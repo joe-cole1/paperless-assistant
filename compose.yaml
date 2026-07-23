@@ -1,0 +1,37 @@
+services:
+  paperless-mcp:
+    container_name: PaperlessMCP
+    image: paperless-assistant:0.1.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    ports:
+      - "8780:8000"
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.50
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import json,urllib.request;
+          response=urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=3);
+          payload=json.load(response);
+          assert response.status==200 and payload.get('status')=='ok'
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s

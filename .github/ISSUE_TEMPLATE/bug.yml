@@ -1,0 +1,67 @@
+name: Bug report
+description: Report a reproducible defect without sensitive data
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Never paste credentials, authorization headers, private document content, personal data, or unsanitized logs.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment type
+      options:
+        - Local uv development
+        - Docker Compose
+        - CI
+        - Other self-hosted deployment
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Use synthetic data and the smallest reliable sequence.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Redact credentials, headers, document content, identifiers, hostnames, and personal data.
+      render: shell
+  - type: textarea
+    id: security
+    attributes:
+      label: Security impact
+      description: If exploitation or data exposure is possible, stop and use SECURITY.md.
+    validations:
+      required: true
+  - type: dropdown
+    id: regression
+    attributes:
+      label: Regression status
+      options:
+        - This worked previously
+        - This has never worked
+        - Unknown
+    validations:
+      required: true
