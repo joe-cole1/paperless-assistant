@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import pytest
@@ -176,6 +177,12 @@ async def test_query_native_context_and_search_fallback(
         "question",
     ]
 
+    gateway.chat_error = False
+    gateway.chat_result = ChatResult("No references", ())
+    empty = await query.ask(204, "answer without references")
+    assert empty.documents == ()
+    assert await query.context(204) is None
+
 
 @pytest.mark.asyncio
 async def test_question_rate_limiter() -> None:
@@ -324,6 +331,95 @@ async def test_ingestion_failures_and_recovery(
 
 
 @pytest.mark.asyncio
+async def test_ingestion_invariants_polling_and_recovery_paths(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = settings_factory(
+        data_dir=tmp_path / "data",
+        paperless_native_task_notification_timeout_seconds=30,
+        paperless_task_poll_initial_seconds=0.01,
+    )
+    settings.staging_dir.mkdir(parents=True)
+    gateway = FakeGateway()
+    repository, _, ingestion = await _services(settings, gateway)
+
+    missing = IngestionJob(
+        id=uuid4(),
+        discord_message_id=1,
+        discord_attachment_id=1,
+        principal_id=201,
+        staged_path=settings.staging_dir / "missing",
+        original_filename="synthetic.pdf",
+        media_type="application/pdf",
+        office_dependent=False,
+        caption="",
+        guidance=MetadataGuidance((1,), None, None),
+    )
+    with pytest.raises(RuntimeError, match="disappeared"):
+        await ingestion.submit(missing)
+    with pytest.raises(RuntimeError, match="disappeared"):
+        await ingestion._required_job(uuid4())
+
+    async def stage(number: int, caption: str = "") -> IngestionJob:
+        path = settings.staging_dir / str(number)
+        path.write_bytes(b"%PDF-1.7")
+        job = await ingestion.stage(
+            discord_message_id=number,
+            discord_attachment_id=number,
+            principal_id=201,
+            staged_path=path,
+            original_filename="synthetic.pdf",
+            caption=caption,
+        )
+        assert job is not None
+        return job
+
+    pending = await ingestion.submit(await stage(2))
+    gateway.task = PaperlessTask(gateway.task_id, TaskState.PENDING)
+    ingestion._settings = settings.model_copy(
+        update={"paperless_native_task_notification_timeout_seconds": 0}
+    )
+    timed_out = await ingestion.poll_until_notifiable(pending.job)
+    assert timed_out.notification_timed_out
+
+    completed = await ingestion.submit(await stage(3))
+    tasks = iter(
+        (
+            PaperlessTask(gateway.task_id, TaskState.PENDING),
+            PaperlessTask(gateway.task_id, TaskState.SUCCESS, DocumentId(44)),
+        )
+    )
+
+    async def next_task(_: UUID) -> PaperlessTask:
+        return next(tasks)
+
+    monkeypatch.setattr(gateway, "get_task", next_task)
+    sleep = AsyncMock(return_value=None)
+    monkeypatch.setattr("paperless_assistant.services.asyncio.sleep", sleep)
+    ingestion._settings = settings.model_copy(
+        update={"paperless_native_task_notification_timeout_seconds": 30}
+    )
+    outcome = await ingestion.poll_until_notifiable(completed.job)
+    assert outcome.job.state == JobState.SUCCEEDED
+    assert outcome.document is not None
+    assert not gateway.notes
+    sleep.assert_awaited_once()
+
+    staged = await stage(4)
+    submitted = await ingestion.submit(await stage(5))
+    gateway.get_task = AsyncMock(side_effect=PaperlessUnavailableError("synthetic"))  # type: ignore[method-assign]
+    await ingestion.recover()
+    loaded_staged = await repository.get_job(staged.id)
+    loaded_submitted = await repository.get_job(submitted.job.id)
+    assert loaded_staged is not None
+    assert loaded_staged.state == JobState.SUBMITTED
+    assert loaded_submitted is not None
+    assert loaded_submitted.state == JobState.SUBMITTED
+
+
+@pytest.mark.asyncio
 async def test_note_failure_does_not_roll_back(
     tmp_path: Path,
     settings_factory: Callable[..., Settings],
@@ -382,6 +478,7 @@ async def test_delivery_original_archive_and_link(
     link = await delivery.prepare(201, 7, 10)
     assert link.attachment is None
     assert "original=true" in link.original_url
+    delivery.cleanup(link)
 
     gateway.download_error_archived = True
     link = await delivery.prepare(201, 7, 10)

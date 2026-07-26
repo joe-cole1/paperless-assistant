@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -331,6 +332,28 @@ def _context(*documents: int, message_ids: tuple[int, ...] = ()) -> ReferenceCon
     )
 
 
+def _job(
+    tmp_path: Path,
+    state: JobState,
+    *,
+    office_dependent: bool = False,
+) -> IngestionJob:
+    return IngestionJob(
+        id=uuid4(),
+        discord_message_id=1,
+        discord_attachment_id=2,
+        principal_id=201,
+        staged_path=tmp_path / "staged",
+        original_filename="synthetic.pdf",
+        media_type="application/pdf",
+        office_dependent=office_dependent,
+        caption="",
+        guidance=MetadataGuidance(),
+        state=state,
+        paperless_task_id=uuid4(),
+    )
+
+
 def test_language_helpers() -> None:
     document = Document(DocumentId(7), "Synthetic", date(2024, 1, 2))
 
@@ -372,6 +395,11 @@ async def test_view_and_exact_message_routing(
     upload_message = FakeMessage(channel=FakeChannel(settings.discord_uploads_channel_id))
     await assistant.on_message(cast(discord.Message, upload_message))
     uploads.assert_awaited_once()
+
+    other_channel = FakeMessage(channel=FakeChannel(999))
+    await assistant.on_message(cast(discord.Message, other_channel))
+    assert questions.await_count == 1
+    assert uploads.await_count == 1
 
     unauthorized = FakeMessage(
         channel=FakeChannel(settings.discord_questions_channel_id),
@@ -430,6 +458,21 @@ async def test_questions_guidance_answer_followup_and_errors(
     ambiguous = FakeMessage(channel=channel, content="What about the date?")
     await assistant._questions_message(cast(discord.Message, ambiguous))
     assert "Which result" in ambiguous.replies[0].content
+
+    query.current_context = _context(7)
+    single = FakeMessage(channel=channel, content="Tell me more")
+    await assistant._questions_message(cast(discord.Message, single))
+    assert query.asked[-1][2] == 7
+
+    delivery_without_ordinal = FakeMessage(channel=channel, content="send it please")
+    await assistant._questions_message(cast(discord.Message, delivery_without_ordinal))
+    assert query.asked[-1] == (201, "send it please", None)
+
+    query.current_context = _context(message_ids=(1234,))
+    invalid_reply = FakeMessage(channel=channel, content="Tell me more")
+    invalid_reply.reference = SimpleNamespace(message_id=1234)
+    await assistant._questions_message(cast(discord.Message, invalid_reply))
+    assert not invalid_reply.replies
 
     query.current_context = None
     query.error = RateLimitedError("synthetic")
@@ -524,6 +567,10 @@ async def test_persistent_delivery_interaction(
     ignored = FakeInteraction(settings, "other:button")
     await assistant.on_interaction(cast(discord.Interaction, ignored))
     assert not ignored.response.messages
+
+    malformed = FakeInteraction(settings, "paperless:send:not-an-id:7")
+    await assistant.on_interaction(cast(discord.Interaction, malformed))
+    assert not malformed.response.messages
 
     query.current_context = None
     expired = FakeInteraction(settings, "paperless:send:201:7")
@@ -647,6 +694,120 @@ async def test_upload_success_duplicate_invalid_and_uncertain(
     )
     await assistant._uploads_message(cast(discord.Message, uncertain))
     assert "uncertain" in uncertain.replies[0].edits[-1]["content"]
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_upload_limits_download_failures_and_rejected_submission(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(
+        data_dir=tmp_path,
+        discord_max_attachments=1,
+        discord_max_attachment_bytes=10,
+        ingestion_max_staged_bytes=20,
+    )
+    settings.staging_dir.mkdir(parents=True)
+    ingestion = FakeIngestion()
+    assistant = _assistant(
+        settings,
+        FakeQuery(),
+        ingestion,
+        FakeDelivery(tmp_path),
+        FakeTaxonomy(),
+    )
+    channel = FakeChannel(settings.discord_uploads_channel_id)
+
+    too_many = FakeMessage(
+        channel=channel,
+        attachments=[
+            FakeAttachment(1, "one.pdf", b"%PDF"),
+            FakeAttachment(2, "two.pdf", b"%PDF"),
+        ],
+    )
+    await assistant._uploads_message(cast(discord.Message, too_many))
+    assert "Only the first 1" in too_many.replies[0].edits[-1]["content"]
+
+    actual_too_large = FakeMessage(
+        channel=channel,
+        attachments=[
+            FakeAttachment(3, "large.pdf", b"01234567890", declared_size=1),
+        ],
+    )
+    await assistant._uploads_message(cast(discord.Message, actual_too_large))
+    assert "downloaded file exceeds" in actual_too_large.replies[0].edits[-1]["content"]
+
+    failed_download = FakeMessage(
+        channel=channel,
+        attachments=[FakeAttachment(4, "failed.pdf", b"x", fail=True)],
+    )
+    await assistant._uploads_message(cast(discord.Message, failed_download))
+    assert "download failed" in failed_download.replies[0].edits[-1]["content"]
+
+    ingestion.submit_state = JobState.FAILED
+    rejected = FakeMessage(
+        channel=channel,
+        attachments=[FakeAttachment(5, "rejected.pdf", b"%PDF")],
+    )
+    await assistant._uploads_message(cast(discord.Message, rejected))
+    assert "rejected" in rejected.replies[0].edits[-1]["content"]
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_upload_post_download_quota_and_poll_recovery_states(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(
+        data_dir=tmp_path,
+        discord_max_attachment_bytes=20,
+        ingestion_max_staged_bytes=20,
+    )
+    settings.staging_dir.mkdir(parents=True)
+    existing = settings.staging_dir / "existing"
+    existing.write_bytes(b"0123456789")
+    ingestion = FakeIngestion()
+    assistant = _assistant(
+        settings,
+        FakeQuery(),
+        ingestion,
+        FakeDelivery(tmp_path),
+        FakeTaxonomy(),
+    )
+    channel = FakeChannel(settings.discord_uploads_channel_id)
+
+    quota = FakeMessage(
+        channel=channel,
+        attachments=[
+            FakeAttachment(1, "quota.pdf", b"01234567890", declared_size=1),
+        ],
+    )
+    await assistant._uploads_message(cast(discord.Message, quota))
+    assert "staging quota was exceeded" in quota.replies[0].edits[-1]["content"]
+
+    existing.unlink()
+    cast(Any, ingestion).poll_until_notifiable = AsyncMock(side_effect=RuntimeError("synthetic"))
+    unavailable = FakeMessage(
+        channel=channel,
+        attachments=[FakeAttachment(2, "unavailable.pdf", b"%PDF")],
+    )
+    await assistant._uploads_message(cast(discord.Message, unavailable))
+    assert "status unavailable" in unavailable.replies[0].edits[-1]["content"]
+
+    cast(Any, ingestion).poll_until_notifiable = AsyncMock(
+        return_value=IngestionOutcome(
+            _job(tmp_path, JobState.SUBMITTED),
+            notification_timed_out=True,
+        )
+    )
+    timed_out = FakeMessage(
+        channel=channel,
+        attachments=[FakeAttachment(3, "pending.pdf", b"%PDF")],
+    )
+    await assistant._uploads_message(cast(discord.Message, timed_out))
+    assert "still processing" in timed_out.replies[0].edits[-1]["content"]
     await assistant.close()
 
 
@@ -780,6 +941,160 @@ async def test_warning_recovery_and_status_helpers(
         201,
     )
     assert channel.sent[-1].content == "answer fallback"
+
+    multi_status = FakeMessage(channel=channel)
+    await assistant._render_query(
+        cast(discord.Message, multi_status),
+        QueryResponse("x" * 2100, (), False, uuid4()),
+        201,
+    )
+    assert channel.sent[-1].content
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_background_loops_lifecycle_and_ready_paths(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    ingestion = FakeIngestion()
+    taxonomy = FakeTaxonomy(True)
+    ready: list[bool] = []
+    assistant = DiscordAssistant(
+        settings,
+        cast(Any, FakeQuery()),
+        cast(Any, ingestion),
+        cast(Any, FakeDelivery(tmp_path)),
+        cast(Any, taxonomy),
+        ready.append,
+    )
+
+    async def complete() -> None:
+        return
+
+    assistant._start_background(complete())
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not cast(Any, assistant)._background_tasks
+
+    blocker = asyncio.Event()
+
+    async def wait_for_blocker() -> None:
+        await blocker.wait()
+
+    assistant._start_background(wait_for_blocker())
+    await assistant.close()
+    assert not cast(Any, assistant)._background_tasks
+
+    clear = AsyncMock()
+    warn = AsyncMock()
+    cast(Any, assistant)._clear_missing_tag_warning = clear
+    cast(Any, assistant)._warn_missing_tag = warn
+    await assistant.on_ready()
+    clear.assert_awaited_once()
+    await assistant.on_error("on_disconnect")
+
+    taxonomy.refresh_result = True
+    cast(Any, assistant).is_ready = lambda: True
+    sleep = AsyncMock(side_effect=[None, None, asyncio.CancelledError])
+    cast(Any, taxonomy).refresh = AsyncMock(side_effect=[True, False])
+    monkeypatch.setattr("paperless_assistant.discord_adapter.asyncio.sleep", sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await assistant._taxonomy_loop()
+    assert ready[-2:] == [True, False]
+    clear.assert_awaited()
+    warn.assert_awaited_once()
+
+    recover = AsyncMock()
+    cast(Any, ingestion).recover = recover
+    sleep.side_effect = [None, asyncio.CancelledError]
+    with pytest.raises(asyncio.CancelledError):
+        await assistant._recovery_loop()
+    recover.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_recovery_warning_and_cleanup_edge_paths(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    ingestion = FakeIngestion()
+    assistant = _assistant(
+        settings,
+        FakeQuery(),
+        ingestion,
+        FakeDelivery(tmp_path),
+        FakeTaxonomy(),
+    )
+    channel = FakeChannel(settings.discord_uploads_channel_id)
+    monkeypatch.setattr(discord, "TextChannel", FakeChannel)
+    cast(Any, assistant).get_channel = lambda _: channel
+
+    succeeded = _job(tmp_path, JobState.SUCCEEDED)
+    cast(Any, ingestion).message_succeeded = AsyncMock(return_value=False)
+    await assistant._notify_recovery(
+        IngestionOutcome(
+            succeeded,
+            Document(DocumentId(44), "Recovered", date(2024, 1, 1)),
+            note_failed=True,
+        )
+    )
+    assert "Guidance note failed" in channel.sent[-1].content
+
+    await assistant._notify_recovery(
+        IngestionOutcome(_job(tmp_path, JobState.RECONCILIATION_REQUIRED))
+    )
+    assert "uncertain" in channel.sent[-1].content
+    await assistant._notify_recovery(
+        IngestionOutcome(_job(tmp_path, JobState.FAILED, office_dependent=True))
+    )
+    assert "Tika/Gotenberg" in channel.sent[-1].content
+
+    cast(Any, assistant).get_channel = lambda _: None
+    await assistant.cleanup_messages((1,), (2,))
+    await assistant._warn_missing_tag()
+
+    ingestion.warning_marker = None
+    await assistant._clear_missing_tag_warning()
+    ingestion.warning_marker = (10, datetime.now(tz=UTC) - timedelta(days=2))
+    await assistant._clear_missing_tag_warning()
+    assert ingestion.warning_marker is not None
+
+    cast(Any, assistant).get_channel = lambda _: channel
+    await assistant._warn_missing_tag()
+    assert channel.partial[-1].deleted
+
+    not_found = discord.NotFound(
+        cast(Any, SimpleNamespace(status=404, reason="synthetic")),
+        "synthetic",
+    )
+    ingestion.warning_marker = (20, datetime.now(tz=UTC))
+    cast(Any, channel).get_partial_message = lambda identifier: cast(
+        Any,
+        SimpleNamespace(delete=AsyncMock(side_effect=not_found)),
+    )
+    await assistant._clear_missing_tag_warning()
+    assert ingestion.warning_marker is None
+
+    http_error = discord.HTTPException(
+        cast(Any, SimpleNamespace(status=500, reason="synthetic")),
+        "synthetic",
+    )
+    ingestion.warning_marker = (21, datetime.now(tz=UTC))
+    cast(Any, channel).get_partial_message = lambda identifier: cast(
+        Any,
+        SimpleNamespace(delete=AsyncMock(side_effect=http_error)),
+    )
+    await assistant._clear_missing_tag_warning()
+    assert ingestion.warning_marker is not None
+
+    settings.staging_dir.mkdir(parents=True)
+    monkeypatch.setattr(Path, "iterdir", lambda _: (_ for _ in ()).throw(OSError()))
+    assert assistant._staging_usage() == settings.ingestion_max_staged_bytes
     await assistant.close()
 
 

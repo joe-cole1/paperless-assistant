@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Self, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -82,6 +83,107 @@ async def test_runtime_background_failure_degrades_readiness(
     await asyncio.sleep(0)
 
     assert not runtime.ready
+    await runtime.paperless.close()
+    await runtime.discord.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_successful_task_lease_loss_and_empty_stop(
+    settings_factory: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = Runtime(settings_factory(instance_lease_seconds=15))
+    runtime.ready = True
+
+    async def succeed() -> None:
+        return
+
+    runtime._start_task(succeed(), name="synthetic-success")
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert runtime.ready
+
+    cast(Any, runtime.repository).acquire_instance = AsyncMock(
+        side_effect=[True, False],
+    )
+    monkeypatch.setattr("paperless_assistant.app.asyncio.sleep", AsyncMock())
+    with pytest.raises(RuntimeError, match="lease was lost"):
+        await runtime._lease_loop()
+
+    cast(Any, runtime.discord).close = AsyncMock()
+    cast(Any, runtime.repository).release_instance = AsyncMock()
+    cast(Any, runtime.repository).close = AsyncMock()
+    cast(Any, runtime.paperless).close = AsyncMock()
+    await runtime.stop()
+    cast(Any, runtime.repository).release_instance.assert_awaited_once_with(runtime.instance_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cleanup_hour", "expected_sleep"),
+    [(13, 3600.0), (11, 23 * 3600.0)],
+)
+async def test_runtime_cleanup_loop_runs_daily_maintenance(
+    settings_factory: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_hour: int,
+    expected_sleep: float,
+) -> None:
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> Self:
+            if tz is None:
+                return cls(2026, 7, 26, 12)
+            return cls(2026, 7, 26, 12, tzinfo=UTC)
+
+    runtime = Runtime(settings_factory(cleanup_hour_local=cleanup_hour))
+    cast(Any, runtime.repository).cleanup_message_ids = AsyncMock(return_value=((10,), (20,)))
+    cast(Any, runtime.discord).cleanup_messages = AsyncMock()
+    cast(Any, runtime.repository).purge = AsyncMock()
+    cast(Any, runtime)._purge_delivery_spool = MagicMock()
+    cast(Any, runtime)._purge_orphan_staging = AsyncMock()
+    sleep = AsyncMock(side_effect=[None, asyncio.CancelledError])
+    monkeypatch.setattr(app_module, "datetime", FixedDateTime)
+    monkeypatch.setattr("paperless_assistant.app.asyncio.sleep", sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await runtime._cleanup_loop()
+
+    assert sleep.await_args_list[0].args == (expected_sleep,)
+    cast(Any, runtime.discord).cleanup_messages.assert_awaited_once_with((10,), (20,))
+    cast(Any, runtime.repository).purge.assert_awaited_once()
+    await runtime.paperless.close()
+    await runtime.discord.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_cleanup_logs_filesystem_failures(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runtime = Runtime(settings_factory(data_dir=tmp_path))
+    runtime.settings.delivery_dir.mkdir(parents=True)
+    runtime.settings.staging_dir.mkdir(parents=True)
+    delivery = runtime.settings.delivery_dir / "old"
+    staging = runtime.settings.staging_dir / "orphan"
+    delivery.write_bytes(b"old")
+    staging.write_bytes(b"orphan")
+    os.utime(delivery, (1, 1))
+    os.utime(staging, (1, 1))
+    cast(Any, runtime.repository).protected_staged_paths = AsyncMock(return_value=frozenset())
+
+    def fail_unlink(_: Path, *, missing_ok: bool = False) -> None:
+        del missing_ok
+        raise OSError("synthetic")
+
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+    runtime._purge_delivery_spool(2)
+    await runtime._purge_orphan_staging(2)
+
+    assert "delivery_spool_cleanup_failed" in caplog.messages
+    assert "staging_spool_cleanup_failed" in caplog.messages
     await runtime.paperless.close()
     await runtime.discord.close()
 
