@@ -768,12 +768,12 @@ async def test_warning_recovery_and_status_helpers(
         "synthetic",
     )
     failed_status = FakeMessage(channel=channel)
-    failed_status.edit = AsyncMock(side_effect=edit_error)  # type: ignore[method-assign]
+    failed_status.edit = AsyncMock(side_effect=edit_error)
     await assistant._replace_status(cast(discord.Message, failed_status), ["fallback"])
     assert channel.sent[-1].content == "fallback"
 
     failed_query_status = FakeMessage(channel=channel)
-    failed_query_status.edit = AsyncMock(side_effect=edit_error)  # type: ignore[method-assign]
+    failed_query_status.edit = AsyncMock(side_effect=edit_error)
     await assistant._render_query(
         cast(discord.Message, failed_query_status),
         QueryResponse("answer fallback", (), False, uuid4()),
