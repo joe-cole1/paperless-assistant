@@ -74,8 +74,6 @@ listed in `DISCORD_ALLOWED_USER_IDS`.
 ```console
 cp .env.example .env
 chmod 600 .env
-mkdir -p ./data
-sudo chown 10001:10001 ./data
 docker compose build
 docker compose up -d --wait
 docker compose ps
@@ -85,7 +83,6 @@ Replace every example ID, URL, and token in `.env`. Important settings:
 
 - `PAPERLESS_INTERNAL_URL` — private container/LAN API URL
 - `PAPERLESS_PUBLIC_URL` — HTTPS URL users open in a browser
-- `PAPERLESS_ASSISTANT_DATA_PATH` — Synology host path mounted at `/data`
 - `PAPERLESS_OFFICE_UPLOADS_ENABLED=false` — upload policy flag only
 - `TZ` — container timezone used for the 03:00 cleanup
 
@@ -93,9 +90,14 @@ Tika and Gotenberg remain part of the existing Paperless deployment. Set
 `PAPERLESS_OFFICE_UPLOADS_ENABLED=true` only when they work there. A bad Tika/Gotenberg setup may
 fail an Office task, but PDF/image questions and ingestion remain available.
 
-The required data path holds SQLite WAL state plus transient staging/delivery files. Back up the
-SQLite database; staged and delivery bytes are transient. The deployment supports exactly one
-worker replica.
+The Docker-managed `paperless-assistant-data` volume holds SQLite recovery, idempotency, and audit
+state plus transient staging/delivery files. Container recreation and `docker compose down`
+preserve it. Deleting the volume—including with `docker compose down -v`—discards that state;
+documents already accepted by Paperless remain in Paperless. See the installation guide for
+optional backup and advanced host bind-mount procedures. A bind mount requires the host directory
+to be created, assigned to UID/GID `10001:10001`, restricted to mode `0700`, and verified before
+startup; copying the supplied override alone is not sufficient. The deployment supports exactly
+one worker replica.
 
 The container runs as UID 10001 with a read-only root filesystem, a restricted writable data
 mount, bounded `/tmp`, no Linux capabilities, and `no-new-privileges`. Default resources are

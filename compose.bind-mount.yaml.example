@@ -1,0 +1,9 @@
+# Optional advanced storage override. Copy this file to compose.override.yaml,
+# replace the source with an absolute local path, and prepare that directory
+# exactly as documented in docs/INSTALL.md before starting the service.
+services:
+  paperless-assistant:
+    volumes:
+      - type: bind
+        source: /volume1/docker/paperless-assistant/data
+        target: /data

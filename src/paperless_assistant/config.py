@@ -51,7 +51,6 @@ class Settings(BaseSettings):
     paperless_office_uploads_enabled: bool = False
 
     data_dir: Path = Path("/data")
-    paperless_assistant_data_path: str = Field(default="./data", min_length=1)
     ingestion_max_staged_bytes: int = Field(default=100 * MIB, ge=1)
     delivery_min_free_bytes: int = Field(default=50 * MIB, ge=0)
 
@@ -89,7 +88,6 @@ class Settings(BaseSettings):
         "host",
         "tz",
         "paperless_source_tag",
-        "paperless_assistant_data_path",
         mode="before",
     )
     @classmethod
