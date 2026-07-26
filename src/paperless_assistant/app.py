@@ -1,4 +1,4 @@
-"""ASGI application construction and process entry point."""
+"""Private health application construction and process entry point."""
 
 from __future__ import annotations
 
@@ -11,11 +11,10 @@ import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.routing import Mount, Route
+from starlette.routing import Route
 
 from paperless_assistant.config import Settings
 from paperless_assistant.logging_config import configure_logging
-from paperless_assistant.mcp_server import create_mcp_server
 
 logger = logging.getLogger(__name__)
 
@@ -25,15 +24,13 @@ def _metadata(settings: Settings) -> dict[str, Any]:
         "service": settings.app_name,
         "version": settings.app_version,
         "environment": settings.app_env,
-        "mcp_endpoint": "/mcp",
-        "bootstrap_mode": settings.mcp_bootstrap_mode,
+        "runtime": "health-only",
     }
 
 
 def create_app(settings: Settings | None = None) -> Starlette:
-    """Construct the HTTP and MCP application from validated settings."""
+    """Construct the private health application from validated settings."""
     resolved = settings or Settings()
-    mcp = create_mcp_server(resolved)
 
     async def service_metadata(_: Request) -> JSONResponse:
         return JSONResponse(_metadata(resolved))
@@ -63,19 +60,16 @@ def create_app(settings: Settings | None = None) -> Starlette:
                 "service": resolved.app_name,
                 "version": resolved.app_version,
                 "environment": resolved.app_env,
-                "mcp_mode": "bootstrap" if resolved.mcp_bootstrap_mode else "standard",
+                "runtime": "health-only",
             },
         )
-        async with mcp.session_manager.run():
-            application.state.ready = True
-            logger.info("service_ready", extra={"service": resolved.app_name, "ready": True})
-            try:
-                yield
-            finally:
-                application.state.ready = False
-                logger.info(
-                    "service_shutdown", extra={"service": resolved.app_name, "ready": False}
-                )
+        application.state.ready = True
+        logger.info("service_ready", extra={"service": resolved.app_name, "ready": True})
+        try:
+            yield
+        finally:
+            application.state.ready = False
+            logger.info("service_shutdown", extra={"service": resolved.app_name, "ready": False})
 
     application = Starlette(
         debug=False,
@@ -83,7 +77,6 @@ def create_app(settings: Settings | None = None) -> Starlette:
             Route("/", service_metadata, methods=["GET"]),
             Route("/healthz", health, methods=["GET"]),
             Route("/readyz", ready, methods=["GET"]),
-            Mount("/", app=mcp.streamable_http_app()),
         ],
         lifespan=lifespan,
     )

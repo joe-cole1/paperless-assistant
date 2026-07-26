@@ -20,7 +20,7 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "event": record.getMessage(),
         }
-        for field in ("service", "version", "environment", "mcp_mode", "ready"):
+        for field in ("service", "version", "environment", "runtime", "ready"):
             if hasattr(record, field):
                 payload[field] = getattr(record, field)
         if record.exc_info and record.exc_info[0] is not None:
