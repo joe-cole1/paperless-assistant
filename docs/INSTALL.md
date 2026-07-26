@@ -56,7 +56,9 @@ listed in its configuration.
 3. Open **Installation**:
    - enable **Guild Install**;
    - user installation is not needed;
-   - under the guild install settings, add the `bot` scope.
+   - leave **Install Link** set to **None**—Discord does not provide an installation-page link
+     for a private bot;
+   - under the default guild install settings, add the `bot` scope if that control is available.
 4. Open **Bot**:
    - disable **Public Bot** for this private installation;
    - enable **Message Content Intent** under privileged gateway intents;
@@ -75,18 +77,27 @@ history, issue, or message.
 
 ## 4. Install the bot in the server
 
-In the Developer Portal:
+Keep **Public Bot** disabled. Only the application owner and members of its developer team can
+install a private bot. Sign in to Discord as one of those accounts and use the bot OAuth2
+authorization flow instead of the Installation page's install-link setting:
 
-1. Return to **Installation**.
-2. For the guild-installed bot, grant:
+1. Open **General Information** and copy the **Application ID**. This ID is not the bot token.
+2. Open **OAuth2 → URL Generator** and select only the `bot` scope.
+3. Grant:
    - View Channels
    - Send Messages
    - Read Message History
    - Attach Files
    - Embed Links
    - Manage Messages
-3. Copy the installation link, open it in a browser, choose **Add to server**, and select the
-   private household server.
+4. Copy and open the generated URL. If the Portal does not show a generated URL, replace
+   `APPLICATION_ID` in this equivalent authorization URL:
+
+   ```text
+   https://discord.com/oauth2/authorize?client_id=APPLICATION_ID&integration_type=0&scope=bot&permissions=125952
+   ```
+
+5. Choose **Add to server** and select the private household server.
 
 Discord requires the installing account to have permission to manage the server. The bot does not
 need Administrator.
