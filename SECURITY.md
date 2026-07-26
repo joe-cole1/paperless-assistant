@@ -19,10 +19,11 @@ data and sanitized metadata only.
 
 ## Current security posture
 
-The implemented runtime exposes only non-secret metadata and liveness/readiness endpoints bound
-to private container/NAS loopback interfaces. MCP, OAuth/JWT/JWKS, Gemini Spark, Pangolin, and
-their public routes have been retired. The current foundation has no Discord or Paperless
-credential and no document capability.
+The runtime exposes only non-secret metadata and liveness/readiness endpoints bound to private
+container/NAS loopback interfaces. MCP, OAuth/JWT/JWKS, Gemini Spark, Pangolin, and their public
+routes have been retired. The primary worker connects outbound to Discord and performs only the
+reviewed Paperless chat, search, taxonomy-read, upload, task-read, note, metadata-read, and
+download operations.
 
 The container runs as a non-root user with a read-only root filesystem, dropped Linux
 capabilities, `no-new-privileges`, and bounded temporary storage.

@@ -1,6 +1,6 @@
 # Paperless Assistant architecture
 
-Status: MCP retired; Discord-first implementation follows in issue #10
+Status: Discord-first MVP implemented by issue #10
 Last updated: 2026-07-25
 
 ## 1. Purpose
@@ -11,8 +11,8 @@ multi-file ingestion. Paperless owns OCR, classification, storage, search, and A
 The assistant owns Discord authorization, workflow policy, reliability, privacy-minimized audit,
 and delivery decisions.
 
-The currently implemented issue #9 runtime intentionally contains only private health endpoints.
-It establishes the foundation after retiring the cancelled Gemini Spark/MCP direction.
+Issue #9 established the private runtime after retiring Gemini Spark/MCP. Issue #10 adds the
+outbound Discord worker, Paperless adapter, application services, and durable local state.
 
 ## 2. System context
 
@@ -32,8 +32,7 @@ flowchart LR
     Assistant --> State
 ```
 
-Only the private health surface is implemented in issue #9. Discord, Paperless, and state flows are
-implemented in issue #10.
+Discord, Paperless, and state flows are implemented in issue #10.
 
 ## 3. Runtime and exposure
 
@@ -91,18 +90,17 @@ Domain and application code do not import Discord or HTTP client implementations
 
 ## 7. Configuration
 
-Issue #9 configuration contains only service metadata, logging, and private bind settings. Issue
-#10 adds validated Discord, Paperless, persistence, limits, timeouts, retention, and timezone
-configuration.
+Configuration includes validated Discord, Paperless, persistence, limits, timeouts, retention,
+and timezone policy.
 
 Secrets are runtime-injected through a permission-restricted deployment environment and never
 placed in source, image layers, tests, documentation examples, issues, or pull requests.
 
 ## 8. Persistence and recovery target
 
-Issue #10 adds SQLite WAL storage for ingestion jobs, Discord event idempotency, short-lived
-document-reference context, and privacy-minimized audit. Staged files use job UUID names and
-restrictive permissions.
+SQLite WAL storage holds ingestion jobs, Discord event idempotency, short-lived
+document-reference context, cleanup-only message IDs, the missing-tag warning ID/timestamp, and
+privacy-minimized audit. Staged files use job UUID names and restrictive permissions.
 
 The target state machine is:
 
@@ -140,6 +138,7 @@ SQLite job/audit state is included according to operator policy.
 - ADR 0004: phased, fail-closed capability delivery remains accepted.
 - ADR 0005: separate Discord-worker assumptions are superseded in part.
 - ADR 0006: Discord is the primary runtime.
+- ADR 0007: native Paperless chat and immediate durable ingestion.
 
 Issue #10 is the canonical Discord MVP. Issue #8 is the future least-privilege and Paperless
 permissions hardening phase. A future inbound interface, custom AI layer, public share-link

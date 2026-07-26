@@ -1,51 +1,67 @@
-"""Unit tests for typed application configuration."""
+"""Unit tests for fail-closed application configuration."""
 
 from __future__ import annotations
+
+from collections.abc import Callable
 
 import pytest
 from pydantic import ValidationError
 
 from paperless_assistant import __version__
-from paperless_assistant.config import Settings
+from paperless_assistant.config import MIB, Settings
 
 
-def test_safe_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("APP_ENV", raising=False)
-    settings = Settings(_env_file=None)
+def test_safe_defaults(settings_factory: Callable[..., Settings]) -> None:
+    settings = settings_factory()
 
     assert settings.app_env == "development"
     assert settings.app_name == "paperless-assistant"
     assert settings.app_version == __version__
     assert settings.host == "127.0.0.1"
     assert settings.port == 8000
+    assert settings.discord_max_attachment_bytes == 25 * MIB
+    assert settings.ingestion_max_staged_bytes == 100 * MIB
+    assert settings.context_ttl.total_seconds() == 900
+    assert settings.database_path.name == "assistant.sqlite3"
+    assert settings.staging_dir.name == "staging"
+    assert settings.delivery_dir.name == "delivery"
+    assert settings.paperless_token.get_secret_value() == "synthetic-paperless-token"
+
+
+def test_required_secrets_and_ids_have_no_defaults() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
 
 
 @pytest.mark.parametrize(
-    ("environment", "value"),
+    ("field", "value"),
     [
-        ("PORT", "0"),
-        ("PORT", "70000"),
-        ("PORT", "not-a-port"),
-        ("LOG_LEVEL", "verbose"),
-        ("HOST", "https://localhost"),
-        ("APP_ENV", " production "),
+        ("port", 0),
+        ("port", 70000),
+        ("log_level", "verbose"),
+        ("host", "https://localhost"),
+        ("app_env", " production "),
+        ("discord_allowed_user_ids", frozenset()),
+        ("discord_allowed_user_ids", frozenset({0})),
+        ("data_dir", "relative"),
+        ("paperless_public_url", "http://paperless.example.test"),
+        ("paperless_source_tag", " Discord "),
     ],
 )
 def test_invalid_configuration_is_rejected(
-    monkeypatch: pytest.MonkeyPatch, environment: str, value: str
+    settings_factory: Callable[..., Settings], field: str, value: object
 ) -> None:
-    monkeypatch.setenv(environment, value)
-
     with pytest.raises(ValidationError):
-        Settings(_env_file=None)
+        settings_factory(**{field: value})
 
 
-@pytest.mark.parametrize(
-    "value",
-    ["bad host", "https://localhost", "localhost/path"],
-)
-def test_invalid_bind_host_is_rejected(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
-    monkeypatch.setenv("HOST", value)
-
-    with pytest.raises(ValidationError):
-        Settings(_env_file=None)
+def test_related_limits_are_validated(settings_factory: Callable[..., Settings]) -> None:
+    with pytest.raises(ValidationError, match="channels must be different"):
+        settings_factory(discord_uploads_channel_id=101)
+    with pytest.raises(ValidationError, match="at least the per-file limit"):
+        settings_factory(ingestion_max_staged_bytes=10)
+    with pytest.raises(ValidationError, match="initial task poll"):
+        settings_factory(
+            paperless_task_poll_initial_seconds=20,
+            paperless_task_poll_max_seconds=10,
+        )

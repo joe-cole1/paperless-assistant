@@ -1,96 +1,155 @@
 # Paperless Assistant
 
-Paperless Assistant is a security-focused, self-hosted Discord interface for a family
-Paperless-ngx deployment.
+Paperless Assistant is a private, self-hosted Discord interface for a household
+Paperless-ngx v3 deployment. Allowlisted users can ask ordinary English questions, receive
+Paperless's native AI answer and referenced files, and immediately ingest several mobile
+attachments.
 
-The repository is currently between runtime phases. The cancelled Gemini Spark/MCP transport has
-been retired. The implemented process exposes only private health endpoints while the outbound
-Discord worker is introduced in issue #10.
+Paperless owns OCR, classification, search, storage, and AI configuration. The assistant adds no
+model, embeddings, query planner, or RAG layer.
 
-## Architecture
+## User experience
 
-The project is a ports-and-adapters modular monolith. Discord is the inbound adapter. Application
-services enforce policy, and Paperless-ngx, persistence, audit, and file delivery are outbound
-adapters. No inbound adapter calls another adapter.
+Configure two private Discord text channels:
 
-See [architecture.md](architecture.md) and the accepted records in [docs/adr](docs/adr).
+- **questions** — ask “give me John's vaccine records from 2024” or “find the receipts from our
+  Venice trip.” Paperless native chat returns up to three references. Each result has Open and
+  Send File actions; “send me the second one” and “send all of them” also work for 15 minutes.
+- **uploads** — attach up to ten documents. The attachment is confirmation: files are validated,
+  submitted independently in order, and tracked through Paperless processing. One caption becomes
+  metadata guidance and a Paperless note for every successful file.
+
+If an original exceeds Discord's effective attachment limit, the assistant offers an archived PDF
+when it fits and always provides the session-authenticated original Paperless download link.
+
+## Architecture and exposure
+
+One container connects outbound through the Discord Gateway. Discord is the only user interface.
+There is no public webhook, MCP, OAuth, Spark, or Pangolin route.
+
+The private HTTP surface contains only:
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/` | Non-secret service metadata |
+| `GET` | `/healthz` | Process liveness |
+| `GET` | `/readyz` | Discord and ingestion-policy readiness |
+
+Compose binds optional host monitoring to `127.0.0.1:8780`. Do not publish or reverse-proxy it.
+See [architecture.md](architecture.md) and [docs/adr](docs/adr).
 
 ## Prerequisites
 
-- Git
-- uv 0.11.31 or a compatible stable release
-- Python 3.14
+- Paperless-ngx v3.0.3 with native AI chat configured and its embeddings current
+- one exact, unique visible Paperless tag named `Discord` (configurable)
+- a Paperless API token; the trusted MVP currently uses the operator's admin token
+- a private Discord guild, bot application, questions channel, and uploads channel
 - Docker Engine with Docker Compose v2
+- for development: Python 3.14 and uv 0.11.31
 
-## Local development
+Issue #8 tracks replacing the initial admin token with least-privilege identities and object
+permissions.
+
+## Discord bot setup
+
+Enable the privileged **Message Content Intent** in the Discord Developer Portal. Invite the bot
+only to the private guild and grant the two configured channels:
+
+- View Channel
+- Send Messages
+- Read Message History
+- Attach Files
+- Embed Links
+- Manage Messages
+
+Record the immutable guild, channel, and user IDs with Discord Developer Mode. The assistant
+default-denies DMs, threads, other guilds/channels, bots, webhooks, edited messages, and users not
+listed in `DISCORD_ALLOWED_USER_IDS`.
+
+## Configure and deploy
+
+```console
+cp .env.example .env
+chmod 600 .env
+mkdir -p ./data
+sudo chown 10001:10001 ./data
+docker compose build
+docker compose up -d --wait
+docker compose ps
+```
+
+Replace every example ID, URL, and token in `.env`. Important settings:
+
+- `PAPERLESS_INTERNAL_URL` — private container/LAN API URL
+- `PAPERLESS_PUBLIC_URL` — HTTPS URL users open in a browser
+- `PAPERLESS_ASSISTANT_DATA_PATH` — Synology host path mounted at `/data`
+- `PAPERLESS_OFFICE_UPLOADS_ENABLED=false` — upload policy flag only
+- `TZ` — container timezone used for the 03:00 cleanup
+
+Tika and Gotenberg remain part of the existing Paperless deployment. Set
+`PAPERLESS_OFFICE_UPLOADS_ENABLED=true` only when they work there. A bad Tika/Gotenberg setup may
+fail an Office task, but PDF/image questions and ingestion remain available.
+
+The required data path holds SQLite WAL state plus transient staging/delivery files. Back up the
+SQLite database; staged and delivery bytes are transient. The deployment supports exactly one
+worker replica.
+
+The container runs as UID 10001 with a read-only root filesystem, a restricted writable data
+mount, bounded `/tmp`, no Linux capabilities, and `no-new-privileges`. Default resources are
+512 MiB and 1 CPU.
+
+## Health and operations
+
+```console
+python -c "import json,urllib.request; print(json.load(urllib.request.urlopen('http://127.0.0.1:8780/healthz')))"
+python -c "import json,urllib.request; print(json.load(urllib.request.urlopen('http://127.0.0.1:8780/readyz')))"
+docker compose logs -f paperless-assistant
+```
+
+Liveness stays healthy through downstream outages. Readiness is degraded when Discord is
+disconnected or the exact required Paperless source tag cannot be verified. A missing tag pauses
+uploads, posts a bounded warning, and rechecks every five minutes; questions and downloads remain
+usable. The daily warning bound survives restarts, and the recorded warning is removed when the
+tag becomes healthy.
+
+Uploads are durable in SQLite. A saved task UUID resumes polling after restart. An interrupted
+ambiguous upload POST is marked `reconciliation_required` and is never automatically repeated.
+Nightly cleanup follows the container timezone and never deletes active or reconciliation jobs.
+
+## Supported uploads
+
+Always enabled after signature validation:
+
+- PDF, PNG, JPEG, TIFF, GIF, WebP, and UTF-8 plain text
+
+Enabled only by `PAPERLESS_OFFICE_UPLOADS_ENABLED=true`:
+
+- DOC/DOCX/ODT, PPT/PPTX/ODP, XLS/XLSX/ODS, and EML
+
+HEIC/HEIF, archives, unsupported types, and extension/signature mismatches are rejected with
+actionable guidance. The incoming default is 25 MiB per file and 100 MiB total staged data.
+
+## Development and verification
 
 ```console
 uv python install 3.14
 uv sync --locked
-cp .env.example .env
-uv run paperless-assistant
-```
-
-The safe Python default binds health endpoints to `127.0.0.1:8000`. The Compose example binds the
-container listener to NAS loopback at `127.0.0.1:8780`.
-
-Common checks:
-
-```console
 uv lock --check
 uv run --locked ruff check .
 uv run --locked ruff format --check .
 uv run --locked mypy
 uv run --locked pytest
 uv run --locked pip-audit
-docker compose build
 ./scripts/container_smoke_test.sh
 ```
 
-## Private endpoints
-
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` | `/` | Non-secret service metadata |
-| `GET` | `/healthz` | Process liveness |
-| `GET` | `/readyz` | Application lifecycle readiness |
-
-MCP and OAuth routes do not exist. Unknown routes return 404.
-
-## Docker Compose
-
-```console
-cp .env.example .env
-docker compose build
-docker compose up -d --wait
-docker compose ps
-docker compose logs -f paperless-assistant
-python -c "import json,urllib.request; print(json.load(urllib.request.urlopen('http://127.0.0.1:8780/healthz')))"
-docker compose down
-```
-
-The container runs as UID 10001 with a read-only root filesystem, bounded `/tmp`, no Linux
-capabilities, and `no-new-privileges`. The host mapping is loopback-only and must not be routed
-through a public reverse proxy.
-
-The smoke test builds and starts the stack, checks liveness/readiness, verifies non-root and
-read-only execution, and always tears the stack down.
+Tests use only synthetic identities and documents. Never commit `.env`, tokens, private documents,
+OCR, questions, answers, captions, filenames, titles, or taxonomy values.
 
 ## Roadmap
 
-1. MCP retirement and private health foundation — implemented by issue #9.
-2. Discord-native Paperless chat, delivery, and immediate multi-file ingestion — issue #10.
-3. Least-privilege Paperless service identities and document permissions — issue #8.
+1. MCP retirement and private health foundation — issue #9.
+2. Discord-native chat, delivery, and immediate multi-file ingestion — issue #10.
+3. Least-privilege Paperless identities and object permissions — issue #8.
 
-## Security
-
-Never commit `.env`, Discord tokens, Paperless tokens, private document content, OCR, captions,
-questions, answers, or personal identifiers. Report vulnerabilities privately according to
-[SECURITY.md](SECURITY.md).
-
-Every implementation begins with a GitHub issue and uses an `issue/<number>-<description>` branch.
-See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## License
-
-MIT; see [LICENSE](LICENSE).
+See [SECURITY.md](SECURITY.md), [CONTRIBUTING.md](CONTRIBUTING.md), and [LICENSE](LICENSE).
