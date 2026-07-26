@@ -8,6 +8,9 @@ attachments.
 Paperless owns OCR, classification, search, storage, and AI configuration. The assistant adds no
 model, embeddings, query planner, or RAG layer.
 
+For a complete first installation—from creating the private Discord bot through manual acceptance
+testing—follow [docs/INSTALL.md](docs/INSTALL.md).
+
 ## User experience
 
 Configure two private Discord text channels:
