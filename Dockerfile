@@ -23,12 +23,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 FROM ${PYTHON_IMAGE} AS runtime
 
 ARG BUILD_DATE="unknown"
+ARG VERSION="0.1.0"
 ARG VCS_REF="unknown"
 LABEL org.opencontainers.image.title="paperless-assistant" \
       org.opencontainers.image.description="Security-first Paperless Assistant runtime" \
       org.opencontainers.image.source="https://github.com/joe-cole1/paperless-assistant" \
       org.opencontainers.image.licenses="MIT" \
-      org.opencontainers.image.version="0.1.0" \
+      org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.revision="${VCS_REF}"
 

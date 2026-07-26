@@ -137,17 +137,35 @@ actionable guidance. The incoming default is 25 MiB per file and 100 MiB total s
 ```console
 uv python install 3.14
 uv sync --locked
-uv lock --check
-uv run --locked ruff check .
-uv run --locked ruff format --check .
-uv run --locked mypy
-uv run --locked pytest
-uv run --locked pip-audit
-./scripts/container_smoke_test.sh
+./scripts/ship_check.sh
 ```
 
 Tests use only synthetic identities and documents. Never commit `.env`, tokens, private documents,
 OCR, questions, answers, captions, filenames, titles, or taxonomy values.
+
+## Releases
+
+Every pull request must have at least one label. GitHub uses the categories in
+`.github/release.yml` to group merged pull requests in generated release notes.
+
+After the release commit is merged and CI succeeds, push an annotated semantic-version tag:
+
+```console
+git tag -a v0.1.0 -m "v0.1.0"
+git push origin v0.1.0
+```
+
+The release workflow publishes `ghcr.io/joe-cole1/paperless-assistant` for the same architectures
+as the supported Paperless-ngx v3.0.3 image: `linux/amd64` and `linux/arm64` (ARMv8). It attaches
+provenance and an SBOM, then creates the GitHub release. Stable releases also update the major,
+major/minor, and `latest` image tags. Prerelease tags such as `v0.2.0-rc.1` do not update
+`latest`.
+
+Deploy an immutable release by pinning its digest from the release notes:
+
+```console
+docker pull ghcr.io/joe-cole1/paperless-assistant@sha256:REPLACE_WITH_RELEASE_DIGEST
+```
 
 ## Roadmap
 

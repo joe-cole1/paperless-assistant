@@ -1,0 +1,19 @@
+changelog:
+  categories:
+    - title: Features
+      labels:
+        - enhancement
+    - title: Fixes
+      labels:
+        - bug
+    - title: Documentation
+      labels:
+        - documentation
+    - title: Dependencies and build tooling
+      labels:
+        - dependencies
+        - github_actions
+        - python:uv
+    - title: Other changes
+      labels:
+        - "*"
