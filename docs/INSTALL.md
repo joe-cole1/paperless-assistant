@@ -236,6 +236,29 @@ Paperless API OK: 200
 If this reports DNS, connection, TLS, `401`, or `403` errors, fix the internal URL, Docker network,
 certificate trust, or API token before continuing. The command does not print the token.
 
+### Optional same-project startup ordering
+
+The standalone assistant deployment does not depend on a Compose-managed Paperless service. If
+Paperless and the assistant are defined in the same Compose project, you may delay assistant
+startup until Paperless is healthy:
+
+```yaml
+services:
+  paperless-assistant:
+    depends_on:
+      paperless-webserver:
+        condition: service_healthy
+```
+
+Replace `paperless-webserver` with the Paperless service name in that project. The Paperless
+service must define a working `healthcheck`; a running container alone is not evidence that its API
+is ready. Do not add this dependency to the standalone `compose.yaml`, where no Paperless service
+is defined.
+
+This condition controls initial Compose startup ordering only. It does not stop or restart the
+assistant if Paperless becomes unhealthy later. The assistant continues to fail closed and report
+dependency readiness through `/readyz`.
+
 ## 9. Start the worker
 
 ```console
