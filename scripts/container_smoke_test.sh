@@ -19,14 +19,29 @@ cleanup() {
 trap cleanup EXIT
 
 docker compose build --pull
-docker compose up -d --wait --wait-timeout 90
+docker compose run \
+  --detach \
+  --rm \
+  --service-ports \
+  --name PaperlessAssistant \
+  --entrypoint python \
+  paperless-assistant \
+  -c "import uvicorn; from paperless_assistant.app import create_app; uvicorn.run(create_app(start_worker=False), host='0.0.0.0', port=8000, log_config=None)"
 
 python3 - <<'PY'
 import json
+import time
 from urllib.request import urlopen
 
-with urlopen("http://127.0.0.1:8780/healthz", timeout=5) as response:
-    payload = json.load(response)
+for attempt in range(30):
+    try:
+        with urlopen("http://127.0.0.1:8780/healthz", timeout=2) as response:
+            payload = json.load(response)
+        break
+    except OSError:
+        if attempt == 29:
+            raise
+        time.sleep(1)
 if response.status != 200 or payload.get("status") != "ok":
     raise SystemExit(f"unhealthy response: {response.status} {payload}")
 with urlopen("http://127.0.0.1:8780/readyz", timeout=5) as response:

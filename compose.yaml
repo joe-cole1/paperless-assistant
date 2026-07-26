@@ -7,6 +7,10 @@ services:
       dockerfile: Dockerfile
     env_file:
       - .env
+    environment:
+      TZ: ${TZ:-America/New_York}
+    volumes:
+      - ${PAPERLESS_ASSISTANT_DATA_PATH:-./data}:/data
     ports:
       - "127.0.0.1:8780:8000"
     restart: unless-stopped
@@ -19,8 +23,8 @@ services:
     security_opt:
       - no-new-privileges:true
     pids_limit: 128
-    mem_limit: 256m
-    cpus: 0.50
+    mem_limit: 512m
+    cpus: 1.0
     healthcheck:
       test:
         - CMD

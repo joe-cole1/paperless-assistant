@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import httpx
 import pytest
 
@@ -10,13 +12,13 @@ from paperless_assistant.config import Settings
 
 
 @pytest.fixture
-def settings() -> Settings:
-    return Settings(_env_file=None)
+def settings(settings_factory: Callable[..., Settings]) -> Settings:
+    return settings_factory()
 
 
 @pytest.mark.asyncio
 async def test_ready_is_unavailable_before_startup(settings: Settings) -> None:
-    application = create_app(settings)
+    application = create_app(settings, start_worker=False)
     transport = httpx.ASGITransport(app=application)
     async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as client:
         response = await client.get("/readyz")
@@ -28,7 +30,7 @@ async def test_ready_is_unavailable_before_startup(settings: Settings) -> None:
 
 @pytest.mark.asyncio
 async def test_http_endpoints_and_unknown_route(settings: Settings) -> None:
-    application = create_app(settings)
+    application = create_app(settings, start_worker=False)
     transport = httpx.ASGITransport(app=application)
 
     async with (
@@ -46,7 +48,7 @@ async def test_http_endpoints_and_unknown_route(settings: Settings) -> None:
         "service": "paperless-assistant",
         "version": "0.1.0",
         "environment": "development",
-        "runtime": "health-only",
+        "runtime": "discord-gateway",
     }
     assert health.status_code == 200
     assert health.json() == {
@@ -67,7 +69,7 @@ async def test_http_endpoints_and_unknown_route(settings: Settings) -> None:
 
 @pytest.mark.asyncio
 async def test_retired_mcp_and_oauth_routes_are_absent(settings: Settings) -> None:
-    application = create_app(settings)
+    application = create_app(settings, start_worker=False)
     transport = httpx.ASGITransport(app=application)
 
     async with (
