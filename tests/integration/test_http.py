@@ -46,8 +46,7 @@ async def test_http_endpoints_and_unknown_route(settings: Settings) -> None:
         "service": "paperless-assistant",
         "version": "0.1.0",
         "environment": "development",
-        "mcp_endpoint": "/mcp",
-        "bootstrap_mode": True,
+        "runtime": "health-only",
     }
     assert health.status_code == 200
     assert health.json() == {
@@ -62,29 +61,23 @@ async def test_http_endpoints_and_unknown_route(settings: Settings) -> None:
     assert missing.text == "Not Found"
 
     combined = " ".join([metadata.text, health.text, ready.text, missing.text]).lower()
-    for forbidden in ("token", "credential", "authorization", "document content"):
+    for forbidden in ("token", "credential", "authorization", "document content", "mcp"):
         assert forbidden not in combined
 
 
 @pytest.mark.asyncio
-async def test_mcp_dns_rebinding_protection_rejects_host_and_origin(settings: Settings) -> None:
+async def test_retired_mcp_and_oauth_routes_are_absent(settings: Settings) -> None:
     application = create_app(settings)
     transport = httpx.ASGITransport(app=application)
-    trusted_transport = httpx.ASGITransport(app=application)
 
     async with (
         application.router.lifespan_context(application),
-        httpx.AsyncClient(transport=transport, base_url="http://untrusted.example") as client,
-        httpx.AsyncClient(
-            transport=trusted_transport, base_url="http://localhost"
-        ) as trusted_client,
+        httpx.AsyncClient(transport=transport, base_url="http://localhost") as client,
     ):
-        invalid_host = await client.post("/mcp", json={})
-        invalid_origin = await trusted_client.post(
-            "/mcp", json={}, headers={"origin": "https://untrusted.example"}
-        )
+        mcp_get = await client.get("/mcp")
+        mcp_post = await client.post("/mcp", json={})
+        oauth_metadata = await client.get("/.well-known/oauth-protected-resource/mcp")
 
-    assert invalid_host.status_code == 421
-    assert invalid_host.text == "Invalid Host header"
-    assert invalid_origin.status_code == 403
-    assert invalid_origin.text == "Invalid Origin header"
+    assert mcp_get.status_code == 404
+    assert mcp_post.status_code == 404
+    assert oauth_metadata.status_code == 404

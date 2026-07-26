@@ -25,7 +25,7 @@ FROM ${PYTHON_IMAGE} AS runtime
 ARG BUILD_DATE="unknown"
 ARG VCS_REF="unknown"
 LABEL org.opencontainers.image.title="paperless-assistant" \
-      org.opencontainers.image.description="Security-first Paperless Assistant MCP bootstrap" \
+      org.opencontainers.image.description="Security-first Paperless Assistant runtime" \
       org.opencontainers.image.source="https://github.com/joe-cole1/paperless-assistant" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.version="0.1.0" \

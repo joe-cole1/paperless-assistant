@@ -1,6 +1,6 @@
 # ADR 0005: Discord as a separate worker using the shared core
 
-- Status: Accepted
+- Status: Superseded in part by ADR 0006
 - Date: 2026-07-23
 
 ## Context

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "paperless-assistant"
 version = "0.1.0"
-description = "A secure, self-hosted document assistant beginning with an MCP connectivity probe."
+description = "A secure, self-hosted Discord interface for Paperless-ngx."
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
 license = { text = "MIT" }
@@ -18,7 +18,6 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "mcp>=1.28.1,<2",
   "pydantic>=2.13.4,<3",
   "pydantic-settings>=2.14.2,<3",
   "starlette>=1.3.1,<2",
@@ -61,7 +60,7 @@ quote-style = "double"
 [tool.mypy]
 python_version = "3.14"
 strict = true
-files = ["src", "tests", "scripts/mcp_smoke_test.py"]
+files = ["src", "tests"]
 plugins = ["pydantic.mypy"]
 
 [tool.pytest.ini_options]

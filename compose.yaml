@@ -1,6 +1,6 @@
 services:
-  paperless-mcp:
-    container_name: PaperlessMCP
+  paperless-assistant:
+    container_name: PaperlessAssistant
     image: paperless-assistant:0.1.0
     build:
       context: .
@@ -8,7 +8,7 @@ services:
     env_file:
       - .env
     ports:
-      - "8780:8000"
+      - "127.0.0.1:8780:8000"
     restart: unless-stopped
     init: true
     read_only: true
