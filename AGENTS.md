@@ -31,6 +31,9 @@ These instructions apply to the entire repository.
 
 - Keep changes small and coherent; use full type annotations and async I/O at network boundaries.
 - Update tests, documentation, configuration examples, and ADRs with the behavior they describe.
+- Maintain 100% statement and branch coverage. Every bug fix must include a regression test that
+  fails without the fix and passes with it; do not use exclusions or trivial assertions to hide
+  untested behavior.
 - Before every push, run `./scripts/ship_check.sh`. This is the mandatory ship gate and must stay
   synchronized with `.github/workflows/ci.yml`; it runs the lock check, actionlint, Ruff
   lint/format, mypy, pytest with coverage, dependency audit, and container smoke test using the

@@ -10,6 +10,7 @@ import pytest
 from paperless_assistant.errors import InvalidAttachmentError
 from paperless_assistant.models import Taxonomy, TaxonomyItem
 from paperless_assistant.policy import (
+    _looks_like_text,
     discord_safe_chunks,
     find_required_tag,
     normalize_text,
@@ -56,6 +57,13 @@ def test_multiple_single_value_matches_apply_neither() -> None:
 
     assert guidance.correspondent_id is None
     assert guidance.document_type_id is None
+
+
+def test_empty_taxonomy_names_never_match() -> None:
+    source = TaxonomyItem(1, "Discord")
+    taxonomy = Taxonomy((source, TaxonomyItem(2, "")), (), ())
+
+    assert resolve_taxonomy("", taxonomy, source).tag_ids == (1,)
 
 
 def test_required_tag_must_be_unique_and_exact() -> None:
@@ -193,6 +201,40 @@ def test_invalid_files_are_actionable(
     assert message in caught.value.user_message
 
 
+def test_text_and_zip_faults_fail_closed(tmp_path: Path) -> None:
+    assert not _looks_like_text(b"", tmp_path / "missing")
+
+    invalid_utf8 = tmp_path / "invalid-utf8"
+    invalid_utf8.write_bytes(b"\xff")
+    with pytest.raises(InvalidAttachmentError) as invalid_text:
+        validate_attachment(invalid_utf8, "invalid.txt", office_enabled=False)
+    assert "UTF-8" in invalid_text.value.user_message
+
+    malformed_zip = tmp_path / "malformed"
+    malformed_zip.write_bytes(b"PK\x03\x04not-a-zip")
+    with pytest.raises(InvalidAttachmentError):
+        validate_attachment(malformed_zip, "malformed.docx", office_enabled=True)
+
+    unknown_ooxml = tmp_path / "unknown-ooxml"
+    with zipfile.ZipFile(unknown_ooxml, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types />")
+        archive.writestr("custom/item.xml", "synthetic")
+    with pytest.raises(InvalidAttachmentError):
+        validate_attachment(unknown_ooxml, "unknown.docx", office_enabled=True)
+
+    oversized_mimetype = tmp_path / "oversized-mimetype"
+    with zipfile.ZipFile(oversized_mimetype, "w") as archive:
+        archive.writestr("mimetype", "x" * 257)
+    with pytest.raises(InvalidAttachmentError):
+        validate_attachment(oversized_mimetype, "oversized.odt", office_enabled=True)
+
+    invalid_mimetype = tmp_path / "invalid-mimetype"
+    with zipfile.ZipFile(invalid_mimetype, "w") as archive:
+        archive.writestr("mimetype", b"\xff")
+    with pytest.raises(InvalidAttachmentError):
+        validate_attachment(invalid_mimetype, "invalid.odt", office_enabled=True)
+
+
 def test_office_disabled(tmp_path: Path) -> None:
     path = tmp_path / "staged"
     path.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
@@ -214,3 +256,11 @@ def test_discord_chunks_mentions_and_ordinals() -> None:
     assert select_ordinal("send the third", [11]) == ()
     assert select_ordinal("what did it say?", [11]) is None
     assert sum_sizes([1, 2, 3]) == 6
+
+
+def test_discord_chunks_prefer_newlines_and_drop_trailing_whitespace() -> None:
+    newline_chunks = discord_safe_chunks(("a" * 80) + "\n" + ("b" * 80), limit=100)
+    exact_chunks = discord_safe_chunks(("x" * 100) + " ", limit=100)
+
+    assert newline_chunks == ("a" * 80, "b" * 80)
+    assert exact_chunks == ("x" * 100,)
