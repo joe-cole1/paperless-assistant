@@ -34,10 +34,12 @@ These instructions apply to the entire repository.
 - Maintain 100% statement and branch coverage. Every bug fix must include a regression test that
   fails without the fix and passes with it; do not use exclusions or trivial assertions to hide
   untested behavior.
-- Before every push, run `./scripts/ship_check.sh`. This is the mandatory ship gate and must stay
-  synchronized with `.github/workflows/ci.yml`; it runs the lock check, actionlint, Ruff
-  lint/format, mypy, pytest with coverage, dependency audit, and container smoke test using the
-  same managed Python version and Linux temporary-filesystem semantics as CI.
+- Before every push, run `./scripts/ship_check.sh` unless the user explicitly instructs you to
+  skip local CI for that push. Record an explicit waiver and the unrun checks plainly in the pull
+  request and final report. The ship gate must stay synchronized with `.github/workflows/ci.yml`;
+  it runs the lock check, actionlint, Ruff lint/format, mypy, pytest with coverage, dependency
+  audit, and container smoke test using the same managed Python version and Linux
+  temporary-filesystem semantics as CI.
 - Do not substitute partial or approximate commands for the ship gate. If it cannot run or fails,
   do not push; report the exact failure and resolve it first.
 - Never bypass a failing check or fabricate successful test output. Report unrun or failing checks plainly.
@@ -51,6 +53,9 @@ These instructions apply to the entire repository.
 ## Repository operations
 
 - Use GitHub MCP for repository, issue, and pull-request context when available; use `gh` and local Git for local operations.
+- A sandboxed `gh auth status` can falsely report an invalid token. Before reporting an
+  authentication blocker or asking the user to refresh credentials, retry the check or the
+  required GitHub operation with unrestricted network access.
 - Keep GitHub Actions pinned to immutable commit SHAs and grant minimal permissions.
 - Never place production secrets in CI. Keep containers non-root and hardened unless an issue documents and reviews an exception.
 - Follow private vulnerability reporting guidance in `SECURITY.md`.
