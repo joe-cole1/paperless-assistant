@@ -130,6 +130,8 @@ jobs:
             release_flags+=(--prerelease --latest=false)
           fi
 
+          # Backticks below are intentional literal Markdown code spans.
+          # shellcheck disable=SC2016
           notes=$(printf 'Container image: `%s/%s@%s`\n\nPlatforms: `linux/amd64` and `linux/arm64` (ARMv8).' \
             "${REGISTRY}" "${IMAGE_NAME}" "${IMAGE_DIGEST}")
 
