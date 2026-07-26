@@ -319,7 +319,7 @@ def _assistant(
         cast(Any, ingestion),
         cast(Any, delivery),
         cast(Any, taxonomy),
-        lambda _: None,
+        ready_callback=lambda _: None,
     )
 
 
@@ -968,7 +968,7 @@ async def test_background_loops_lifecycle_and_ready_paths(
         cast(Any, ingestion),
         cast(Any, FakeDelivery(tmp_path)),
         cast(Any, taxonomy),
-        ready.append,
+        ready_callback=ready.append,
     )
 
     async def complete() -> None:
@@ -1114,7 +1114,7 @@ async def test_gateway_lifecycle_hooks(
         cast(Any, ingestion),
         cast(Any, FakeDelivery(tmp_path)),
         cast(Any, taxonomy),
-        ready.append,
+        ready_callback=ready.append,
     )
     started: list[Any] = []
 

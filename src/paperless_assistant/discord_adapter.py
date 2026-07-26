@@ -101,6 +101,7 @@ class DiscordAssistant(discord.Client):
         ingestion: IngestionService,
         delivery: DeliveryService,
         taxonomy: TaxonomyCache,
+        *,
         ready_callback: Callable[[bool], None],
     ) -> None:
         intents = discord.Intents.none()

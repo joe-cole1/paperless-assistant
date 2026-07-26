@@ -58,7 +58,7 @@ class Runtime:
             self.ingestion,
             self.delivery,
             self.taxonomy,
-            self._set_ready,
+            ready_callback=self._set_ready,
         )
         self.ready = False
         self._tasks: set[asyncio.Task[None]] = set()
