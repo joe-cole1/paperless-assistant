@@ -28,15 +28,13 @@ uv run pre-commit install
 ## Required checks
 
 ```console
-uv lock --check
-uv run --locked ruff check .
-uv run --locked ruff format --check .
-uv run --locked mypy
-uv run --locked pytest
-uv run --locked pip-audit
-docker compose build
-./scripts/container_smoke_test.sh
+./scripts/ship_check.sh
 ```
+
+The ship gate is the same quality and container suite used by `.github/workflows/ci.yml`. It
+checks the lock, GitHub Actions syntax, Ruff lint and formatting, mypy, pytest and coverage,
+dependency vulnerabilities, and the hardened container runtime. Run it immediately before every
+push.
 
 Do not claim a command passed unless you ran it and observed the result. If a check cannot run locally, say so in the pull request and rely on a clearly identified CI result.
 

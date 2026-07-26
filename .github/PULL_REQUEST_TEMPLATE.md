@@ -43,3 +43,4 @@ Closes #
 - [ ] Dependency and container checks pass or exceptions are documented.
 - [ ] I reviewed the final diff and checked for secrets and generated artifacts.
 - [ ] This PR contains `Closes #…` or `Refs #…`.
+- [ ] This PR has at least one label, preferably a release-note category from `.github/release.yml`.

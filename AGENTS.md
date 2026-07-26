@@ -31,11 +31,18 @@ These instructions apply to the entire repository.
 
 - Keep changes small and coherent; use full type annotations and async I/O at network boundaries.
 - Update tests, documentation, configuration examples, and ADRs with the behavior they describe.
-- Run the relevant Ruff lint/format checks, mypy, pytest with coverage, dependency audit, and container checks.
+- Before every push, run `./scripts/ship_check.sh`. This is the mandatory ship gate and must stay
+  synchronized with `.github/workflows/ci.yml`; it runs the lock check, actionlint, Ruff
+  lint/format, mypy, pytest with coverage, dependency audit, and container smoke test using the
+  same managed Python version and Linux temporary-filesystem semantics as CI.
+- Do not substitute partial or approximate commands for the ship gate. If it cannot run or fails,
+  do not push; report the exact failure and resolve it first.
 - Never bypass a failing check or fabricate successful test output. Report unrun or failing checks plainly.
 - Review `git status`, configured remotes, and the final Git diff before committing. Check for credentials and generated artifacts.
 - Use small, meaningful commits when practical. Never force-push, rewrite shared history, or discard user changes.
 - Pull requests must link the issue and contain `Closes #<number>` or `Refs #<number>` as appropriate.
+- Every pull request must have at least one label before merge. Prefer a category label from
+  `.github/release.yml` so generated release notes classify the change correctly.
 - Before pushing more changes to a branch with an open pull request, inspect its checks and review state.
 
 ## Repository operations
