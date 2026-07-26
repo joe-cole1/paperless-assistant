@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-07-25
 - Depends on: ADR 0006
+- Superseded in part by: ADR 0008
 - Issue: #10
 
 ## Context

@@ -127,27 +127,52 @@ DISCORD_ALLOWED_USER_IDS=[111111111111111111,222222222222222222]
 
 ## 6. Install the assistant
 
-Choose a private directory on the Docker host:
+Choose a private directory for the Compose project:
 
 ```console
 git clone https://github.com/joe-cole1/paperless-assistant.git
 cd paperless-assistant
 cp .env.example .env
 chmod 600 .env
-mkdir -p ./data
-chmod 700 ./data
-sudo chown -R 10001:10001 ./data
 ```
 
-If testing a not-yet-merged branch, check out that branch before copying `.env`:
+Compose creates the persistent `paperless-assistant-data` volume with the ownership required by
+the non-root container. No host data directory, SSH permission change, or Synology UID/GID setup
+is required. In Synology Container Manager, deploy `compose.yaml` as a Project; do not add a
+second `/data` mount to the service.
+
+### Optional advanced host bind mount
+
+Use a host bind mount only when you deliberately want the assistant database visible to
+host-managed backup tools. It restores a one-time Unix ownership requirement and is not needed
+for normal installation.
+
+Stop the service before changing its storage mapping. Create the directory on a local Synology
+Btrfs/ext4 volume, then assign it to the container's numeric UID/GID and restrict it:
 
 ```console
-git switch issue/10-discord-paperless-assistant
+docker compose down
+sudo mkdir -p /volume1/docker/paperless-assistant/data
+sudo chown -R 10001:10001 /volume1/docker/paperless-assistant/data
+sudo chmod 700 /volume1/docker/paperless-assistant/data
+sudo stat -c '%u:%g %a %n' /volume1/docker/paperless-assistant/data
 ```
 
-On Synology, use a durable absolute host directory instead of `./data`, create it first, and make
-UID/GID `10001:10001` its owner. Do not place the state directory in a temporary package or
-download directory.
+The final command must report UID/GID `10001:10001` and mode `700`. Do not continue if it does
+not. Avoid SMB/NFS-backed paths that reject normal Unix `chown` or `chmod`; use a local NAS volume
+instead.
+
+Enable the supplied override and replace its example `source` with the exact absolute directory
+you prepared:
+
+```console
+cp compose.bind-mount.yaml.example compose.override.yaml
+```
+
+Compose automatically reads `compose.override.yaml`. Keep the mapping writable and targeted
+exactly at `/data`. Do not set `PAPERLESS_ASSISTANT_DATA_PATH`; that obsolete variable is no
+longer part of the deployment. After these steps, the normal build and startup commands below
+use the bind mount.
 
 ## 7. Configure `.env`
 
@@ -167,8 +192,6 @@ PAPERLESS_PUBLIC_URL=https://paperless.example.invalid
 PAPERLESS_TOKEN=replace-with-paperless-api-token
 PAPERLESS_SOURCE_TAG=Discord
 PAPERLESS_OFFICE_UPLOADS_ENABLED=false
-
-PAPERLESS_ASSISTANT_DATA_PATH=./data
 ```
 
 Important details:
@@ -340,6 +363,14 @@ Only after the normal tests pass and Paperless Tika/Gotenberg are known to work:
 - Confirm the container has outbound internet access to Discord.
 - Confirm only one assistant replica is running against the SQLite volume.
 
+### Startup reports a `/data` permission error
+
+- Confirm the service uses the `paperless-assistant-data` named volume from `compose.yaml`, not a
+  Synology host-directory mount left over from an earlier setup.
+- Confirm no second `/data` mapping was added in Container Manager.
+- If you deliberately use the advanced bind-mount option in step 6, verify that its local Unix
+  filesystem directory is owned by UID/GID `10001:10001` with mode `0700`.
+
 ### The bot is online but ignores messages
 
 - Enable Message Content intent on the Developer Portal's **Bot** page.
@@ -376,8 +407,28 @@ Only after the normal tests pass and Paperless Tika/Gotenberg are known to work:
 
 ## 12. Back up and update
 
-Back up the configured host data directory, especially `assistant.sqlite3`. Staging and delivery
-files are transient.
+The `paperless-assistant-data` named volume survives image updates, container recreation, and
+`docker compose down`. Do not use `docker compose down -v`, delete the volume in Container
+Manager, or remove it with Docker unless you intend to discard the assistant's recovery,
+idempotency, context, warning, and audit state. Documents already accepted by Paperless remain in
+Paperless; staging and delivery files are transient.
+
+Routine backup is optional for the household deployment. For a consistent SQLite copy, briefly
+stop the worker:
+
+```console
+docker compose stop paperless-assistant
+docker compose cp paperless-assistant:/data/assistant.sqlite3 ./assistant.sqlite3
+docker compose start paperless-assistant
+```
+
+Store that file as sensitive data. It contains minimized identifiers and workflow state, though
+not document contents, questions, answers, captions, filenames, or tokens.
+
+If an existing installation already uses a host bind mount, do not switch it silently to an empty
+named volume. Either migrate its `assistant.sqlite3` into the named volume during a stopped
+maintenance window or retain the existing absolute path using the advanced bind-mount procedure
+in step 6. Verify ownership and mode even if the directory worked with a previous image.
 
 To update after reviewing release notes:
 

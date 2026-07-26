@@ -10,7 +10,7 @@ services:
     environment:
       TZ: ${TZ:-America/New_York}
     volumes:
-      - ${PAPERLESS_ASSISTANT_DATA_PATH:-./data}:/data
+      - paperless-assistant-data:/data
     ports:
       - "127.0.0.1:8780:8000"
     restart: unless-stopped
@@ -39,3 +39,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+
+volumes:
+  paperless-assistant-data:
+    name: paperless-assistant-data

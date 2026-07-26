@@ -39,7 +39,8 @@ ENV PYTHONUNBUFFERED=1 \
     HOME=/home/appuser
 
 RUN groupadd --gid 10001 appuser \
-    && useradd --uid 10001 --gid appuser --create-home --shell /usr/sbin/nologin appuser
+    && useradd --uid 10001 --gid appuser --create-home --shell /usr/sbin/nologin appuser \
+    && install -d --owner=appuser --group=appuser --mode=0700 /data
 
 WORKDIR /app
 COPY --from=builder --chown=appuser:appuser /app/.venv /app/.venv

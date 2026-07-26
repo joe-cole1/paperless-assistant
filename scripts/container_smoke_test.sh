@@ -58,6 +58,13 @@ if [[ "${runtime_uid}" -eq 0 ]]; then
 fi
 echo "Container runs as non-root UID ${runtime_uid}."
 
+data_permissions="$(docker compose exec -T paperless-assistant stat -c '%u:%g:%a' /data)"
+if [[ "${data_permissions}" != "10001:10001:700" ]]; then
+  echo "Persistent data volume has unsafe ownership or permissions: ${data_permissions}." >&2
+  exit 1
+fi
+echo "Persistent data volume is owned by UID/GID 10001:10001 with mode 0700."
+
 read_only="$(docker inspect PaperlessAssistant --format '{{.HostConfig.ReadonlyRootfs}}')"
 if [[ "${read_only}" != "true" ]]; then
   echo "Container root filesystem is not read-only." >&2
