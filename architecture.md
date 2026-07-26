@@ -1,7 +1,7 @@
 # Paperless Assistant architecture
 
 Status: Discord-first MVP implemented by issue #10
-Last updated: 2026-07-25
+Last updated: 2026-07-26
 
 ## 1. Purpose
 
@@ -123,8 +123,10 @@ outages return bounded user-facing failures and must not cause destructive resta
 ## 10. Deployment
 
 The target is a Synology NAS using Docker Compose. The image is immutable except for a restricted
-bind-mounted data directory. Health access is loopback-only. One worker replica is supported;
-horizontal scaling requires a new coordination and storage design.
+Docker-managed data volume whose stable Compose name survives container recreation and stack
+renaming. A host bind mount remains an advanced operator option. Health access is loopback-only.
+One worker replica is supported; horizontal scaling requires a new coordination and storage
+design.
 
 Deployment retains the previous known-good image and configuration for rollback. Database schema
 changes use forward migrations and backups. Staged data is transient and excluded from backups;
@@ -139,7 +141,9 @@ SQLite job/audit state is included according to operator policy.
 - ADR 0005: separate Discord-worker assumptions are superseded in part.
 - ADR 0006: Discord is the primary runtime.
 - ADR 0007: native Paperless chat and immediate durable ingestion.
+- ADR 0008: a Docker-managed volume is the zero-setup persistence default.
 
-Issue #10 is the canonical Discord MVP. Issue #8 is the future least-privilege and Paperless
-permissions hardening phase. A future inbound interface, custom AI layer, public share-link
-capability, or additional user population requires a separate issue and security review.
+Issue #10 is the canonical Discord MVP. Issue #20 corrects its default storage deployment. Issue
+#8 is the future least-privilege and Paperless permissions hardening phase. A future inbound
+interface, custom AI layer, public share-link capability, or additional user population requires
+a separate issue and security review.
