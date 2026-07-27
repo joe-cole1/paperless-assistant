@@ -95,6 +95,7 @@ class FakeMessage:
         self.replies: list[FakeMessage] = []
         self.edits: list[dict[str, Any]] = []
         self.deleted = False
+        self.pinned = False
         self.send_kwargs: dict[str, Any] = {}
 
     async def reply(self, content: str, **kwargs: Any) -> FakeMessage:
@@ -1207,12 +1208,14 @@ async def test_dismiss_button_and_clean_command(
     channel = FakeChannel(settings.discord_questions_channel_id)
     bot_msg = FakeMessage(channel=channel, user_id=123)
     user_msg = FakeMessage(channel=channel, user_id=999)
-    channel.sent.extend([bot_msg, user_msg])
+    pinned_msg = FakeMessage(channel=channel, user_id=999)
+    pinned_msg.pinned = True
+    channel.sent.extend([bot_msg, user_msg, pinned_msg])
     monkeypatch.setattr(discord.Client, "user", property(lambda s: SimpleNamespace(id=123)))
 
     class FakeHistory:
         def __aiter__(self) -> FakeHistory:
-            self._messages = [bot_msg, user_msg]
+            self._messages = [bot_msg, user_msg, pinned_msg]
             self._idx = 0
             return self
 
@@ -1232,6 +1235,6 @@ async def test_dismiss_button_and_clean_command(
     interaction_valid.client = SimpleNamespace(user=SimpleNamespace(id=123))
     await callback(cast(discord.Interaction, interaction_valid), 10)
     assert bot_msg.deleted
-    interaction_valid.followup.send.assert_awaited_with(
-        "Cleaned 1 assistant message(s).", ephemeral=True
-    )
+    assert user_msg.deleted
+    assert not pinned_msg.deleted
+    interaction_valid.followup.send.assert_awaited_with("Cleaned 2 message(s).", ephemeral=True)

@@ -422,10 +422,10 @@ class IngestionService:
         if inbox_tag is None:
             return ()
         removed_message_ids: list[int] = []
-        for msg_id, doc_id in active_uploads:
+        for msg_ids, doc_id in active_uploads:
             doc_tag_ids = await self._gateway.get_document_tag_ids(doc_id)
             if inbox_tag.id not in doc_tag_ids:
-                removed_message_ids.append(msg_id)
+                removed_message_ids.extend(msg_ids)
         return tuple(dict.fromkeys(removed_message_ids))
 
     async def _record(self, job: IngestionJob, outcome: str) -> None:

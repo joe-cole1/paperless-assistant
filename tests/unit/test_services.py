@@ -535,7 +535,7 @@ async def test_check_inbox_tag_removals(
     assert await ingestion.check_inbox_tag_removals() == ()
 
     gateway.doc_tags[44] = (1,)  # inbox tag (2) removed!
-    assert await ingestion.check_inbox_tag_removals() == (50,)
+    assert await ingestion.check_inbox_tag_removals() == (50, 10)
 
     gateway.taxonomy_error = True
     assert await ingestion.check_inbox_tag_removals() == ()
