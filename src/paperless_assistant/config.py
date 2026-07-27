@@ -76,6 +76,11 @@ class Settings(BaseSettings):
     reference_context_ttl_seconds: int = Field(default=15 * 60, ge=60, le=24 * 60 * 60)
 
     cleanup_hour_local: int = Field(default=3, ge=0, le=23)
+    cleanup_inbox_tag: str = Field(default="inbox", min_length=1, max_length=100)
+    cleanup_inbox_tag_enabled: bool = True
+    cleanup_inbox_tag_poll_interval_seconds: int = Field(default=300, ge=30, le=3600)
+    cleanup_question_delay_minutes: int = Field(default=0, ge=0, le=10080)
+    cleanup_upload_delay_minutes: int = Field(default=0, ge=0, le=10080)
     query_conversation_retention_hours: int = Field(default=24, ge=1, le=168)
     failed_message_retention_days: int = Field(default=7, ge=1, le=90)
     audit_retention_days: int = Field(default=90, ge=7, le=3650)
@@ -88,6 +93,7 @@ class Settings(BaseSettings):
         "host",
         "tz",
         "paperless_source_tag",
+        "cleanup_inbox_tag",
         mode="before",
     )
     @classmethod

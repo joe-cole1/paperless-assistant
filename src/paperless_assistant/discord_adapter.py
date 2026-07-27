@@ -72,7 +72,50 @@ def _document_line(document: Document, public_url: str) -> str:
     )
 
 
-def _result_view(principal_id: int, document_id: int, public_url: str) -> discord.ui.View:
+class DismissButton(discord.ui.Button[discord.ui.View]):
+    def __init__(self, allowed_user_ids: frozenset[int]) -> None:
+        super().__init__(
+            label="Dismiss",
+            style=discord.ButtonStyle.secondary,
+            emoji="🗑️",
+            custom_id=f"paperless:dismiss:{uuid4().hex[:8]}",
+        )
+        self._allowed_user_ids = allowed_user_ids
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id not in self._allowed_user_ids:
+            await interaction.response.send_message(
+                "You are not authorized to dismiss this message.",
+                ephemeral=True,
+            )
+            return
+        if interaction.message is not None:
+            with suppress(discord.HTTPException):
+                await interaction.message.delete()
+
+
+def _upload_outcome_view(
+    allowed_user_ids: frozenset[int], public_url: str | None = None
+) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    if public_url is not None:
+        view.add_item(
+            discord.ui.Button(
+                label="Open",
+                style=discord.ButtonStyle.link,
+                url=public_url,
+            )
+        )
+    view.add_item(DismissButton(allowed_user_ids))
+    return view
+
+
+def _result_view(
+    principal_id: int,
+    document_id: int,
+    public_url: str,
+    allowed_user_ids: frozenset[int],
+) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     view.add_item(
         discord.ui.Button(
@@ -88,6 +131,7 @@ def _result_view(principal_id: int, document_id: int, public_url: str) -> discor
             custom_id=f"paperless:send:{principal_id}:{document_id}",
         )
     )
+    view.add_item(DismissButton(allowed_user_ids))
     return view
 
 
@@ -118,6 +162,55 @@ class DiscordAssistant(discord.Client):
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._pending_recovery: list[IngestionOutcome] = []
         self._staging_lock = asyncio.Lock()
+        self.tree = discord.app_commands.CommandTree(self)
+        self._register_commands()
+
+    def _register_commands(self) -> None:
+        @self.tree.command(
+            name="clean",
+            description="Clean up assistant messages in this channel.",
+        )
+        @discord.app_commands.describe(
+            count="Number of recent channel messages to inspect and clean (default: 100)"
+        )
+        async def clean_command(interaction: discord.Interaction, count: int = 100) -> None:
+            if interaction.user.id not in self._settings.discord_allowed_user_ids:
+                await interaction.response.send_message(
+                    "You are not authorized to run this command.", ephemeral=True
+                )
+                return
+            if interaction.channel_id not in (
+                self._settings.discord_questions_channel_id,
+                self._settings.discord_uploads_channel_id,
+            ):
+                await interaction.response.send_message(
+                    "Clean command can only be used in assistant channels.", ephemeral=True
+                )
+                return
+            await interaction.response.defer(ephemeral=True)
+            channel = interaction.channel
+            if not isinstance(channel, discord.TextChannel):
+                await interaction.followup.send("Invalid channel type.", ephemeral=True)
+                return
+            cleaned = 0
+            limit = min(max(1, count), 100)
+            bot_user_id = (
+                self.user.id
+                if self.user is not None
+                else (
+                    interaction.client.user.id
+                    if interaction.client is not None and interaction.client.user is not None
+                    else None
+                )
+            )
+            async for message in channel.history(limit=limit):
+                if bot_user_id is not None and message.author.id == bot_user_id:
+                    with suppress(discord.HTTPException):
+                        await message.delete()
+                        cleaned += 1
+            await interaction.followup.send(
+                f"Cleaned {cleaned} assistant message(s).", ephemeral=True
+            )
 
     async def setup_hook(self) -> None:
         """Initialize downstream policy before accepting messages."""
@@ -125,6 +218,8 @@ class DiscordAssistant(discord.Client):
         await self._ingestion.recover(self._notify_recovery)
         self._start_background(self._taxonomy_loop())
         self._start_background(self._recovery_loop())
+        with suppress(discord.HTTPException, discord.app_commands.MissingApplicationID):
+            await self.tree.sync(guild=discord.Object(id=self._settings.discord_guild_id))
 
     def _start_background(self, coroutine: Coroutine[Any, Any, None]) -> None:
         task: asyncio.Task[None] = asyncio.create_task(coroutine)
@@ -286,7 +381,9 @@ class DiscordAssistant(discord.Client):
             url = self._delivery_url(int(document.id))
             result_message = await status.channel.send(
                 f"**Result {index}**\n{_document_line(document, url)}",
-                view=_result_view(principal_id, int(document.id), url),
+                view=_result_view(
+                    principal_id, int(document.id), url, self._settings.discord_allowed_user_ids
+                ),
                 allowed_mentions=NO_MENTIONS,
             )
             result_message_ids.append(result_message.id)
@@ -529,20 +626,40 @@ class DiscordAssistant(discord.Client):
                         f"{index}. `{job.original_filename}` — processing failed.{guidance}"
                     )
                     all_resolved = False
-            await self._replace_status(status, results)
+            succeeded_url = next(
+                (
+                    self._delivery_url(int(recovered.document.id))
+                    for _, recovered in zip(submitted, outcomes, strict=True)
+                    if not isinstance(recovered, BaseException)
+                    and recovered.job.state == JobState.SUCCEEDED
+                    and recovered.document is not None
+                ),
+                None,
+            )
+            await self._replace_status(status, results, succeeded_url)
         if all_resolved:
             with suppress(discord.HTTPException):
                 await message.delete()
 
-    async def _replace_status(self, status: discord.Message, lines: Sequence[str]) -> None:
+    async def _replace_status(
+        self,
+        status: discord.Message,
+        lines: Sequence[str],
+        public_url: str | None = None,
+    ) -> None:
         chunks = discord_safe_chunks("\n".join(lines))
         first = chunks[0] if chunks else "No files were processed."
+        view = _upload_outcome_view(self._settings.discord_allowed_user_ids, public_url)
         try:
-            await status.edit(content=first, allowed_mentions=NO_MENTIONS)
+            await status.edit(content=first, view=view, allowed_mentions=NO_MENTIONS)
         except discord.HTTPException:
-            await status.channel.send(first, allowed_mentions=NO_MENTIONS)
+            await status.channel.send(first, view=view, allowed_mentions=NO_MENTIONS)
         for chunk in chunks[1:]:
-            await status.channel.send(chunk, allowed_mentions=NO_MENTIONS)
+            await status.channel.send(
+                chunk,
+                view=_upload_outcome_view(self._settings.discord_allowed_user_ids),
+                allowed_mentions=NO_MENTIONS,
+            )
 
     def _staging_usage(self) -> int:
         try:
@@ -576,12 +693,14 @@ class DiscordAssistant(discord.Client):
                 self._pending_recovery.append(outcome)
             return
         state = outcome.job.state.value.replace("_", " ")
+        public_url: str | None = None
         if outcome.job.state == JobState.SUCCEEDED and outcome.document is not None:
             note = " Guidance note failed." if outcome.note_failed else ""
+            public_url = self._delivery_url(int(outcome.document.id))
             content = (
                 f"Recovered ingestion job `{outcome.job.id}`: "
                 f"[{outcome.document.title}]"
-                f"({self._delivery_url(int(outcome.document.id))}) succeeded.{note}"
+                f"({public_url}) succeeded.{note}"
             )
         elif outcome.job.state == JobState.RECONCILIATION_REQUIRED:
             content = (
@@ -597,6 +716,7 @@ class DiscordAssistant(discord.Client):
             content = f"Recovered ingestion job `{outcome.job.id}`: {state}."
         await channel.send(
             content,
+            view=_upload_outcome_view(self._settings.discord_allowed_user_ids, public_url),
             allowed_mentions=NO_MENTIONS,
         )
         if outcome.job.state == JobState.SUCCEEDED and await self._ingestion.message_succeeded(

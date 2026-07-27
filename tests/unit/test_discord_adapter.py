@@ -17,6 +17,7 @@ import pytest
 from paperless_assistant.config import Settings
 from paperless_assistant.discord_adapter import (
     DiscordAssistant,
+    DismissButton,
     _document_line,
     _is_delivery_request,
     _is_follow_up,
@@ -45,6 +46,7 @@ class FakeChannel:
         self.id = identifier
         self.sent: list[FakeMessage] = []
         self.partial: list[FakeMessage] = []
+        self.history_factory: Callable[[int], Any] | None = None
 
     async def send(self, content: str, **kwargs: Any) -> FakeMessage:
         message = FakeMessage(
@@ -60,6 +62,11 @@ class FakeChannel:
         message = FakeMessage(channel=self, identifier=identifier)
         self.partial.append(message)
         return message
+
+    def history(self, limit: int = 100) -> Any:
+        if self.history_factory is not None:
+            return self.history_factory(limit)
+        return ()
 
 
 class FakeMessage:
@@ -381,8 +388,10 @@ async def test_view_and_exact_message_routing(
         FakeDelivery(tmp_path),
         FakeTaxonomy(),
     )
-    view = _result_view(201, 7, "https://paperless.example.test/doc")
-    assert len(view.children) == 2
+    view = _result_view(
+        201, 7, "https://paperless.example.test/doc", settings.discord_allowed_user_ids
+    )
+    assert len(view.children) == 3
 
     questions = AsyncMock()
     uploads = AsyncMock()
@@ -1135,3 +1144,94 @@ async def test_gateway_lifecycle_hooks(
     await assistant.on_disconnect()
     assert ready[-1] is False
     await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_dismiss_button_and_clean_command(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    assistant = _assistant(
+        settings,
+        FakeQuery(),
+        FakeIngestion(),
+        FakeDelivery(tmp_path),
+        FakeTaxonomy(),
+    )
+
+    button = DismissButton(settings.discord_allowed_user_ids)
+    msg = FakeMessage(channel=FakeChannel(settings.discord_questions_channel_id))
+    interaction_allowed = AsyncMock()
+    interaction_allowed.user = SimpleNamespace(id=201)
+    interaction_allowed.message = msg
+    await button.callback(cast(discord.Interaction, interaction_allowed))
+    interaction_allowed.message = None
+    await button.callback(cast(discord.Interaction, interaction_allowed))
+
+    interaction_unauthorized = AsyncMock()
+    interaction_unauthorized.user = SimpleNamespace(id=999)
+    await button.callback(cast(discord.Interaction, interaction_unauthorized))
+    interaction_unauthorized.response.send_message.assert_awaited_with(
+        "You are not authorized to dismiss this message.", ephemeral=True
+    )
+
+    clean_cmd = assistant.tree.get_command("clean")
+    assert isinstance(clean_cmd, discord.app_commands.Command)
+    callback = cast(Any, clean_cmd.callback)
+
+    interaction_clean = AsyncMock()
+    interaction_clean.user = SimpleNamespace(id=999)
+    await callback(cast(discord.Interaction, interaction_clean), 10)
+    interaction_clean.response.send_message.assert_awaited_with(
+        "You are not authorized to run this command.", ephemeral=True
+    )
+
+    interaction_wrong_channel = AsyncMock()
+    interaction_wrong_channel.user = SimpleNamespace(id=201)
+    interaction_wrong_channel.channel_id = 999
+    await callback(cast(discord.Interaction, interaction_wrong_channel), 10)
+    interaction_wrong_channel.response.send_message.assert_awaited_with(
+        "Clean command can only be used in assistant channels.", ephemeral=True
+    )
+
+    interaction_non_text = AsyncMock()
+    interaction_non_text.user = SimpleNamespace(id=201)
+    interaction_non_text.channel_id = settings.discord_questions_channel_id
+    interaction_non_text.channel = "invalid"
+    await callback(cast(discord.Interaction, interaction_non_text), 10)
+    interaction_non_text.followup.send.assert_awaited_with("Invalid channel type.", ephemeral=True)
+
+    monkeypatch.setattr(discord, "TextChannel", FakeChannel)
+    channel = FakeChannel(settings.discord_questions_channel_id)
+    bot_msg = FakeMessage(channel=channel, user_id=123)
+    user_msg = FakeMessage(channel=channel, user_id=999)
+    channel.sent.extend([bot_msg, user_msg])
+    monkeypatch.setattr(discord.Client, "user", property(lambda s: SimpleNamespace(id=123)))
+
+    class FakeHistory:
+        def __aiter__(self) -> FakeHistory:
+            self._messages = [bot_msg, user_msg]
+            self._idx = 0
+            return self
+
+        async def __anext__(self) -> FakeMessage:
+            if self._idx < len(self._messages):
+                msg = self._messages[self._idx]
+                self._idx += 1
+                return msg
+            raise StopAsyncIteration
+
+    channel.history_factory = lambda limit=100: FakeHistory()
+
+    interaction_valid = AsyncMock()
+    interaction_valid.user = SimpleNamespace(id=201)
+    interaction_valid.channel_id = settings.discord_questions_channel_id
+    interaction_valid.channel = channel
+    interaction_valid.client = SimpleNamespace(user=SimpleNamespace(id=123))
+    await callback(cast(discord.Interaction, interaction_valid), 10)
+    assert bot_msg.deleted
+    interaction_valid.followup.send.assert_awaited_with(
+        "Cleaned 1 assistant message(s).", ephemeral=True
+    )

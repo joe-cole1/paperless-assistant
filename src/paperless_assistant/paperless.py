@@ -215,6 +215,26 @@ class HttpPaperlessGateway:
             document_types=items(document_types),
         )
 
+    async def get_document_tag_ids(self, document_id: int) -> tuple[int, ...]:
+        """Fetch tag IDs currently attached to a document."""
+        try:
+            response = await self._client.get(f"api/documents/{document_id}/")
+            if response.status_code == 404:
+                return ()
+            self._raise_status(response)
+            payload = response.json()
+            raw_tags = payload.get("tags", []) if isinstance(payload, dict) else []
+            if isinstance(raw_tags, list):
+                return tuple(tag_id for tag_id in raw_tags if isinstance(tag_id, int))
+            return ()
+        except (
+            httpx.HTTPError,
+            PaperlessUnavailableError,
+            PaperlessAuthenticationError,
+            ValueError,
+        ):
+            return ()
+
     async def submit_document(
         self,
         path: Path,

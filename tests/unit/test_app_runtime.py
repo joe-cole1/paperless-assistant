@@ -230,3 +230,33 @@ def test_main_builds_uvicorn_app(
     main()
 
     run.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_runtime_inbox_tag_cleanup_loop(
+    settings_factory: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = Runtime(settings_factory(cleanup_inbox_tag_poll_interval_seconds=30))
+    cast(Any, runtime.ingestion).check_inbox_tag_removals = AsyncMock(
+        side_effect=[(), (100,), Exception("synthetic"), asyncio.CancelledError]
+    )
+    cast(Any, runtime.discord).cleanup_messages = AsyncMock()
+
+    calls = 0
+
+    async def toggle_sleep(_: float) -> None:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            runtime.settings = settings_factory(cleanup_inbox_tag_enabled=True)
+
+    monkeypatch.setattr("paperless_assistant.app.asyncio.sleep", toggle_sleep)
+    runtime.settings = settings_factory(cleanup_inbox_tag_enabled=False)
+
+    with pytest.raises(asyncio.CancelledError):
+        await runtime._inbox_tag_cleanup_loop()
+
+    cast(Any, runtime.discord).cleanup_messages.assert_awaited_once_with((), (100,))
+    await runtime.paperless.close()
+    await runtime.discord.close()
