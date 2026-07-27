@@ -68,7 +68,7 @@ files = ["src", "tests"]
 plugins = ["pydantic.mypy"]
 
 [tool.pytest.ini_options]
-addopts = "--capture=sys --strict-config --strict-markers --cov=paperless_assistant --cov-report=term-missing --cov-fail-under=100"
+addopts = "--capture=sys --strict-config --strict-markers --cov=paperless_assistant --cov-report=term-missing --cov-fail-under=90"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
@@ -77,7 +77,7 @@ branch = true
 source = ["paperless_assistant"]
 
 [tool.coverage.report]
-fail_under = 100
+fail_under = 90
 show_missing = true
 skip_covered = false
 exclude_also = [

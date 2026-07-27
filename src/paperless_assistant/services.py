@@ -20,11 +20,13 @@ from paperless_assistant.errors import (
     UnlinkedUserError,
 )
 from paperless_assistant.models import (
+    AISuggestions,
     AuditEvent,
     ChatResult,
     DeliveryPlan,
     Document,
     DocumentId,
+    DocumentUpdate,
     IngestionJob,
     JobState,
     MetadataGuidance,
@@ -204,6 +206,11 @@ class TaxonomyCache:
     @property
     def ingestion_ready(self) -> bool:
         return self._taxonomy is not None and self._required_tag is not None
+
+    @property
+    def snapshot(self) -> Taxonomy | None:
+        """Access the latest visible taxonomy snapshot."""
+        return self._taxonomy
 
     async def refresh(self) -> bool:
         """Refresh atomically; an unavailable or ambiguous tag fails closed."""
@@ -475,6 +482,40 @@ class IngestionService:
                 document_id=job.paperless_document_id,
             )
         )
+
+    async def get_suggestions_for_job(self, job: IngestionJob) -> AISuggestions | None:
+        """Fetch AI suggestions for a completed job."""
+        if job.paperless_document_id is None:
+            return None
+        user_token = (
+            await self._credentials.get_user_token(job.principal_id)
+            if self._credentials is not None
+            else None
+        )
+        if self._credentials is not None and user_token is None:
+            raise UnlinkedUserError("Paperless account is not linked")
+        try:
+            return await self._gateway.get_ai_suggestions(
+                int(job.paperless_document_id), token=user_token
+            )
+        except PaperlessUnavailableError:
+            return None
+
+    async def apply_suggestions(self, job: IngestionJob, updates: DocumentUpdate) -> None:
+        """Apply user-approved suggestions to the document."""
+        if job.paperless_document_id is None:
+            return
+        user_token = (
+            await self._credentials.get_user_token(job.principal_id)
+            if self._credentials is not None
+            else None
+        )
+        if self._credentials is not None and user_token is None:
+            raise UnlinkedUserError("Paperless account is not linked")
+        await self._gateway.update_document(
+            int(job.paperless_document_id), updates, token=user_token
+        )
+        await self._record(job, "suggestions_applied")
 
 
 class DeliveryService:

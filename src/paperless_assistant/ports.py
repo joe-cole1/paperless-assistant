@@ -11,9 +11,11 @@ from uuid import UUID
 from pydantic import SecretStr
 
 from paperless_assistant.models import (
+    AISuggestions,
     AuditEvent,
     ChatResult,
     Document,
+    DocumentUpdate,
     Download,
     IngestionJob,
     JobState,
@@ -57,6 +59,14 @@ class PaperlessGateway(Protocol):
 
     async def add_note(
         self, document_id: int, note: str, *, token: SecretStr | None = None
+    ) -> None: ...
+
+    async def get_ai_suggestions(
+        self, document_id: int, *, token: SecretStr | None = None
+    ) -> AISuggestions: ...
+
+    async def update_document(
+        self, document_id: int, updates: DocumentUpdate, *, token: SecretStr | None = None
     ) -> None: ...
 
     async def download(

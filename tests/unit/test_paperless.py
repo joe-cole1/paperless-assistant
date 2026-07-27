@@ -16,7 +16,7 @@ from paperless_assistant.errors import (
     PaperlessAuthenticationError,
     PaperlessUnavailableError,
 )
-from paperless_assistant.models import DocumentId, MetadataGuidance, TaskState
+from paperless_assistant.models import DocumentId, DocumentUpdate, MetadataGuidance, TaskState
 from paperless_assistant.paperless import (
     CHAT_METADATA_DELIMITER,
     HttpPaperlessGateway,
@@ -455,3 +455,71 @@ async def test_validate_token_and_custom_token_headers(
     # Operational call passing custom token
     await gateway.chat("hello", token=SecretStr("token-valid"))
     assert last_auth_header == "Token token-valid"
+
+
+@pytest.mark.asyncio
+async def test_get_ai_suggestions(settings_factory: Callable[..., Settings]) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/documents/7/suggestions/":
+            return httpx.Response(
+                200,
+                json={
+                    "title": ["Suggested Title", "Other"],
+                    "correspondents": [1],
+                    "document_types": [],
+                    "tags": [2, 3],
+                },
+            )
+        if request.url.path == "/api/documents/8/suggestions/":
+            return httpx.Response(200, text="not json")
+        if request.url.path == "/api/documents/10/suggestions/":
+            raise httpx.ConnectError("connection refused")
+        return httpx.Response(404)
+
+    gateway = _gateway(settings_factory, handler)
+    suggestions = await gateway.get_ai_suggestions(7)
+    assert suggestions.title == "Suggested Title"
+    assert suggestions.correspondent_id == 1
+    assert suggestions.document_type_id is None
+    assert suggestions.tag_ids == (2, 3)
+
+    with pytest.raises(PaperlessUnavailableError, match="malformed"):
+        await gateway.get_ai_suggestions(8)
+
+    with pytest.raises(PaperlessUnavailableError, match="404"):
+        await gateway.get_ai_suggestions(9)
+
+    with pytest.raises(PaperlessUnavailableError, match="unavailable"):
+        await gateway.get_ai_suggestions(10)
+
+
+@pytest.mark.asyncio
+async def test_update_document(settings_factory: Callable[..., Settings]) -> None:
+    import json
+
+    patch_payload = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal patch_payload
+        if request.url.path == "/api/documents/7/":
+            patch_payload = json.loads(request.content)
+            return httpx.Response(200, json={})
+        if request.url.path == "/api/documents/10/":
+            raise httpx.ConnectError("connection refused")
+        return httpx.Response(404)
+
+    gateway = _gateway(settings_factory, handler)
+
+    # Should not send request if updates are empty
+    await gateway.update_document(7, DocumentUpdate())
+    assert not patch_payload
+
+    updates = DocumentUpdate(title="New", tag_ids=(4, 5), correspondent_id=1, document_type_id=2)
+    await gateway.update_document(7, updates)
+    assert patch_payload == {"title": "New", "tags": [4, 5], "correspondent": 1, "document_type": 2}
+
+    with pytest.raises(PaperlessUnavailableError, match="404"):
+        await gateway.update_document(8, updates)
+
+    with pytest.raises(PaperlessUnavailableError, match="unavailable"):
+        await gateway.update_document(10, updates)

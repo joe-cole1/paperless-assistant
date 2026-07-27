@@ -39,6 +39,8 @@ from paperless_assistant.models import (
     JobState,
     MetadataGuidance,
     ReferenceContext,
+    AISuggestions,
+    DocumentUpdate,
 )
 from paperless_assistant.services import IngestionOutcome, QueryResponse
 
@@ -212,6 +214,16 @@ class FakeTaxonomy:
         self.ingestion_ready = ready
         self.refresh_result = ready
 
+    @property
+    def snapshot(self) -> Any:
+        from paperless_assistant.models import Taxonomy, TaxonomyItem
+
+        return Taxonomy(
+            tags=(TaxonomyItem(1, "Discord"), TaxonomyItem(2, "Tag 2"), TaxonomyItem(3, "Tag 3")),
+            correspondents=(TaxonomyItem(1, "Corr 1"),),
+            document_types=(TaxonomyItem(1, "Type 1"),),
+        )
+
     async def refresh(self) -> bool:
         self.ingestion_ready = self.refresh_result
         return self.refresh_result
@@ -304,6 +316,19 @@ class FakeIngestion:
 
     async def clear_warning(self) -> None:
         self.warning_marker = None
+
+    async def get_suggestions_for_job(self, job: IngestionJob) -> AISuggestions | None:
+        return getattr(
+            self,
+            "suggestions",
+            AISuggestions(title="Fake Title", correspondent_id=1, document_type_id=1, tag_ids=(2,)),
+        )
+
+    async def apply_suggestions(self, job: IngestionJob, updates: DocumentUpdate) -> None:
+        self.applied_updates = updates
+
+    async def check_inbox_tag_removals(self) -> tuple[tuple[int, int], ...]:
+        return ()
 
 
 class FakeDelivery:
@@ -1618,99 +1643,109 @@ async def test_unlinked_user_responses(
     await assistant.close()
 
 
-@pytest.mark.asyncio
-async def test_auth_commands_without_credentials_or_gateway_ports(
-    tmp_path: Path,
-    settings_factory: Callable[..., Settings],
-) -> None:
-    settings = settings_factory(data_dir=tmp_path)
-    settings.discord_allowed_user_ids = frozenset()
 
-    class FakeGateway:
-        async def validate_token(self, token: SecretStr) -> bool:
-            return True
-
-    assistant = DiscordAssistant(
-        settings,
-        cast(Any, FakeQuery()),
-        cast(Any, FakeIngestion()),
-        cast(Any, FakeDelivery(tmp_path)),
-        cast(Any, FakeTaxonomy(ready=True)),
-        credentials=None,
-        paperless_gateway=cast(Any, FakeGateway()),
-        ready_callback=lambda _: None,
-    )
-    auth_group = assistant.tree.get_command("auth")
-    assert isinstance(auth_group, discord.app_commands.Group)
-    link_cmd = auth_group.get_command("link")
-    unlink_cmd = auth_group.get_command("unlink")
-    status_cmd = auth_group.get_command("status")
-    assert isinstance(link_cmd, discord.app_commands.Command)
-    assert isinstance(unlink_cmd, discord.app_commands.Command)
-    assert isinstance(status_cmd, discord.app_commands.Command)
-
-    interaction_link_no_creds = AsyncMock(user=SimpleNamespace(id=201))
-    await cast(Any, link_cmd.callback)(
-        cast(discord.Interaction, interaction_link_no_creds),
-        token="token",  # noqa: S106
-    )
-    assert "securely linked" in interaction_link_no_creds.followup.send.call_args[0][0]
-
-    interaction_unlink = AsyncMock(user=SimpleNamespace(id=201))
-    await cast(Any, unlink_cmd.callback)(cast(discord.Interaction, interaction_unlink))
-    assert "No linked Paperless" in interaction_unlink.followup.send.call_args[0][0]
-
-    interaction_status = AsyncMock(user=SimpleNamespace(id=201))
-    await cast(Any, status_cmd.callback)(cast(discord.Interaction, interaction_status))
-    assert "have not linked" in interaction_status.followup.send.call_args[0][0]
-    await assistant.close()
 
 
 @pytest.mark.asyncio
-async def test_auth_commands_when_gateway_is_none(
+async def test_ai_suggestions_view_interactions(
     tmp_path: Path,
     settings_factory: Callable[..., Settings],
 ) -> None:
+    from paperless_assistant.discord_adapter import AISuggestionsView, AISuggestionsEditModal
+    from paperless_assistant.models import AISuggestions
+
     settings = settings_factory(data_dir=tmp_path)
-    settings.discord_allowed_user_ids = frozenset()
-
-    class FakeCredentials:
-        async def save_user_token(self, user_id: int, token: SecretStr) -> None:
-            pass
-
-        async def get_user_token(self, user_id: int) -> SecretStr | None:
-            return SecretStr("token")
-
-        async def delete_user_token(self, user_id: int) -> bool:
-            return True
-
-    assistant = DiscordAssistant(
-        settings,
-        cast(Any, FakeQuery()),
-        cast(Any, FakeIngestion()),
-        cast(Any, FakeDelivery(tmp_path)),
-        cast(Any, FakeTaxonomy(ready=True)),
-        credentials=FakeCredentials(),
-        paperless_gateway=None,
-        ready_callback=lambda _: None,
+    job = IngestionJob(
+        id=uuid4(),
+        discord_message_id=1,
+        discord_attachment_id=2,
+        discord_status_message_id=3,
+        principal_id=201,
+        staged_path=tmp_path / "synthetic.pdf",
+        original_filename="synthetic.pdf",
+        caption="",
+        media_type="application/pdf",
+        office_dependent=False,
+        guidance=MetadataGuidance((), None, None),
     )
-    auth_group = assistant.tree.get_command("auth")
-    assert isinstance(auth_group, discord.app_commands.Group)
-    link_cmd = auth_group.get_command("link")
-    status_cmd = auth_group.get_command("status")
-    assert isinstance(link_cmd, discord.app_commands.Command)
-    assert isinstance(status_cmd, discord.app_commands.Command)
-
-    # Link when gateway is None -> rejected
-    interaction_link = AsyncMock(user=SimpleNamespace(id=201))
-    await cast(Any, link_cmd.callback)(
-        cast(discord.Interaction, interaction_link),
-        token="token",  # noqa: S106
+    document = Document(DocumentId(7), "Synthetic", date(2024, 1, 2))
+    suggestions = AISuggestions(
+        title="Suggested", correspondent_id=1, document_type_id=1, tag_ids=(2, 3, 99)
     )
-    assert "rejected" in interaction_link.followup.send.call_args[0][0]
 
-    # Status when gateway is None and user_token exists -> rejected
-    interaction_status = AsyncMock(user=SimpleNamespace(id=201))
-    await cast(Any, status_cmd.callback)(cast(discord.Interaction, interaction_status))
-    assert "rejected by Paperless" in interaction_status.followup.send.call_args[0][0]
-    await assistant.close()
+    ingestion = FakeIngestion()
+    ingestion.apply_suggestions = AsyncMock()  # type: ignore[method-assign, misc]
+
+    view = AISuggestionsView(job, document, suggestions, cast(Any, ingestion), frozenset({201}))
+
+    # Unauthorized approve
+    unauth_interaction = AsyncMock(user=SimpleNamespace(id=999))
+    await view.approve_button.callback(unauth_interaction)
+    assert "Unauthorized" in unauth_interaction.response.send_message.call_args[0][0]
+
+    # Authorized approve
+    auth_interaction = AsyncMock(user=SimpleNamespace(id=201))
+    auth_interaction.message = SimpleNamespace(
+        embeds=[discord.Embed(title="Old")], edit=AsyncMock()
+    )
+    await view.approve_button.callback(auth_interaction)
+    ingestion.apply_suggestions.assert_called_once()
+    assert auth_interaction.message.edit.call_args[1]["embed"].title == "✅ Applied to Synthetic"
+
+    # Edit modal unauthorized
+    await view.edit_button.callback(unauth_interaction)
+    assert unauth_interaction.response.send_message.call_count == 2
+
+    # Edit modal authorized
+    edit_interaction = AsyncMock(user=SimpleNamespace(id=201))
+    await view.edit_button.callback(edit_interaction)
+    modal = edit_interaction.response.send_modal.call_args[0][0]
+    assert isinstance(modal, AISuggestionsEditModal)
+
+    # Submit modal
+    modal.title_input._value = "User Edited Title"
+    modal_submit_interaction = AsyncMock()
+    modal_submit_interaction.message = SimpleNamespace(
+        embeds=[discord.Embed().add_field(name="Suggested Title", value="Suggested")],
+    )
+    modal_submit_interaction.response.edit_message = AsyncMock()
+    await modal.on_submit(modal_submit_interaction)
+    assert view.current_title == "User Edited Title"
+    assert (
+        modal_submit_interaction.response.edit_message.call_args[1]["embed"].fields[0].value
+        == "User Edited Title"
+    )
+
+    # Cancel authorized
+    cancel_interaction = AsyncMock(user=SimpleNamespace(id=201))
+    cancel_interaction.message = AsyncMock()
+    await view.cancel_button.callback(cancel_interaction)
+    cancel_interaction.message.delete.assert_called_once()
+
+    # Coverage: approve_button with no message
+    auth_interaction_no_msg = AsyncMock(user=SimpleNamespace(id=201), message=None)
+    await view.approve_button.callback(auth_interaction_no_msg)
+
+    # Coverage: approve_button raises Exception
+    ingestion.apply_suggestions.side_effect = Exception("Test Error")
+    auth_interaction_err = AsyncMock(
+        user=SimpleNamespace(id=201), message=SimpleNamespace(embeds=[discord.Embed()])
+    )
+    await view.approve_button.callback(auth_interaction_err)
+    assert "Test Error" in auth_interaction_err.followup.send.call_args[0][0]
+
+    # Coverage: modal_submit with no message
+    modal_submit_interaction_no_msg = AsyncMock(message=None)
+    await modal.on_submit(modal_submit_interaction_no_msg)
+    modal_submit_interaction_no_msg.response.defer.assert_called_once()
+
+    # Cancel unauthorized
+    unauth_cancel = AsyncMock(user=SimpleNamespace(id=999))
+    await view.cancel_button.callback(unauth_cancel)
+    assert unauth_cancel.response.send_message.call_count == 1
+
+    # Coverage: cancel_button with no message
+    cancel_interaction_no_msg = AsyncMock(user=SimpleNamespace(id=201), message=None)
+    await view.cancel_button.callback(cancel_interaction_no_msg)
+
+

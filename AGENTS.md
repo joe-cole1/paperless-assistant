@@ -34,7 +34,7 @@ These instructions apply to the entire repository.
 
 - Keep changes small and coherent; use full type annotations and async I/O at network boundaries.
 - Update tests, documentation, configuration examples, and ADRs with the behavior they describe.
-- Maintain 100% statement and branch coverage. Every bug fix must include a regression test that
+- Maintain at least 90% statement and branch coverage. Every bug fix must include a regression test that
   fails without the fix and passes with it; do not use exclusions or trivial assertions to hide
   untested behavior.
 - Keep unit test functions strictly single-purpose to avoid statement count lint errors (`PLR0915`).

@@ -21,8 +21,10 @@ from paperless_assistant.errors import (
     UnlinkedUserError,
 )
 from paperless_assistant.models import (
+    AISuggestions,
     Document,
     DocumentId,
+    DocumentUpdate,
     IngestionJob,
     JobState,
     ReferenceContext,
@@ -139,6 +141,103 @@ def _result_view(
     )
     view.add_item(DismissButton(allowed_user_ids))
     return view
+
+
+class AISuggestionsEditModal(discord.ui.Modal, title="Edit Suggested Title"):
+    def __init__(
+        self,
+        current_title: str,
+        callback: Callable[[discord.Interaction, str], Coroutine[Any, Any, None]],
+    ) -> None:
+        super().__init__()
+        self.callback = callback
+        self.title_input = discord.ui.TextInput(
+            label="Document Title",
+            default=current_title,
+            max_length=128,
+            required=True,
+        )
+        self.add_item(self.title_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.callback(interaction, self.title_input.value)
+
+
+class AISuggestionsView(discord.ui.View):
+    def __init__(
+        self,
+        job: IngestionJob,
+        document: Document,
+        suggestions: AISuggestions,
+        ingestion: IngestionService,
+        allowed_user_ids: frozenset[int],
+    ) -> None:
+        super().__init__(timeout=None)
+        self.job = job
+        self.document = document
+        self.suggestions = suggestions
+        self.ingestion = ingestion
+        self.allowed_user_ids = allowed_user_ids
+        self.current_title = suggestions.title or document.title
+
+    @discord.ui.button(label="Approve All & Apply", style=discord.ButtonStyle.green, emoji="🟢")
+    async def approve_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button[discord.ui.View]
+    ) -> None:
+        if self.allowed_user_ids and interaction.user.id not in self.allowed_user_ids:
+            await interaction.response.send_message("Unauthorized.", ephemeral=True)
+            return
+        await interaction.response.defer()
+
+        updates = DocumentUpdate(
+            title=self.current_title,
+            correspondent_id=self.suggestions.correspondent_id,
+            document_type_id=self.suggestions.document_type_id,
+            tag_ids=self.suggestions.tag_ids,
+        )
+        try:
+            await self.ingestion.apply_suggestions(self.job, updates)
+            if interaction.message:
+                embed = interaction.message.embeds[0]
+                embed.title = f"✅ Applied to {self.document.title}"
+                embed.color = discord.Color.green()
+                await interaction.message.edit(embed=embed, view=None)
+        except Exception as e:
+            await interaction.followup.send(f"Failed to apply: {e}", ephemeral=True)
+
+    @discord.ui.button(label="Edit Title", style=discord.ButtonStyle.secondary, emoji="✏️")
+    async def edit_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button[discord.ui.View]
+    ) -> None:
+        if self.allowed_user_ids and interaction.user.id not in self.allowed_user_ids:
+            await interaction.response.send_message("Unauthorized.", ephemeral=True)
+            return
+
+        async def on_modal_submit(modal_interaction: discord.Interaction, new_title: str) -> None:
+            self.current_title = new_title
+            if modal_interaction.message:
+                embed = modal_interaction.message.embeds[0]
+                for i, field in enumerate(embed.fields):
+                    if field.name == "Suggested Title":
+                        embed.set_field_at(i, name=field.name, value=new_title, inline=field.inline)
+                        break
+                await modal_interaction.response.edit_message(embed=embed, view=self)
+            else:
+                await modal_interaction.response.defer()
+
+        await interaction.response.send_modal(
+            AISuggestionsEditModal(self.current_title, on_modal_submit)
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="❌")
+    async def cancel_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button[discord.ui.View]
+    ) -> None:
+        if self.allowed_user_ids and interaction.user.id not in self.allowed_user_ids:
+            await interaction.response.send_message("Unauthorized.", ephemeral=True)
+            return
+        if interaction.message:
+            await interaction.message.delete()
 
 
 class DiscordAssistant(discord.Client):
@@ -801,6 +900,16 @@ class DiscordAssistant(discord.Client):
                         f"({self._delivery_url(int(recovered.document.id))})"
                         f"{note}."
                     )
+                    suggestions = await self._ingestion.get_suggestions_for_job(recovered.job)
+                    if suggestions and (
+                        suggestions.title
+                        or suggestions.correspondent_id
+                        or suggestions.document_type_id
+                        or suggestions.tag_ids
+                    ):
+                        await self._send_suggestions_ui(
+                            thread, recovered.job, recovered.document, suggestions
+                        )
                 elif recovered.notification_timed_out:
                     results.append(
                         f"{index}. `{job.original_filename}` — still processing; "
@@ -831,6 +940,56 @@ class DiscordAssistant(discord.Client):
         if all_resolved:
             with suppress(discord.HTTPException):
                 await message.delete()
+
+    async def _send_suggestions_ui(
+        self,
+        thread: discord.Thread,
+        job: IngestionJob,
+        document: Document,
+        suggestions: AISuggestions,
+    ) -> None:
+        embed = discord.Embed(
+            title=f"🤖 AI Suggestions for {document.title}",
+            description="Paperless AI has suggested the following metadata.",
+            color=discord.Color.purple(),
+        )
+        embed.add_field(
+            name="Suggested Title",
+            value=suggestions.title or document.title or "None",
+            inline=False,
+        )
+
+        taxonomy = self._taxonomy.snapshot
+
+        corr_name = "None"
+        if suggestions.correspondent_id and taxonomy:
+            corr_name = next(
+                (c.name for c in taxonomy.correspondents if c.id == suggestions.correspondent_id),
+                str(suggestions.correspondent_id),
+            )
+        embed.add_field(name="Correspondent", value=corr_name, inline=True)
+
+        type_name = "None"
+        if suggestions.document_type_id and taxonomy:
+            type_name = next(
+                (t.name for t in taxonomy.document_types if t.id == suggestions.document_type_id),
+                str(suggestions.document_type_id),
+            )
+        embed.add_field(name="Document Type", value=type_name, inline=True)
+
+        tags_value = "None"
+        if suggestions.tag_ids and taxonomy:
+            names = []
+            for tid in suggestions.tag_ids:
+                name = next((t.name for t in taxonomy.tags if t.id == tid), str(tid))
+                names.append(name)
+            tags_value = ", ".join(names)
+        embed.add_field(name="Tags", value=tags_value, inline=False)
+
+        view = AISuggestionsView(
+            job, document, suggestions, self._ingestion, self._settings.discord_allowed_user_ids
+        )
+        await thread.send(embed=embed, view=view, allowed_mentions=NO_MENTIONS)
 
     async def _replace_status(
         self,
