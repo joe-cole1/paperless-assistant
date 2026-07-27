@@ -401,6 +401,31 @@ class IngestionService:
             raise RuntimeError("ingestion job disappeared")
         return job
 
+    async def check_inbox_tag_removals(self) -> tuple[int, ...]:
+        """Return message IDs for active upload notifications whose inbox tag was removed in Paperless."""
+        if not self._settings.cleanup_inbox_tag_enabled:
+            return ()
+        active_uploads = await self._repository.active_succeeded_uploads()
+        if not active_uploads:
+            return ()
+        try:
+            taxonomy = await self._gateway.get_taxonomy()
+        except PaperlessUnavailableError:
+            return ()
+        inbox_tag_name = self._settings.cleanup_inbox_tag.casefold()
+        inbox_tag = next(
+            (tag for tag in taxonomy.tags if tag.name.casefold() == inbox_tag_name),
+            None,
+        )
+        if inbox_tag is None:
+            return ()
+        removed_message_ids: list[int] = []
+        for msg_id, doc_id in active_uploads:
+            doc_tag_ids = await self._gateway.get_document_tag_ids(doc_id)
+            if inbox_tag.id not in doc_tag_ids:
+                removed_message_ids.append(msg_id)
+        return tuple(dict.fromkeys(removed_message_ids))
+
     async def _record(self, job: IngestionJob, outcome: str) -> None:
         await self._audit.record(
             AuditEvent(

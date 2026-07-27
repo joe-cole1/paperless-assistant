@@ -192,6 +192,12 @@ PAPERLESS_PUBLIC_URL=https://paperless.example.invalid
 PAPERLESS_TOKEN=replace-with-paperless-api-token
 PAPERLESS_SOURCE_TAG=Discord
 PAPERLESS_OFFICE_UPLOADS_ENABLED=false
+
+CLEANUP_INBOX_TAG=inbox
+CLEANUP_INBOX_TAG_ENABLED=true
+CLEANUP_INBOX_TAG_POLL_INTERVAL_SECONDS=300
+CLEANUP_QUESTION_DELAY_MINUTES=0
+CLEANUP_UPLOAD_DELAY_MINUTES=0
 ```
 
 Important details:
@@ -200,6 +206,8 @@ Important details:
 - `PAPERLESS_PUBLIC_URL` must be the HTTPS browser URL your wife can open.
 - Do not add `Token ` before `PAPERLESS_TOKEN`; supply only the token value.
 - Keep Office uploads `false` for the first startup.
+- `CLEANUP_INBOX_TAG` configures the Paperless tag monitored for automatic Discord message removal once removed in Paperless.
+- `CLEANUP_QUESTION_DELAY_MINUTES` and `CLEANUP_UPLOAD_DELAY_MINUTES` optionally set auto-deletion timers (0 = default daily 03:00 purge).
 - `DISCORD_MAX_ATTACHMENT_BYTES` controls incoming uploads only. Outgoing files use Discord's
   effective runtime limit automatically.
 - The default cleanup runs at 03:00 in `TZ`.

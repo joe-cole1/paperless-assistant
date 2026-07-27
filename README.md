@@ -16,11 +16,14 @@ testing—follow [docs/INSTALL.md](docs/INSTALL.md).
 Configure two private Discord text channels:
 
 - **questions** — ask “give me John's vaccine records from 2024” or “find the receipts from our
-  Venice trip.” Paperless native chat returns up to three references. Each result has Open and
-  Send File actions; “send me the second one” and “send all of them” also work for 15 minutes.
+  Venice trip.” Paperless native chat returns up to three references. Each result has Open, Send File,
+  and **Dismiss** actions; “send me the second one” and “send all of them” also work for 15 minutes.
 - **uploads** — attach up to ten documents. The attachment is confirmation: files are validated,
-  submitted independently in order, and tracked through Paperless processing. One caption becomes
-  metadata guidance and a Paperless note for every successful file.
+  submitted independently in order, and tracked through Paperless processing. Successful uploads include
+  **Open** and **Dismiss** buttons. Once the configured `CLEANUP_INBOX_TAG` (default `inbox`) is removed
+  from a document in Paperless, the bot automatically deletes the corresponding upload notification message.
+
+Allowlisted users can also run `/clean [count]` in either channel to bulk-purge assistant messages on demand.
 
 If an original exceeds Discord's effective attachment limit, the assistant offers an archived PDF
 when it fits and always provides the session-authenticated original Paperless download link.
@@ -84,6 +87,10 @@ Replace every example ID, URL, and token in `.env`. Important settings:
 - `PAPERLESS_INTERNAL_URL` — private container/LAN API URL
 - `PAPERLESS_PUBLIC_URL` — HTTPS URL users open in a browser
 - `PAPERLESS_OFFICE_UPLOADS_ENABLED=false` — upload policy flag only
+- `CLEANUP_INBOX_TAG=inbox` — tag monitored for removal to auto-delete upload notifications
+- `CLEANUP_INBOX_TAG_POLL_INTERVAL_SECONDS=300` — polling frequency for tag removal checks
+- `CLEANUP_QUESTION_DELAY_MINUTES=0` — optional auto-delete delay for Q&A pairs (0 = daily 03:00 purge)
+- `CLEANUP_UPLOAD_DELAY_MINUTES=0` — optional auto-delete delay for upload notifications
 - `TZ` — container timezone used for the 03:00 cleanup
 
 Tika and Gotenberg remain part of the existing Paperless deployment. Set

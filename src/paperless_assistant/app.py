@@ -80,6 +80,7 @@ class Runtime:
             raise RuntimeError("another paperless-assistant instance holds the active lease")
         self._start_task(self._lease_loop())
         self._start_task(self._cleanup_loop())
+        self._start_task(self._inbox_tag_cleanup_loop())
         self._start_task(
             self.discord.start(self.settings.discord_token.get_secret_value()),
             name="discord-gateway",
@@ -138,15 +139,24 @@ class Runtime:
                 next_run += timedelta(days=1)
             await asyncio.sleep((next_run - local_now).total_seconds())
             now = datetime.now(tz=UTC)
-            context_before = (
-                now - timedelta(hours=self.settings.query_conversation_retention_hours)
-            ).isoformat()
+            question_hours = (
+                self.settings.cleanup_question_delay_minutes / 60.0
+                if self.settings.cleanup_question_delay_minutes > 0
+                else float(self.settings.query_conversation_retention_hours)
+            )
+            context_before = (now - timedelta(hours=question_hours)).isoformat()
             failed_before = (
                 now - timedelta(days=self.settings.failed_message_retention_days)
             ).isoformat()
+            succeeded_hours = (
+                self.settings.cleanup_upload_delay_minutes / 60.0
+                if self.settings.cleanup_upload_delay_minutes > 0
+                else 0.0
+            )
+            succeeded_before = (now - timedelta(hours=succeeded_hours)).isoformat()
             question_ids, upload_ids = await self.repository.cleanup_message_ids(
                 context_before=context_before,
-                succeeded_before=now.isoformat(),
+                succeeded_before=succeeded_before,
                 failed_before=failed_before,
             )
             await self.discord.cleanup_messages(question_ids, upload_ids)
@@ -157,6 +167,25 @@ class Runtime:
             )
             self._purge_delivery_spool(now.timestamp() - 3600)
             await self._purge_orphan_staging(now.timestamp() - 3600)
+
+    async def _inbox_tag_cleanup_loop(self) -> None:
+        interval = max(30, self.settings.cleanup_inbox_tag_poll_interval_seconds)
+        while True:
+            await asyncio.sleep(interval)
+            if not self.settings.cleanup_inbox_tag_enabled:
+                continue
+            try:
+                upload_message_ids = await self.ingestion.check_inbox_tag_removals()
+                if upload_message_ids:
+                    await self.discord.cleanup_messages((), upload_message_ids)
+            except Exception as error:  # noqa: BLE001
+                logger.warning(
+                    "inbox_tag_cleanup_failed",
+                    extra={
+                        "service": self.settings.app_name,
+                        "error_type": type(error).__name__,
+                    },
+                )
 
     def _purge_delivery_spool(self, older_than: float) -> None:
         for path in self.settings.delivery_dir.iterdir():

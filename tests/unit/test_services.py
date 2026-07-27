@@ -63,6 +63,10 @@ class FakeGateway:
         self.download_sizes = {"original": 4, "archived": 3}
         self.download_error_archived = False
         self.last_question: tuple[str, int | None] | None = None
+        self.doc_tags: dict[int, tuple[int, ...]] = {}
+
+    async def get_document_tag_ids(self, document_id: int) -> tuple[int, ...]:
+        return self.doc_tags.get(document_id, (1,))
 
     async def chat(self, question: str, document_id: int | None = None) -> ChatResult:
         self.last_question = (question, document_id)
@@ -493,3 +497,56 @@ async def test_delivery_original_archive_and_link(
     await low_disk_repository.initialize()
     low_disk = DeliveryService(constrained, gateway, low_disk_repository)
     assert (await low_disk.prepare(201, 7, 10)).attachment is None
+
+
+@pytest.mark.asyncio
+async def test_check_inbox_tag_removals(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(
+        data_dir=tmp_path / "data",
+        cleanup_inbox_tag="inbox",
+        cleanup_inbox_tag_enabled=True,
+    )
+    settings.staging_dir.mkdir(parents=True)
+    gateway = FakeGateway()
+    gateway.taxonomy = Taxonomy((TaxonomyItem(1, "Discord"), TaxonomyItem(2, "inbox")), (), ())
+    repository, taxonomy, ingestion = await _services(settings, gateway)
+    assert await ingestion.check_inbox_tag_removals() == ()
+
+    path = settings.staging_dir / "doc"
+    path.write_bytes(b"%PDF-1.7")
+    job = await ingestion.stage(
+        discord_message_id=10,
+        discord_attachment_id=10,
+        discord_status_message_id=50,
+        principal_id=201,
+        staged_path=path,
+        original_filename="synthetic.pdf",
+        caption="caption",
+    )
+    assert job is not None
+    await repository.transition_job(job.id, JobState.STAGED, JobState.SUBMITTING)
+    await repository.transition_job(job.id, JobState.SUBMITTING, JobState.SUBMITTED)
+    await repository.transition_job(job.id, JobState.SUBMITTED, JobState.SUCCEEDED, document_id=44)
+
+    gateway.doc_tags[44] = (1, 2)
+    assert await ingestion.check_inbox_tag_removals() == ()
+
+    gateway.doc_tags[44] = (1,)  # inbox tag (2) removed!
+    assert await ingestion.check_inbox_tag_removals() == (50,)
+
+    gateway.taxonomy_error = True
+    assert await ingestion.check_inbox_tag_removals() == ()
+    gateway.taxonomy_error = False
+
+    gateway.taxonomy = Taxonomy((TaxonomyItem(1, "Discord"),), (), ())
+    assert await ingestion.check_inbox_tag_removals() == ()
+
+    disabled_settings = settings_factory(
+        data_dir=tmp_path / "disabled",
+        cleanup_inbox_tag_enabled=False,
+    )
+    _, _, disabled_ingestion = await _services(disabled_settings, gateway)
+    assert await disabled_ingestion.check_inbox_tag_removals() == ()

@@ -26,6 +26,11 @@ def test_safe_defaults(settings_factory: Callable[..., Settings]) -> None:
     assert settings.staging_dir.name == "staging"
     assert settings.delivery_dir.name == "delivery"
     assert settings.paperless_token.get_secret_value() == "synthetic-paperless-token"
+    assert settings.cleanup_inbox_tag == "inbox"
+    assert settings.cleanup_inbox_tag_enabled is True
+    assert settings.cleanup_inbox_tag_poll_interval_seconds == 300
+    assert settings.cleanup_question_delay_minutes == 0
+    assert settings.cleanup_upload_delay_minutes == 0
 
 
 def test_required_secrets_and_ids_have_no_defaults() -> None:
@@ -46,6 +51,7 @@ def test_required_secrets_and_ids_have_no_defaults() -> None:
         ("data_dir", "relative"),
         ("paperless_public_url", "http://paperless.example.test"),
         ("paperless_source_tag", " Discord "),
+        ("cleanup_inbox_tag", " inbox "),
     ],
 )
 def test_invalid_configuration_is_rejected(

@@ -71,6 +71,24 @@ async def test_owned_gateway_client_closes(settings_factory: Callable[..., Setti
 
 
 @pytest.mark.asyncio
+async def test_get_document_tag_ids(settings_factory: Callable[..., Settings]) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/documents/100/":
+            return httpx.Response(200, json={"id": 100, "tags": [1, 2, 5]})
+        if request.url.path == "/api/documents/101/":
+            return httpx.Response(200, json={"id": 101, "tags": "invalid"})
+        if request.url.path == "/api/documents/404/":
+            return httpx.Response(404)
+        return httpx.Response(500)
+
+    gateway = _gateway(settings_factory, handler)
+    assert await gateway.get_document_tag_ids(100) == (1, 2, 5)
+    assert await gateway.get_document_tag_ids(101) == ()
+    assert await gateway.get_document_tag_ids(404) == ()
+    assert await gateway.get_document_tag_ids(500) == ()
+
+
+@pytest.mark.asyncio
 async def test_chat_search_documents_and_urls(
     settings_factory: Callable[..., Settings],
 ) -> None:

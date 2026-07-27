@@ -51,13 +51,10 @@ container-local listener.
 
 ## 4. Ports and adapters
 
-The repository remains a modular monolith:
-
-- inbound Discord adapter: validates transport identity and translates messages/interactions;
-- application services: authorize users and enforce query, delivery, ingestion, and cleanup
-  policy;
-- Paperless gateway: the only component that performs Paperless HTTP calls;
-- ingestion and audit repositories: durable SQLite implementations;
+- inbound Discord adapter: validates transport identity, translates messages/interactions, handles the `/clean` slash command, and provides interactive `Dismiss` buttons;
+- application services: authorize users and enforce query, delivery, ingestion, inbox tag polling, and cleanup policy;
+- Paperless gateway: the only component that performs Paperless HTTP calls (including document tag checks for auto-cleanup);
+- ingestion and audit repositories: durable SQLite implementations tracking active upload notifications;
 - delivery adapter: stages and sends Discord files or returns authenticated Paperless links.
 
 Domain and application code do not import Discord or HTTP client implementations.

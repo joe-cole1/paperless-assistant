@@ -446,6 +446,26 @@ class SQLiteRepository:
             rows = cursor.fetchall()
         return tuple(JobState(row["state"]) for row in rows)
 
+    async def active_succeeded_uploads(self) -> tuple[tuple[int, int], ...]:
+        """Return tuple of (discord_message_id, paperless_document_id) for active succeeded uploads."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                SELECT discord_status_message_id, discord_message_id, paperless_document_id
+                FROM ingestion_jobs
+                WHERE state = ? AND paperless_document_id IS NOT NULL
+                """,
+                (JobState.SUCCEEDED.value,),
+            )
+            rows = cursor.fetchall()
+        results: list[tuple[int, int]] = []
+        for row in rows:
+            msg_id = row["discord_status_message_id"] or row["discord_message_id"]
+            doc_id = row["paperless_document_id"]
+            if msg_id and doc_id:
+                results.append((int(msg_id), int(doc_id)))
+        return tuple(results)
+
     async def protected_staged_paths(self) -> frozenset[Path]:
         """Return every job-owned path, including reconciliation evidence."""
         with self._connection() as connection:
