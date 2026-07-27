@@ -10,6 +10,7 @@ These instructions apply to the entire repository.
 - Work on `issue/<number>-<short-description>`, never directly on the default branch unless explicitly instructed.
 - Keep one primary issue per branch. Do not invent an issue number or silently expand scope.
 - Record newly discovered work as a proposed follow-on issue rather than folding it into the current change.
+- Before pushing follow-up commits, check PR state (`gh pr view`). If the branch's PR is already merged into `main`, create a new issue (`gh issue create`), pull `main`, checkout a new `issue/<number>-<short-description>` branch, and open a fresh PR.
 
 ## Understand the design
 
@@ -17,6 +18,8 @@ These instructions apply to the entire repository.
 - Read the applicable records in `docs/adr/`; add or supersede an ADR for consequential decisions.
 - Preserve the modular-monolith, ports-and-adapters boundaries. Inbound adapters call application services, not other inbound adapters.
 - Implement only currently required capabilities. Do not add speculative Paperless, Gemini, or Discord integrations.
+- Always copy global commands to target guilds (`self.tree.copy_global_to(guild=guild)`) before calling `self.tree.sync(guild=guild)` in `setup_hook()` so slash commands register instantly in server UIs without waiting for global propagation.
+- On-demand `/clean` commands must delete all non-pinned messages (`not message.pinned`). Background auto-cleanups (inbox tag removal, timed expiry) must track and delete paired user prompt message IDs alongside bot response card IDs.
 
 ## Security and privacy
 
@@ -34,6 +37,7 @@ These instructions apply to the entire repository.
 - Maintain 100% statement and branch coverage. Every bug fix must include a regression test that
   fails without the fix and passes with it; do not use exclusions or trivial assertions to hide
   untested behavior.
+- Keep unit test functions strictly single-purpose to avoid statement count lint errors (`PLR0915`).
 - Before every push, run `./scripts/ship_check.sh` unless the user explicitly instructs you to
   skip local CI for that push. Record an explicit waiver and the unrun checks plainly in the pull
   request and final report. The ship gate must stay synchronized with `.github/workflows/ci.yml`;
