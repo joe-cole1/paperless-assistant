@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -65,7 +66,7 @@ class FakeGateway:
         self.task_error = False
         self.suggestions_error = False
         self.suggestions_result = AISuggestions("Suggested", 1, None, (2,))
-        self.updates_applied = None
+        self.updates_applied: DocumentUpdate | None = None
         self.note_error = False
         self.notes: list[str] = []
         self.download_sizes = {"original": 4, "archived": 3}
@@ -602,8 +603,6 @@ async def test_get_suggestions_for_job(
 
     ingestion._credentials = FakeCreds()  # type: ignore[assignment]
 
-    from uuid import uuid4
-
     job = IngestionJob(
         id=uuid4(),
         discord_message_id=1,
@@ -613,7 +612,7 @@ async def test_get_suggestions_for_job(
         staged_path=Path("synthetic.pdf"),
         original_filename="synthetic.pdf",
         caption="",
-        paperless_document_id=7,
+        paperless_document_id=DocumentId(7),
         media_type="application/pdf",
         office_dependent=False,
         guidance=MetadataGuidance((), None, None),
@@ -625,8 +624,6 @@ async def test_get_suggestions_for_job(
 
     gateway.suggestions_error = True
     assert await ingestion.get_suggestions_for_job(job) is None
-
-    from dataclasses import replace
 
     job_no_doc = replace(job, paperless_document_id=None)
     assert await ingestion.get_suggestions_for_job(job_no_doc) is None
@@ -656,8 +653,6 @@ async def test_apply_suggestions(
 
     ingestion._credentials = FakeCreds()  # type: ignore[assignment]
 
-    from uuid import uuid4
-
     job = IngestionJob(
         id=uuid4(),
         discord_message_id=1,
@@ -667,7 +662,7 @@ async def test_apply_suggestions(
         staged_path=Path("synthetic.pdf"),
         original_filename="synthetic.pdf",
         caption="",
-        paperless_document_id=7,
+        paperless_document_id=DocumentId(7),
         media_type="application/pdf",
         office_dependent=False,
         guidance=MetadataGuidance((), None, None),
@@ -689,7 +684,5 @@ async def test_apply_suggestions(
         await ingestion.apply_suggestions(job, updates)
 
     # Coverage for no paperless_document_id
-    from dataclasses import replace
-
     job_no_doc = replace(job, paperless_document_id=None)
     await ingestion.apply_suggestions(job_no_doc, updates)  # Should return silently

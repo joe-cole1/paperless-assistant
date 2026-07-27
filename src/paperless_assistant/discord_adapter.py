@@ -151,7 +151,7 @@ class AISuggestionsEditModal(discord.ui.Modal, title="Edit Suggested Title"):
     ) -> None:
         super().__init__()
         self.callback = callback
-        self.title_input = discord.ui.TextInput(
+        self.title_input: discord.ui.TextInput[Any] = discord.ui.TextInput(
             label="Document Title",
             default=current_title,
             max_length=128,

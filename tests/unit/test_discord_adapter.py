@@ -17,6 +17,8 @@ from pydantic import SecretStr
 
 from paperless_assistant.config import Settings
 from paperless_assistant.discord_adapter import (
+    AISuggestionsEditModal,
+    AISuggestionsView,
     DiscordAssistant,
     DismissButton,
     _document_embed,
@@ -31,16 +33,18 @@ from paperless_assistant.errors import (
     UnlinkedUserError,
 )
 from paperless_assistant.models import (
+    AISuggestions,
     DeliveryPlan,
     Document,
     DocumentId,
+    DocumentUpdate,
     Download,
     IngestionJob,
     JobState,
     MetadataGuidance,
     ReferenceContext,
-    AISuggestions,
-    DocumentUpdate,
+    Taxonomy,
+    TaxonomyItem,
 )
 from paperless_assistant.services import IngestionOutcome, QueryResponse
 
@@ -216,8 +220,6 @@ class FakeTaxonomy:
 
     @property
     def snapshot(self) -> Any:
-        from paperless_assistant.models import Taxonomy, TaxonomyItem
-
         return Taxonomy(
             tags=(TaxonomyItem(1, "Discord"), TaxonomyItem(2, "Tag 2"), TaxonomyItem(3, "Tag 3")),
             correspondents=(TaxonomyItem(1, "Corr 1"),),
@@ -1643,18 +1645,12 @@ async def test_unlinked_user_responses(
     await assistant.close()
 
 
-
-
-
 @pytest.mark.asyncio
 async def test_ai_suggestions_view_interactions(
     tmp_path: Path,
     settings_factory: Callable[..., Settings],
 ) -> None:
-    from paperless_assistant.discord_adapter import AISuggestionsView, AISuggestionsEditModal
-    from paperless_assistant.models import AISuggestions
-
-    settings = settings_factory(data_dir=tmp_path)
+    _ = settings_factory(data_dir=tmp_path)
     job = IngestionJob(
         id=uuid4(),
         discord_message_id=1,
@@ -1674,7 +1670,7 @@ async def test_ai_suggestions_view_interactions(
     )
 
     ingestion = FakeIngestion()
-    ingestion.apply_suggestions = AsyncMock()  # type: ignore[method-assign, misc]
+    ingestion.apply_suggestions = AsyncMock()  # type: ignore[method-assign]
 
     view = AISuggestionsView(job, document, suggestions, cast(Any, ingestion), frozenset({201}))
 
@@ -1747,5 +1743,3 @@ async def test_ai_suggestions_view_interactions(
     # Coverage: cancel_button with no message
     cancel_interaction_no_msg = AsyncMock(user=SimpleNamespace(id=201), message=None)
     await view.cancel_button.callback(cancel_interaction_no_msg)
-
-

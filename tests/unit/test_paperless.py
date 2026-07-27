@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from pathlib import Path
 from uuid import uuid4
@@ -495,8 +496,6 @@ async def test_get_ai_suggestions(settings_factory: Callable[..., Settings]) -> 
 
 @pytest.mark.asyncio
 async def test_update_document(settings_factory: Callable[..., Settings]) -> None:
-    import json
-
     patch_payload = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
