@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from pydantic import SecretStr
 
 from paperless_assistant.config import Settings
 from paperless_assistant.errors import (
@@ -420,3 +421,37 @@ async def test_write_and_download_filesystem_failures(
         )
     with pytest.raises(PaperlessUnavailableError, match="staging unavailable"):
         await gateway.download(7, tmp_path / "missing-parent" / "destination")
+
+
+@pytest.mark.asyncio
+async def test_validate_token_and_custom_token_headers(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    last_auth_header = ""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal last_auth_header
+        last_auth_header = request.headers.get("authorization", "")
+        if last_auth_header == "Token token-valid":
+            return httpx.Response(200, json={"results": [], "count": 0})
+        return httpx.Response(401, json={"detail": "Invalid token."})
+
+    gateway = _gateway(settings_factory, handler)
+
+    valid = await gateway.validate_token(SecretStr("token-valid"))
+    assert valid is True
+    assert last_auth_header == "Token token-valid"
+
+    invalid = await gateway.validate_token(SecretStr("token-invalid"))
+    assert invalid is False
+
+    # Exception handling in validate_token
+    def failing_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("Connection refused")
+
+    failing_gateway = _gateway(settings_factory, failing_handler)
+    assert await failing_gateway.validate_token(SecretStr("token-valid")) is False
+
+    # Operational call passing custom token
+    await gateway.chat("hello", token=SecretStr("token-valid"))
+    assert last_auth_header == "Token token-valid"

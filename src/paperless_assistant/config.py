@@ -39,7 +39,11 @@ class Settings(BaseSettings):
     discord_guild_id: int = Field(gt=0)
     discord_questions_channel_id: int = Field(gt=0)
     discord_uploads_channel_id: int = Field(gt=0)
-    discord_allowed_user_ids: frozenset[int] = Field(min_length=1)
+    discord_allowed_user_ids: frozenset[int] = Field(default_factory=frozenset)
+    encryption_key: SecretStr = Field(
+        default=SecretStr("development-encryption-key-must-be-provided-in-production"),
+        min_length=1,
+    )
     discord_max_attachments: int = Field(default=10, ge=1, le=10)
     discord_max_attachment_bytes: int = Field(default=25 * MIB, ge=1)
 
@@ -114,8 +118,8 @@ class Settings(BaseSettings):
     @field_validator("discord_allowed_user_ids")
     @classmethod
     def validate_user_ids(cls, value: frozenset[int]) -> frozenset[int]:
-        """Require immutable positive Discord snowflakes."""
-        if not value or any(identifier <= 0 for identifier in value):
+        """Require immutable positive Discord snowflakes when non-empty."""
+        if any(identifier <= 0 for identifier in value):
             raise ValueError("must contain only positive Discord user IDs")
         return value
 

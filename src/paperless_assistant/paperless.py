@@ -12,6 +12,7 @@ from urllib.parse import unquote
 from uuid import UUID
 
 import httpx
+from pydantic import SecretStr
 
 from paperless_assistant.config import Settings
 from paperless_assistant.errors import (
@@ -113,6 +114,23 @@ class HttpPaperlessGateway:
             follow_redirects=False,
         )
 
+    def _headers(self, token: SecretStr | None = None) -> dict[str, str] | None:
+        if token is None:
+            return None
+        return {"Authorization": f"Token {token.get_secret_value()}"}
+
+    async def validate_token(self, token: SecretStr) -> bool:
+        """Validate a candidate Paperless API token via a harmless authenticated request."""
+        try:
+            response = await self._client.get(
+                "api/documents/",
+                params={"page_size": 1},
+                headers=self._headers(token),
+            )
+            return response.status_code == 200
+        except httpx.HTTPError, PaperlessUnavailableError, PaperlessAuthenticationError:
+            return False
+
     async def close(self) -> None:
         """Close the owned connection pool."""
         if self._owns_client:
@@ -125,13 +143,16 @@ class HttpPaperlessGateway:
         if response.is_error:
             raise PaperlessUnavailableError(f"Paperless returned HTTP {response.status_code}")
 
-    async def chat(self, question: str, document_id: int | None = None) -> ChatResult:
+    async def chat(
+        self, question: str, document_id: int | None = None, *, token: SecretStr | None = None
+    ) -> ChatResult:
         """Complete one native Paperless streamed chat call."""
         try:
             async with self._client.stream(
                 "POST",
                 "api/documents/chat/",
                 json={"q": question, "document_id": document_id},
+                headers=self._headers(token),
                 timeout=httpx.Timeout(self._settings.paperless_chat_timeout_seconds),
             ) as response:
                 self._raise_status(response)
@@ -140,14 +161,21 @@ class HttpPaperlessGateway:
             raise PaperlessUnavailableError("Paperless chat unavailable") from error
         return parse_chat_response("".join(chunks))
 
-    async def _paginated(self, endpoint: str) -> tuple[dict[str, Any], ...]:
+    async def _paginated(
+        self, endpoint: str, *, token: SecretStr | None = None
+    ) -> tuple[dict[str, Any], ...]:
         page = 1
         results: list[dict[str, Any]] = []
         while True:
             try:
-                response = await self._client.get(endpoint, params={"page": page, "page_size": 100})
+                response = await self._client.get(
+                    endpoint,
+                    params={"page": page, "page_size": 100},
+                    headers=self._headers(token),
+                )
             except httpx.HTTPError as error:
                 raise PaperlessUnavailableError("Paperless API unavailable") from error
+
             self._raise_status(response)
             try:
                 payload = response.json()
@@ -162,12 +190,15 @@ class HttpPaperlessGateway:
                 return tuple(results)
             page += 1
 
-    async def search_documents(self, query: str, limit: int = 3) -> tuple[Document, ...]:
+    async def search_documents(
+        self, query: str, limit: int = 3, *, token: SecretStr | None = None
+    ) -> tuple[Document, ...]:
         """Use Paperless native full-text search without interpreting the query."""
         try:
             response = await self._client.get(
                 "api/documents/",
                 params={"query": query, "page_size": min(limit, 3)},
+                headers=self._headers(token),
             )
         except httpx.HTTPError as error:
             raise PaperlessUnavailableError("Paperless search unavailable") from error
@@ -181,10 +212,12 @@ class HttpPaperlessGateway:
             raise PaperlessUnavailableError("malformed search response")
         return tuple(_document(item) for item in results[: min(limit, 3)])
 
-    async def get_document(self, document_id: int) -> Document:
+    async def get_document(self, document_id: int, *, token: SecretStr | None = None) -> Document:
         """Fetch current visible metadata for a referenced document."""
         try:
-            response = await self._client.get(f"api/documents/{document_id}/")
+            response = await self._client.get(
+                f"api/documents/{document_id}/", headers=self._headers(token)
+            )
         except httpx.HTTPError as error:
             raise PaperlessUnavailableError("Paperless document unavailable") from error
         self._raise_status(response)
@@ -193,11 +226,11 @@ class HttpPaperlessGateway:
         except ValueError as error:
             raise PaperlessUnavailableError("malformed document response") from error
 
-    async def get_taxonomy(self) -> Taxonomy:
+    async def get_taxonomy(self, *, token: SecretStr | None = None) -> Taxonomy:
         """Read every visible object in the three supported taxonomy categories."""
-        tags = await self._paginated("api/tags/")
-        correspondents = await self._paginated("api/correspondents/")
-        document_types = await self._paginated("api/document_types/")
+        tags = await self._paginated("api/tags/", token=token)
+        correspondents = await self._paginated("api/correspondents/", token=token)
+        document_types = await self._paginated("api/document_types/", token=token)
 
         def items(values: tuple[dict[str, Any], ...]) -> tuple[TaxonomyItem, ...]:
             resolved: list[TaxonomyItem] = []
@@ -215,10 +248,14 @@ class HttpPaperlessGateway:
             document_types=items(document_types),
         )
 
-    async def get_document_tag_ids(self, document_id: int) -> tuple[int, ...]:
+    async def get_document_tag_ids(
+        self, document_id: int, *, token: SecretStr | None = None
+    ) -> tuple[int, ...]:
         """Fetch tag IDs currently attached to a document."""
         try:
-            response = await self._client.get(f"api/documents/{document_id}/")
+            response = await self._client.get(
+                f"api/documents/{document_id}/", headers=self._headers(token)
+            )
             if response.status_code == 404:
                 return ()
             self._raise_status(response)
@@ -241,6 +278,8 @@ class HttpPaperlessGateway:
         filename: str,
         media_type: str,
         guidance: MetadataGuidance,
+        *,
+        token: SecretStr | None = None,
     ) -> UUID:
         """Submit once; any transport ambiguity is fail-closed."""
         fields: dict[str, Any] = {"tags": [str(tag) for tag in guidance.tag_ids]}
@@ -254,6 +293,7 @@ class HttpPaperlessGateway:
                     "api/documents/post_document/",
                     data=fields,
                     files={"document": (filename, stream, media_type)},
+                    headers=self._headers(token),
                 )
         except (OSError, httpx.HTTPError) as error:
             raise AmbiguousSubmissionError("document POST outcome is unknown") from error
@@ -265,10 +305,14 @@ class HttpPaperlessGateway:
         except (KeyError, TypeError, ValueError) as error:
             raise AmbiguousSubmissionError("document POST returned no durable task ID") from error
 
-    async def get_task(self, task_id: UUID) -> PaperlessTask:
+    async def get_task(self, task_id: UUID, *, token: SecretStr | None = None) -> PaperlessTask:
         """Read and normalize one Paperless consumption task."""
         try:
-            response = await self._client.get("api/tasks/", params={"task_id": str(task_id)})
+            response = await self._client.get(
+                "api/tasks/",
+                params={"task_id": str(task_id)},
+                headers=self._headers(token),
+            )
         except httpx.HTTPError as error:
             raise PaperlessUnavailableError("Paperless task unavailable") from error
         self._raise_status(response)
@@ -304,18 +348,22 @@ class HttpPaperlessGateway:
             message=message if isinstance(message, str) else None,
         )
 
-    async def add_note(self, document_id: int, note: str) -> None:
+    async def add_note(
+        self, document_id: int, note: str, *, token: SecretStr | None = None
+    ) -> None:
         """Create one native note idempotently across restart recovery."""
         try:
             endpoint = f"api/documents/{document_id}/notes/"
-            existing = await self._client.get(endpoint)
+            existing = await self._client.get(endpoint, headers=self._headers(token))
             self._raise_status(existing)
             payload = existing.json()
             if isinstance(payload, list) and any(
                 isinstance(item, dict) and item.get("note") == note for item in payload
             ):
                 return
-            response = await self._client.post(endpoint, json={"note": note})
+            response = await self._client.post(
+                endpoint, json={"note": note}, headers=self._headers(token)
+            )
         except httpx.HTTPError as error:
             raise PaperlessUnavailableError("Paperless note unavailable") from error
         except ValueError as error:
@@ -323,7 +371,12 @@ class HttpPaperlessGateway:
         self._raise_status(response)
 
     async def download(
-        self, document_id: int, destination: Path, *, archived: bool = False
+        self,
+        document_id: int,
+        destination: Path,
+        *,
+        archived: bool = False,
+        token: SecretStr | None = None,
     ) -> Download:
         """Stream an original or archived file to a caller-supplied UUID path."""
         params = {"follow_formatting": "true"}
@@ -331,7 +384,10 @@ class HttpPaperlessGateway:
             params["original"] = "true"
         try:
             async with self._client.stream(
-                "GET", f"api/documents/{document_id}/download/", params=params
+                "GET",
+                f"api/documents/{document_id}/download/",
+                params=params,
+                headers=self._headers(token),
             ) as response:
                 self._raise_status(response)
                 fallback = f"document-{document_id}.pdf" if archived else f"document-{document_id}"

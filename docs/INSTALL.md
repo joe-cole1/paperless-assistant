@@ -120,9 +120,9 @@ In Discord:
 2. Right-click the server and select **Copy Server ID**.
 3. Right-click `paperless-questions` and copy its channel ID.
 4. Right-click `paperless-uploads` and copy its channel ID.
-5. Right-click each allowed household member and copy the user ID.
+5. (Optional) Right-click specific allowed household members and copy their user IDs.
 
-Use IDs, not display names. The allowlist is a JSON array such as:
+If `DISCORD_ALLOWED_USER_IDS` is omitted or left empty (`[]`), any Discord user in the private channel can link their Paperless account via `/auth link`. Alternatively, restrict bot interactions to specific users with a JSON array:
 
 ```dotenv
 DISCORD_ALLOWED_USER_IDS=[111111111111111111,222222222222222222]
@@ -154,7 +154,6 @@ Stop the service before changing its storage mapping. Create the directory on a 
 Btrfs/ext4 volume, then assign it to the container's numeric UID/GID and restrict it:
 
 ```console
-docker compose down
 sudo mkdir -p /volume1/docker/paperless-assistant/data
 sudo chown -R 10001:10001 /volume1/docker/paperless-assistant/data
 sudo chmod 700 /volume1/docker/paperless-assistant/data
@@ -188,11 +187,13 @@ DISCORD_TOKEN=replace-with-discord-bot-token
 DISCORD_GUILD_ID=123456789012345678
 DISCORD_QUESTIONS_CHANNEL_ID=123456789012345679
 DISCORD_UPLOADS_CHANNEL_ID=123456789012345680
-DISCORD_ALLOWED_USER_IDS=[123456789012345681,123456789012345682]
+DISCORD_ALLOWED_USER_IDS=[]
+
+ENCRYPTION_KEY=replace-with-secret-passphrase-or-32-byte-base64-key
 
 PAPERLESS_INTERNAL_URL=http://paperless-webserver:8000
 PAPERLESS_PUBLIC_URL=https://paperless.example.invalid
-PAPERLESS_TOKEN=replace-with-paperless-api-token
+PAPERLESS_TOKEN=replace-with-paperless-admin-token
 PAPERLESS_SOURCE_TAG=Discord
 PAPERLESS_OFFICE_UPLOADS_ENABLED=false
 
@@ -205,8 +206,11 @@ CLEANUP_UPLOAD_DELAY_MINUTES=0
 
 Important details:
 
+- `ENCRYPTION_KEY` encrypts user Paperless API tokens stored in the local SQLite database.
+- `PAPERLESS_TOKEN` in `.env` is required for system background tasks (tag taxonomy polling and inbox tag cleanup).
+- Each channel member links their personal Paperless account by typing `/auth link <token>` ephemerally in Discord once the bot is running.
 - `PAPERLESS_INTERNAL_URL` must work from inside this container, not merely from the Docker host.
-- `PAPERLESS_PUBLIC_URL` must be the HTTPS browser URL your wife can open.
+- `PAPERLESS_PUBLIC_URL` must be the HTTPS browser URL your users open.
 - Do not add `Token ` before `PAPERLESS_TOKEN`; supply only the token value.
 - Keep Office uploads `false` for the first startup.
 - `CLEANUP_INBOX_TAG` configures the Paperless tag monitored for automatic Discord message removal once removed in Paperless.
@@ -214,8 +218,6 @@ Important details:
 - `DISCORD_MAX_ATTACHMENT_BYTES` controls incoming uploads only. Outgoing files use Discord's
   effective runtime limit automatically.
 - The default cleanup runs at 03:00 in `TZ`.
-- The MVP intentionally uses the administrator's Paperless token. Issue #8 tracks future
-  least-privilege identities.
 
 Validate Compose without printing the expanded secret-bearing configuration:
 

@@ -1,9 +1,9 @@
 # Paperless Assistant
 
 Paperless Assistant is a private, self-hosted Discord interface for a household
-Paperless-ngx v3 deployment. Allowlisted users can ask ordinary English questions, receive
-Paperless's native AI answer and referenced files, and immediately ingest several mobile
-attachments.
+Paperless-ngx v3 deployment. Allowlisted users can ask ordinary English questions, receive Paperless's native AI answer and referenced files, and immediately ingest several mobile attachments.
+
+Each user securely links their own Paperless API token using the `/auth link <token>` ephemeral command. The token is validated against Paperless and saved in SQLite encrypted with a key derived from `ENCRYPTION_KEY`.
 
 Paperless owns OCR, classification, search, storage, and AI configuration. The assistant adds no
 model, embeddings, query planner, or RAG layer.
@@ -19,7 +19,12 @@ Configure two private Discord text channels:
   Venice trip.” The bot auto-creates a dedicated public thread for each query. Paperless native chat returns up to three references rendered as rich Discord embed cards inside the thread with Open, Send File, and Dismiss controls, and thread-scoped follow-up context.
 - **uploads** — attach up to ten documents. Top-level uploads auto-create a dedicated thread where status updates and Paperless processing progress are reported. Successful uploads include **Open** and **Dismiss** buttons. Once the configured `CLEANUP_INBOX_TAG` (default `inbox`) is removed from a document in Paperless, the bot automatically deletes the corresponding upload notification message (and its thread).
 
-Allowlisted users can also run `/clean [count]` in either channel to bulk-purge assistant messages on demand.
+Slash commands available to users:
+
+- `/auth link <token>` — Ephemerally test and store your Paperless API token.
+- `/auth unlink` — Remove your linked Paperless API token.
+- `/auth status` — Check whether your Paperless account token is linked and valid.
+- `/clean [count]` — Bulk-purge assistant messages on demand in assistant channels.
 
 If an original exceeds Discord's effective attachment limit, the assistant offers an archived PDF
 when it fits and always provides the session-authenticated original Paperless download link.
@@ -44,13 +49,10 @@ See [architecture.md](architecture.md) and [docs/adr](docs/adr).
 
 - Paperless-ngx v3.0.3 with native AI chat configured and its embeddings current
 - one exact, unique visible Paperless tag named `Discord` (configurable)
-- a Paperless API token; the trusted MVP currently uses the operator's admin token
+- a system Paperless API token in `.env` (used for background system tasks such as taxonomy polling and inbox tag cleanup)
 - a private Discord guild, bot application, questions channel, and uploads channel
 - Docker Engine with Docker Compose v2
 - for development: Python 3.14 and uv 0.11.31
-
-Issue #8 tracks replacing the initial admin token with least-privilege identities and object
-permissions.
 
 ## Discord bot setup
 
@@ -64,9 +66,8 @@ only to the private guild and grant the two configured channels:
 - Embed Links
 - Manage Messages
 
-Record the immutable guild, channel, and user IDs with Discord Developer Mode. The assistant
-default-denies DMs, threads, other guilds/channels, bots, webhooks, edited messages, and users not
-listed in `DISCORD_ALLOWED_USER_IDS`.
+Record the immutable guild and channel IDs with Discord Developer Mode. The assistant
+default-denies DMs, threads, other guilds/channels, bots, webhooks, edited messages, and unauthenticated users. `DISCORD_ALLOWED_USER_IDS` is optional; when omitted or empty (`[]`), channel membership serves as the single gatekeeper for `/auth link`.
 
 ## Configure and deploy
 

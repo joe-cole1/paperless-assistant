@@ -13,6 +13,7 @@ from uuid import uuid4
 
 import discord
 import pytest
+from pydantic import SecretStr
 
 from paperless_assistant.config import Settings
 from paperless_assistant.discord_adapter import (
@@ -27,6 +28,7 @@ from paperless_assistant.errors import (
     InvalidAttachmentError,
     PaperlessUnavailableError,
     RateLimitedError,
+    UnlinkedUserError,
 )
 from paperless_assistant.models import (
     DeliveryPlan,
@@ -1369,4 +1371,346 @@ async def test_thread_routing_and_render_query_error_handling(
         user=SimpleNamespace(id=201),
     )
     await assistant.on_interaction(cast(discord.Interaction, malformed))
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_auth_link_and_unlink_commands(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    settings.staging_dir.mkdir(parents=True, exist_ok=True)
+    settings.discord_allowed_user_ids = frozenset()
+
+    class FakeCredentials:
+        def __init__(self) -> None:
+            self.tokens: dict[int, SecretStr] = {}
+
+        async def save_user_token(self, user_id: int, token: SecretStr) -> None:
+            self.tokens[user_id] = token
+
+        async def get_user_token(self, user_id: int) -> SecretStr | None:
+            return self.tokens.get(user_id)
+
+        async def delete_user_token(self, user_id: int) -> bool:
+            return self.tokens.pop(user_id, None) is not None
+
+    class FakeGateway:
+        async def validate_token(self, token: SecretStr) -> bool:
+            return token.get_secret_value() == "valid-token"
+
+    creds = FakeCredentials()
+    gateway = FakeGateway()
+    assistant = DiscordAssistant(
+        settings,
+        cast(Any, FakeQuery()),
+        cast(Any, FakeIngestion()),
+        cast(Any, FakeDelivery(tmp_path)),
+        cast(Any, FakeTaxonomy(ready=True)),
+        credentials=creds,
+        paperless_gateway=cast(Any, gateway),
+        ready_callback=lambda _: None,
+    )
+
+    auth_group = assistant.tree.get_command("auth")
+    assert isinstance(auth_group, discord.app_commands.Group)
+    link_cmd = auth_group.get_command("link")
+    unlink_cmd = auth_group.get_command("unlink")
+    assert isinstance(link_cmd, discord.app_commands.Command)
+    assert isinstance(unlink_cmd, discord.app_commands.Command)
+
+    # Invalid link
+    interaction_invalid = AsyncMock(user=SimpleNamespace(id=9999))
+    await cast(Any, link_cmd.callback)(
+        cast(discord.Interaction, interaction_invalid),
+        token="bad-token",  # noqa: S106
+    )
+    assert "rejected" in interaction_invalid.followup.send.call_args[0][0]
+
+    # Valid link
+    interaction_valid = AsyncMock(user=SimpleNamespace(id=9999))
+    await cast(Any, link_cmd.callback)(
+        cast(discord.Interaction, interaction_valid),
+        token="valid-token",  # noqa: S106
+    )
+    assert "securely linked" in interaction_valid.followup.send.call_args[0][0]
+    assert creds.tokens[9999].get_secret_value() == "valid-token"
+
+    # Unlink
+    interaction_unlink = AsyncMock(user=SimpleNamespace(id=9999))
+    await cast(Any, unlink_cmd.callback)(cast(discord.Interaction, interaction_unlink))
+    assert "removed" in interaction_unlink.followup.send.call_args[0][0]
+
+    # Unlink when empty
+    interaction_unlink_again = AsyncMock(user=SimpleNamespace(id=9999))
+    await cast(Any, unlink_cmd.callback)(cast(discord.Interaction, interaction_unlink_again))
+    assert "No linked Paperless" in interaction_unlink_again.followup.send.call_args[0][0]
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_auth_status_command(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    settings.discord_allowed_user_ids = frozenset()
+
+    class FakeCredentials:
+        def __init__(self) -> None:
+            self.tokens: dict[int, SecretStr] = {}
+
+        async def save_user_token(self, user_id: int, token: SecretStr) -> None:
+            self.tokens[user_id] = token
+
+        async def get_user_token(self, user_id: int) -> SecretStr | None:
+            return self.tokens.get(user_id)
+
+        async def delete_user_token(self, user_id: int) -> bool:
+            return False
+
+    class FakeGateway:
+        async def validate_token(self, token: SecretStr) -> bool:
+            return token.get_secret_value() == "valid-token"
+
+    creds = FakeCredentials()
+    gateway = FakeGateway()
+    assistant = DiscordAssistant(
+        settings,
+        cast(Any, FakeQuery()),
+        cast(Any, FakeIngestion()),
+        cast(Any, FakeDelivery(tmp_path)),
+        cast(Any, FakeTaxonomy(ready=True)),
+        credentials=creds,
+        paperless_gateway=cast(Any, gateway),
+        ready_callback=lambda _: None,
+    )
+
+    auth_group = assistant.tree.get_command("auth")
+    assert isinstance(auth_group, discord.app_commands.Group)
+    status_cmd = auth_group.get_command("status")
+    assert isinstance(status_cmd, discord.app_commands.Command)
+
+    # Status when unlinked
+    interaction_unlinked = AsyncMock(user=SimpleNamespace(id=9999))
+    await cast(Any, status_cmd.callback)(cast(discord.Interaction, interaction_unlinked))
+    assert "have not linked" in interaction_unlinked.followup.send.call_args[0][0]
+
+    # Status when active
+    creds.tokens[9999] = SecretStr("valid-token")
+    interaction_active = AsyncMock(user=SimpleNamespace(id=9999))
+    await cast(Any, status_cmd.callback)(cast(discord.Interaction, interaction_active))
+    assert "linked and active" in interaction_active.followup.send.call_args[0][0]
+
+    # Status when revoked
+    creds.tokens[9999] = SecretStr("revoked-token")
+    interaction_revoked = AsyncMock(user=SimpleNamespace(id=9999))
+    await cast(Any, status_cmd.callback)(cast(discord.Interaction, interaction_revoked))
+    assert "rejected by Paperless" in interaction_revoked.followup.send.call_args[0][0]
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_auth_commands_unauthorized_user(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    settings.discord_allowed_user_ids = frozenset({201})
+
+    assistant = DiscordAssistant(
+        settings,
+        cast(Any, FakeQuery()),
+        cast(Any, FakeIngestion()),
+        cast(Any, FakeDelivery(tmp_path)),
+        cast(Any, FakeTaxonomy(ready=True)),
+        ready_callback=lambda _: None,
+    )
+
+    assert assistant._authorized_user_id(9999) is False
+
+    auth_group = assistant.tree.get_command("auth")
+    assert isinstance(auth_group, discord.app_commands.Group)
+    link_cmd = auth_group.get_command("link")
+    unlink_cmd = auth_group.get_command("unlink")
+    status_cmd = auth_group.get_command("status")
+    clean_cmd = assistant.tree.get_command("clean")
+    assert isinstance(link_cmd, discord.app_commands.Command)
+    assert isinstance(unlink_cmd, discord.app_commands.Command)
+    assert isinstance(status_cmd, discord.app_commands.Command)
+    assert isinstance(clean_cmd, discord.app_commands.Command)
+
+    interaction_unauth = AsyncMock(user=SimpleNamespace(id=9999))
+    await cast(Any, clean_cmd.callback)(cast(discord.Interaction, interaction_unauth), 10)
+    assert "not authorized" in interaction_unauth.response.send_message.call_args[0][0]
+
+    interaction_unauth_link = AsyncMock(user=SimpleNamespace(id=9999))
+    await cast(Any, link_cmd.callback)(
+        cast(discord.Interaction, interaction_unauth_link),
+        token="valid-token",  # noqa: S106
+    )
+    assert "not authorized" in interaction_unauth_link.response.send_message.call_args[0][0]
+
+    interaction_unauth_unlink = AsyncMock(user=SimpleNamespace(id=9999))
+    await cast(Any, unlink_cmd.callback)(cast(discord.Interaction, interaction_unauth_unlink))
+    assert "not authorized" in interaction_unauth_unlink.response.send_message.call_args[0][0]
+
+    interaction_unauth_status = AsyncMock(user=SimpleNamespace(id=9999))
+    await cast(Any, status_cmd.callback)(cast(discord.Interaction, interaction_unauth_status))
+    assert "not authorized" in interaction_unauth_status.response.send_message.call_args[0][0]
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_unlinked_user_responses(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    settings.staging_dir.mkdir(parents=True, exist_ok=True)
+    query = FakeQuery()
+    ingestion = FakeIngestion()
+    delivery = FakeDelivery(tmp_path)
+    taxonomy = FakeTaxonomy(ready=True)
+
+    assistant = DiscordAssistant(
+        settings,
+        cast(Any, query),
+        cast(Any, ingestion),
+        cast(Any, delivery),
+        cast(Any, taxonomy),
+        ready_callback=lambda _: None,
+    )
+
+    async def raise_unlinked(*args: Any, **kwargs: Any) -> Any:
+        raise UnlinkedUserError("unlinked")
+
+    q_channel = FakeChannel(settings.discord_questions_channel_id)
+    msg_unlinked_q = FakeMessage(channel=q_channel, content="What is this?", user_id=201)
+    query.ask = raise_unlinked  # type: ignore[method-assign]
+    await assistant.on_message(cast(discord.Message, msg_unlinked_q))
+    assert "have not linked your Paperless account" in msg_unlinked_q.thread.sent[0].content
+
+    u_channel = FakeChannel(settings.discord_uploads_channel_id)
+    msg_unlinked_u = FakeMessage(
+        channel=u_channel,
+        attachments=[FakeAttachment(1, "doc.pdf", b"%PDF-1.7")],
+        user_id=201,
+    )
+    ingestion.submit = raise_unlinked  # type: ignore[method-assign]
+    await assistant.on_message(cast(discord.Message, msg_unlinked_u))
+    assert "have not linked your Paperless account" in msg_unlinked_u.thread.sent[0].content
+
+    interaction_button = AsyncMock()
+    interaction_button.guild_id = settings.discord_guild_id
+    interaction_button.user = SimpleNamespace(id=201)
+    interaction_button.channel = q_channel
+    interaction_button.channel_id = settings.discord_questions_channel_id
+    interaction_button.data = {"custom_id": "paperless:send:201:7"}
+    delivery.prepare = raise_unlinked  # type: ignore[method-assign]
+    query.context = AsyncMock(return_value=SimpleNamespace(document_ids=(7,)))  # type: ignore[method-assign]
+    await assistant.on_interaction(cast(discord.Interaction, interaction_button))
+    assert (
+        "have not linked your Paperless account" in interaction_button.followup.send.call_args[0][0]
+    )
+
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_auth_commands_without_credentials_or_gateway_ports(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    settings.discord_allowed_user_ids = frozenset()
+
+    class FakeGateway:
+        async def validate_token(self, token: SecretStr) -> bool:
+            return True
+
+    assistant = DiscordAssistant(
+        settings,
+        cast(Any, FakeQuery()),
+        cast(Any, FakeIngestion()),
+        cast(Any, FakeDelivery(tmp_path)),
+        cast(Any, FakeTaxonomy(ready=True)),
+        credentials=None,
+        paperless_gateway=cast(Any, FakeGateway()),
+        ready_callback=lambda _: None,
+    )
+    auth_group = assistant.tree.get_command("auth")
+    assert isinstance(auth_group, discord.app_commands.Group)
+    link_cmd = auth_group.get_command("link")
+    unlink_cmd = auth_group.get_command("unlink")
+    status_cmd = auth_group.get_command("status")
+    assert isinstance(link_cmd, discord.app_commands.Command)
+    assert isinstance(unlink_cmd, discord.app_commands.Command)
+    assert isinstance(status_cmd, discord.app_commands.Command)
+
+    interaction_link_no_creds = AsyncMock(user=SimpleNamespace(id=201))
+    await cast(Any, link_cmd.callback)(
+        cast(discord.Interaction, interaction_link_no_creds),
+        token="token",  # noqa: S106
+    )
+    assert "securely linked" in interaction_link_no_creds.followup.send.call_args[0][0]
+
+    interaction_unlink = AsyncMock(user=SimpleNamespace(id=201))
+    await cast(Any, unlink_cmd.callback)(cast(discord.Interaction, interaction_unlink))
+    assert "No linked Paperless" in interaction_unlink.followup.send.call_args[0][0]
+
+    interaction_status = AsyncMock(user=SimpleNamespace(id=201))
+    await cast(Any, status_cmd.callback)(cast(discord.Interaction, interaction_status))
+    assert "have not linked" in interaction_status.followup.send.call_args[0][0]
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_auth_commands_when_gateway_is_none(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    settings.discord_allowed_user_ids = frozenset()
+
+    class FakeCredentials:
+        async def save_user_token(self, user_id: int, token: SecretStr) -> None:
+            pass
+
+        async def get_user_token(self, user_id: int) -> SecretStr | None:
+            return SecretStr("token")
+
+        async def delete_user_token(self, user_id: int) -> bool:
+            return True
+
+    assistant = DiscordAssistant(
+        settings,
+        cast(Any, FakeQuery()),
+        cast(Any, FakeIngestion()),
+        cast(Any, FakeDelivery(tmp_path)),
+        cast(Any, FakeTaxonomy(ready=True)),
+        credentials=FakeCredentials(),
+        paperless_gateway=None,
+        ready_callback=lambda _: None,
+    )
+    auth_group = assistant.tree.get_command("auth")
+    assert isinstance(auth_group, discord.app_commands.Group)
+    link_cmd = auth_group.get_command("link")
+    status_cmd = auth_group.get_command("status")
+    assert isinstance(link_cmd, discord.app_commands.Command)
+    assert isinstance(status_cmd, discord.app_commands.Command)
+
+    # Link when gateway is None -> rejected
+    interaction_link = AsyncMock(user=SimpleNamespace(id=201))
+    await cast(Any, link_cmd.callback)(
+        cast(discord.Interaction, interaction_link),
+        token="token",  # noqa: S106
+    )
+    assert "rejected" in interaction_link.followup.send.call_args[0][0]
+
+    # Status when gateway is None and user_token exists -> rejected
+    interaction_status = AsyncMock(user=SimpleNamespace(id=201))
+    await cast(Any, status_cmd.callback)(cast(discord.Interaction, interaction_status))
+    assert "rejected by Paperless" in interaction_status.followup.send.call_args[0][0]
     await assistant.close()
