@@ -21,9 +21,11 @@ from paperless_assistant.errors import (
     PaperlessUnavailableError,
 )
 from paperless_assistant.models import (
+    AISuggestions,
     ChatResult,
     Document,
     DocumentId,
+    DocumentUpdate,
     Download,
     MetadataGuidance,
     PaperlessTask,
@@ -271,6 +273,81 @@ class HttpPaperlessGateway:
             ValueError,
         ):
             return ()
+
+    async def get_ai_suggestions(
+        self, document_id: int, *, token: SecretStr | None = None
+    ) -> AISuggestions:
+        """Fetch native Paperless AI metadata suggestions for a document."""
+        try:
+            response = await self._client.get(
+                f"api/documents/{document_id}/suggestions/", headers=self._headers(token)
+            )
+        except httpx.HTTPError as error:
+            raise PaperlessUnavailableError("Paperless suggestions unavailable") from error
+        self._raise_status(response)
+        try:
+            payload = response.json()
+            title_suggestions = payload.get("title", [])
+            title = (
+                title_suggestions[0]
+                if isinstance(title_suggestions, list) and title_suggestions
+                else None
+            )
+
+            corr_suggestions = payload.get("correspondents", [])
+            corr = (
+                corr_suggestions[0]
+                if isinstance(corr_suggestions, list) and corr_suggestions
+                else None
+            )
+
+            dtype_suggestions = payload.get("document_types", [])
+            dtype = (
+                dtype_suggestions[0]
+                if isinstance(dtype_suggestions, list) and dtype_suggestions
+                else None
+            )
+
+            tag_suggestions = payload.get("tags", [])
+            tags = (
+                tuple(t for t in tag_suggestions if isinstance(t, int))
+                if isinstance(tag_suggestions, list)
+                else ()
+            )
+
+            return AISuggestions(
+                title=title if isinstance(title, str) else None,
+                correspondent_id=corr if isinstance(corr, int) else None,
+                document_type_id=dtype if isinstance(dtype, int) else None,
+                tag_ids=tags,
+            )
+        except (ValueError, TypeError, AttributeError) as error:
+            raise PaperlessUnavailableError("malformed suggestions response") from error
+
+    async def update_document(
+        self, document_id: int, updates: DocumentUpdate, *, token: SecretStr | None = None
+    ) -> None:
+        """Apply explicit metadata updates to a document."""
+        fields: dict[str, Any] = {}
+        if updates.title is not None:
+            fields["title"] = updates.title
+        if updates.correspondent_id is not None:
+            fields["correspondent"] = updates.correspondent_id
+        if updates.document_type_id is not None:
+            fields["document_type"] = updates.document_type_id
+        if updates.tag_ids is not None:
+            fields["tags"] = list(updates.tag_ids)
+
+        if not fields:
+            return
+
+        try:
+            response = await self._client.patch(
+                f"api/documents/{document_id}/", json=fields, headers=self._headers(token)
+            )
+        except httpx.HTTPError as error:
+            raise PaperlessUnavailableError("Paperless update unavailable") from error
+        self._raise_status(response)
 
     async def submit_document(
         self,

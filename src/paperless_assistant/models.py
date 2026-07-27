@@ -39,6 +39,26 @@ class MetadataGuidance:
 
 
 @dataclass(frozen=True, slots=True)
+class AISuggestions:
+    """Native AI suggested metadata for an existing document."""
+
+    title: str | None = None
+    correspondent_id: int | None = None
+    document_type_id: int | None = None
+    tag_ids: tuple[int, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentUpdate:
+    """Explicit metadata updates to apply to a document."""
+
+    title: str | None = None
+    correspondent_id: int | None = None
+    document_type_id: int | None = None
+    tag_ids: tuple[int, ...] | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class Document:
     """Privacy-sensitive document metadata used only for Discord responses."""
 

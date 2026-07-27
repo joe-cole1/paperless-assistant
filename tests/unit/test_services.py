@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -16,11 +17,14 @@ from paperless_assistant.errors import (
     ConfigurationUnavailableError,
     PaperlessUnavailableError,
     RateLimitedError,
+    UnlinkedUserError,
 )
 from paperless_assistant.models import (
+    AISuggestions,
     ChatResult,
     Document,
     DocumentId,
+    DocumentUpdate,
     Download,
     IngestionJob,
     JobState,
@@ -56,8 +60,13 @@ class FakeGateway:
         self.taxonomy = Taxonomy((TaxonomyItem(1, "Discord"),), (), ())
         self.taxonomy_error = False
         self.submit_error: Exception | None = None
-        self.task_id = uuid4()
-        self.task = PaperlessTask(self.task_id, TaskState.SUCCESS, DocumentId(44))
+        self.search_error = False
+        self.task = PaperlessTask(uuid4(), TaskState.SUCCESS, DocumentId(44))
+        self.task_id = self.task.task_id
+        self.task_error = False
+        self.suggestions_error = False
+        self.suggestions_result = AISuggestions("Suggested", 1, None, (2,))
+        self.updates_applied: DocumentUpdate | None = None
         self.note_error = False
         self.notes: list[str] = []
         self.download_sizes = {"original": 4, "archived": 3}
@@ -67,6 +76,16 @@ class FakeGateway:
 
     async def validate_token(self, token: object) -> bool:
         return True
+
+    async def get_ai_suggestions(self, document_id: int, *, token: object = None) -> AISuggestions:
+        if self.suggestions_error:
+            raise PaperlessUnavailableError("suggestions error")
+        return self.suggestions_result
+
+    async def update_document(
+        self, document_id: int, updates: DocumentUpdate, *, token: object = None
+    ) -> None:
+        self.updates_applied = updates
 
     async def get_document_tag_ids(
         self, document_id: int, *, token: object = None
@@ -566,3 +585,104 @@ async def test_check_inbox_tag_removals(
     )
     _, _, disabled_ingestion = await _services(disabled_settings, gateway)
     assert await disabled_ingestion.check_inbox_tag_removals() == ()
+
+
+@pytest.mark.asyncio
+async def test_get_suggestions_for_job(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / "data")
+    settings.staging_dir.mkdir(parents=True)
+    gateway = FakeGateway()
+    _, _, ingestion = await _services(settings, gateway)
+
+    class FakeCreds:
+        async def get_user_token(self, user_id: int) -> str:
+            return "token"
+
+    ingestion._credentials = FakeCreds()  # type: ignore[assignment]
+
+    job = IngestionJob(
+        id=uuid4(),
+        discord_message_id=1,
+        discord_attachment_id=2,
+        discord_status_message_id=3,
+        principal_id=201,
+        staged_path=Path("synthetic.pdf"),
+        original_filename="synthetic.pdf",
+        caption="",
+        paperless_document_id=DocumentId(7),
+        media_type="application/pdf",
+        office_dependent=False,
+        guidance=MetadataGuidance((), None, None),
+    )
+
+    s = await ingestion.get_suggestions_for_job(job)
+    assert s is not None
+    assert s.title == "Suggested"
+
+    gateway.suggestions_error = True
+    assert await ingestion.get_suggestions_for_job(job) is None
+
+    job_no_doc = replace(job, paperless_document_id=None)
+    assert await ingestion.get_suggestions_for_job(job_no_doc) is None
+
+    class MissingCreds:
+        async def get_user_token(self, user_id: int) -> str | None:
+            return None
+
+    ingestion._credentials = MissingCreds()  # type: ignore[assignment]
+    with pytest.raises(UnlinkedUserError):
+        await ingestion.get_suggestions_for_job(job)
+
+
+@pytest.mark.asyncio
+async def test_apply_suggestions(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / "data")
+    settings.staging_dir.mkdir(parents=True)
+    gateway = FakeGateway()
+    repository, _, ingestion = await _services(settings, gateway)
+
+    class FakeCreds:
+        async def get_user_token(self, user_id: int) -> str:
+            return "token"
+
+    ingestion._credentials = FakeCreds()  # type: ignore[assignment]
+
+    job = IngestionJob(
+        id=uuid4(),
+        discord_message_id=1,
+        discord_attachment_id=2,
+        discord_status_message_id=3,
+        principal_id=201,
+        staged_path=Path("synthetic.pdf"),
+        original_filename="synthetic.pdf",
+        caption="",
+        paperless_document_id=DocumentId(7),
+        media_type="application/pdf",
+        office_dependent=False,
+        guidance=MetadataGuidance((), None, None),
+    )
+
+    await repository.create_job(job)
+    updates = DocumentUpdate(title="New")
+    await ingestion.apply_suggestions(job, updates)
+    assert gateway.updates_applied is not None
+    assert gateway.updates_applied.title == "New"
+
+    # Coverage for unlinked user
+    class MissingCreds:
+        async def get_user_token(self, user_id: int) -> str | None:
+            return None
+
+    ingestion._credentials = MissingCreds()  # type: ignore[assignment]
+    with pytest.raises(UnlinkedUserError):
+        await ingestion.apply_suggestions(job, updates)
+
+    # Coverage for no paperless_document_id
+    job_no_doc = replace(job, paperless_document_id=None)
+    await ingestion.apply_suggestions(job_no_doc, updates)  # Should return silently
