@@ -82,7 +82,7 @@ install a private bot. Sign in to Discord as one of those accounts and use the b
 authorization flow instead of the Installation page's install-link setting:
 
 1. Open **General Information** and copy the **Application ID**. This ID is not the bot token.
-2. Open **OAuth2 → URL Generator** and select only the `bot` scope.
+2. Open **OAuth2 → URL Generator** and select both the `bot` and `applications.commands` scopes.
 3. Grant:
    - View Channels
    - Send Messages
@@ -90,11 +90,12 @@ authorization flow instead of the Installation page's install-link setting:
    - Attach Files
    - Embed Links
    - Manage Messages
+   - Use Application Commands
 4. Copy and open the generated URL. If the Portal does not show a generated URL, replace
    `APPLICATION_ID` in this equivalent authorization URL:
 
    ```text
-   https://discord.com/oauth2/authorize?client_id=APPLICATION_ID&integration_type=0&scope=bot&permissions=125952
+   https://discord.com/oauth2/authorize?client_id=APPLICATION_ID&scope=bot%20applications.commands&permissions=2147609600
    ```
 
 5. Choose **Add to server** and select the private household server.
