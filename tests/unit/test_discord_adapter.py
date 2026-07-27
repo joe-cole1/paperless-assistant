@@ -18,7 +18,7 @@ from paperless_assistant.config import Settings
 from paperless_assistant.discord_adapter import (
     DiscordAssistant,
     DismissButton,
-    _document_line,
+    _document_embed,
     _is_delivery_request,
     _is_follow_up,
     _result_view,
@@ -393,10 +393,14 @@ def test_language_helpers() -> None:
     assert not _is_delivery_request("Where is it?")
     assert _is_follow_up("What about the date?")
     assert not _is_follow_up("Find a vaccine record")
-    assert "2024-01-02" in _document_line(document, "https://example.test")
-    assert "date unavailable" in _document_line(
-        Document(DocumentId(8), "No Date", None), "https://example.test"
-    )
+
+    embed = _document_embed(document, "https://example.test")
+    assert embed.title == "📄 Synthetic"
+    assert embed.fields[0].value == "Jan 02, 2024"
+    assert embed.fields[1].value == "7"
+
+    undated = _document_embed(Document(DocumentId(8), "No Date", None), "https://example.test")
+    assert undated.fields[0].value == "Unavailable"
 
 
 @pytest.mark.asyncio
@@ -480,7 +484,7 @@ async def test_questions_guidance_answer_followup_and_errors(
     assert question.thread.sent[0].content == "Native answer"
     assert query.asked[-1] == (201, "Find my record", None)
     assert query.saved is not None
-    assert question.thread.sent[1].content.startswith("**Result 1**")
+    assert question.thread.sent[1].send_kwargs["embed"].title.startswith("📄 ")
 
     query.current_context = _context(7, message_ids=(1234,))
     followup = FakeMessage(channel=channel, content="What about its date?")
