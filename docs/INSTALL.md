@@ -86,6 +86,9 @@ authorization flow instead of the Installation page's install-link setting:
 3. Grant:
    - View Channels
    - Send Messages
+   - Send Messages in Threads
+   - Create Public Threads
+   - Manage Threads
    - Read Message History
    - Attach Files
    - Embed Links
@@ -95,7 +98,7 @@ authorization flow instead of the Installation page's install-link setting:
    `APPLICATION_ID` in this equivalent authorization URL:
 
    ```text
-   https://discord.com/oauth2/authorize?client_id=APPLICATION_ID&scope=bot%20applications.commands&permissions=2147609600
+   https://discord.com/oauth2/authorize?client_id=APPLICATION_ID&scope=bot%20applications.commands&permissions=328565124096
    ```
 
 5. Choose **Add to server** and select the private household server.
@@ -104,8 +107,7 @@ Discord requires the installing account to have permission to manage the server.
 need Administrator.
 
 After installation, review the two private channels' permission overrides. The bot role must have
-the permissions above in both channels. **Manage Messages** lets it remove successfully processed
-upload messages and retained status messages. Do not grant it access to unrelated private channels.
+the permissions above in both channels. **Create Public Threads**, **Send Messages in Threads**, and **Manage Threads** allow the bot to nest responses under top-level user comments, while **Manage Messages** lets it remove successfully processed upload messages and retained status messages. Do not grant it access to unrelated private channels.
 
 Discord explains bot tokens, scopes, and least-privilege server permissions in its
 [OAuth2 and permissions guide](https://docs.discord.com/developers/platform/oauth2-and-permissions).

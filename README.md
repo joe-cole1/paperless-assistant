@@ -16,12 +16,8 @@ testing—follow [docs/INSTALL.md](docs/INSTALL.md).
 Configure two private Discord text channels:
 
 - **questions** — ask “give me John's vaccine records from 2024” or “find the receipts from our
-  Venice trip.” Paperless native chat returns up to three references. Each result has Open, Send File,
-  and **Dismiss** actions; “send me the second one” and “send all of them” also work for 15 minutes.
-- **uploads** — attach up to ten documents. The attachment is confirmation: files are validated,
-  submitted independently in order, and tracked through Paperless processing. Successful uploads include
-  **Open** and **Dismiss** buttons. Once the configured `CLEANUP_INBOX_TAG` (default `inbox`) is removed
-  from a document in Paperless, the bot automatically deletes the corresponding upload notification message.
+  Venice trip.” The bot auto-creates a dedicated public thread for each query. Paperless native chat returns up to three references inside the thread with direct file attachments (when within size limits), Open/Send File/Dismiss controls, and thread-scoped follow-up context.
+- **uploads** — attach up to ten documents. Top-level uploads auto-create a dedicated thread where status updates and Paperless processing progress are reported. Successful uploads include **Open** and **Dismiss** buttons. Once the configured `CLEANUP_INBOX_TAG` (default `inbox`) is removed from a document in Paperless, the bot automatically deletes the corresponding upload notification message (and its thread).
 
 Allowlisted users can also run `/clean [count]` in either channel to bulk-purge assistant messages on demand.
 
