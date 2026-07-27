@@ -1148,20 +1148,11 @@ async def test_gateway_lifecycle_hooks(
 
 
 @pytest.mark.asyncio
-async def test_dismiss_button_and_clean_command(
+async def test_dismiss_button_callback(
     tmp_path: Path,
     settings_factory: Callable[..., Settings],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = settings_factory(data_dir=tmp_path)
-    assistant = _assistant(
-        settings,
-        FakeQuery(),
-        FakeIngestion(),
-        FakeDelivery(tmp_path),
-        FakeTaxonomy(),
-    )
-
     button = DismissButton(settings.discord_allowed_user_ids)
     msg = FakeMessage(channel=FakeChannel(settings.discord_questions_channel_id))
     interaction_allowed = AsyncMock()
@@ -1176,6 +1167,22 @@ async def test_dismiss_button_and_clean_command(
     await button.callback(cast(discord.Interaction, interaction_unauthorized))
     interaction_unauthorized.response.send_message.assert_awaited_with(
         "You are not authorized to dismiss this message.", ephemeral=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_clean_command_callback(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    assistant = _assistant(
+        settings,
+        FakeQuery(),
+        FakeIngestion(),
+        FakeDelivery(tmp_path),
+        FakeTaxonomy(),
     )
 
     clean_cmd = assistant.tree.get_command("clean")
