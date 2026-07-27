@@ -63,13 +63,16 @@ def _is_follow_up(content: str) -> bool:
     return normalized.startswith(prefixes)
 
 
-def _document_line(document: Document, public_url: str) -> str:
-    created = document.created.isoformat() if document.created else "date unavailable"
-    return (
-        f"**{document.title}**\n"
-        f"Document date: {created} · ID: {int(document.id)}\n"
-        f"[Open in Paperless]({public_url})"
+def _document_embed(document: Document, public_url: str) -> discord.Embed:
+    created = document.created.strftime("%b %d, %Y") if document.created else "Unavailable"
+    embed = discord.Embed(
+        title=f"📄 {document.title}",
+        url=public_url,
+        color=discord.Color.blue(),
     )
+    embed.add_field(name="Document Date", value=created, inline=True)
+    embed.add_field(name="Paperless ID", value=str(int(document.id)), inline=True)
+    return embed
 
 
 class DismissButton(discord.ui.Button[discord.ui.View]):
@@ -405,10 +408,10 @@ class DiscordAssistant(discord.Client):
         for chunk in chunks[1:]:
             await status.channel.send(chunk, allowed_mentions=NO_MENTIONS)
         result_message_ids: list[int] = []
-        for index, document in enumerate(response.documents, start=1):
+        for document in response.documents:
             url = self._delivery_url(int(document.id))
             result_message = await status.channel.send(
-                f"**Result {index}**\n{_document_line(document, url)}",
+                embed=_document_embed(document, url),
                 view=_result_view(
                     principal_id, int(document.id), url, self._settings.discord_allowed_user_ids
                 ),
