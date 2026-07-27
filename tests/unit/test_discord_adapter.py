@@ -46,6 +46,7 @@ class FakeChannel:
         self.id = identifier
         self.sent: list[FakeMessage] = []
         self.partial: list[FakeMessage] = []
+        self.history_factory: Callable[[int], Any] | None = None
 
     async def send(self, content: str, **kwargs: Any) -> FakeMessage:
         message = FakeMessage(
@@ -61,6 +62,11 @@ class FakeChannel:
         message = FakeMessage(channel=self, identifier=identifier)
         self.partial.append(message)
         return message
+
+    def history(self, limit: int = 100) -> Any:
+        if self.history_factory is not None:
+            return self.history_factory(limit)
+        return ()
 
 
 class FakeMessage:
@@ -1172,10 +1178,12 @@ async def test_dismiss_button_and_clean_command(
     )
 
     clean_cmd = assistant.tree.get_command("clean")
-    assert clean_cmd is not None
+    assert isinstance(clean_cmd, discord.app_commands.Command)
+    callback = cast(Any, clean_cmd.callback)
+
     interaction_clean = AsyncMock()
     interaction_clean.user = SimpleNamespace(id=999)
-    await clean_cmd.callback(cast(discord.Interaction, interaction_clean), 10)
+    await callback(cast(discord.Interaction, interaction_clean), 10)
     interaction_clean.response.send_message.assert_awaited_with(
         "You are not authorized to run this command.", ephemeral=True
     )
@@ -1183,7 +1191,7 @@ async def test_dismiss_button_and_clean_command(
     interaction_wrong_channel = AsyncMock()
     interaction_wrong_channel.user = SimpleNamespace(id=201)
     interaction_wrong_channel.channel_id = 999
-    await clean_cmd.callback(cast(discord.Interaction, interaction_wrong_channel), 10)
+    await callback(cast(discord.Interaction, interaction_wrong_channel), 10)
     interaction_wrong_channel.response.send_message.assert_awaited_with(
         "Clean command can only be used in assistant channels.", ephemeral=True
     )
@@ -1192,7 +1200,7 @@ async def test_dismiss_button_and_clean_command(
     interaction_non_text.user = SimpleNamespace(id=201)
     interaction_non_text.channel_id = settings.discord_questions_channel_id
     interaction_non_text.channel = "invalid"
-    await clean_cmd.callback(cast(discord.Interaction, interaction_non_text), 10)
+    await callback(cast(discord.Interaction, interaction_non_text), 10)
     interaction_non_text.followup.send.assert_awaited_with("Invalid channel type.", ephemeral=True)
 
     monkeypatch.setattr(discord, "TextChannel", FakeChannel)
@@ -1215,14 +1223,14 @@ async def test_dismiss_button_and_clean_command(
                 return msg
             raise StopAsyncIteration
 
-    channel.history = lambda limit=100: FakeHistory()  # type: ignore[assignment]
+    channel.history_factory = lambda limit=100: FakeHistory()
 
     interaction_valid = AsyncMock()
     interaction_valid.user = SimpleNamespace(id=201)
     interaction_valid.channel_id = settings.discord_questions_channel_id
     interaction_valid.channel = channel
     interaction_valid.client = SimpleNamespace(user=SimpleNamespace(id=123))
-    await clean_cmd.callback(cast(discord.Interaction, interaction_valid), 10)
+    await callback(cast(discord.Interaction, interaction_valid), 10)
     assert bot_msg.deleted
     interaction_valid.followup.send.assert_awaited_with(
         "Cleaned 1 assistant message(s).", ephemeral=True

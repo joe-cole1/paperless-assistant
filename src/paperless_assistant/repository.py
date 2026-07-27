@@ -455,7 +455,9 @@ class SQLiteRepository:
                 """
                 SELECT discord_status_message_id, discord_message_id, paperless_document_id
                 FROM ingestion_jobs
-                WHERE state = ? AND paperless_document_id IS NOT NULL
+                WHERE state = ?
+                  AND paperless_document_id IS NOT NULL
+                  AND (discord_status_message_id IS NOT NULL OR discord_message_id IS NOT NULL)
                 """,
                 (JobState.SUCCEEDED.value,),
             )
@@ -463,9 +465,7 @@ class SQLiteRepository:
         results: list[tuple[int, int]] = []
         for row in rows:
             msg_id = row["discord_status_message_id"] or row["discord_message_id"]
-            doc_id = row["paperless_document_id"]
-            if msg_id and doc_id:
-                results.append((int(msg_id), int(doc_id)))
+            results.append((int(msg_id), int(row["paperless_document_id"])))
         return tuple(results)
 
     async def protected_staged_paths(self) -> frozenset[Path]:
