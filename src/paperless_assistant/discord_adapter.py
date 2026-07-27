@@ -219,7 +219,16 @@ class DiscordAssistant(discord.Client):
         self._start_background(self._taxonomy_loop())
         self._start_background(self._recovery_loop())
         with suppress(discord.HTTPException, discord.app_commands.MissingApplicationID):
-            await self.tree.sync(guild=discord.Object(id=self._settings.discord_guild_id))
+            guild = discord.Object(id=self._settings.discord_guild_id)
+            self.tree.copy_global_to(guild=guild)
+            logger.info(
+                "discord_commands_synced",
+                extra={
+                    "service": self._settings.app_name,
+                    "guild_id": self._settings.discord_guild_id,
+                },
+            )
+            await self.tree.sync(guild=guild)
 
     def _start_background(self, coroutine: Coroutine[Any, Any, None]) -> None:
         task: asyncio.Task[None] = asyncio.create_task(coroutine)
