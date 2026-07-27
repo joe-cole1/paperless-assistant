@@ -99,11 +99,13 @@ class QueryService:
         question: str,
         *,
         document_id: int | None = None,
+        context_id: int | None = None,
     ) -> QueryResponse:
         """Ask Paperless unchanged and fetch only its ordered references."""
         await self._rate.acquire(principal_id)
         correlation_id = uuid4()
         used_fallback = False
+        target_context_id = context_id if context_id is not None else principal_id
         try:
             async with self._semaphore:
                 result = await self._gateway.chat(question, document_id)
@@ -127,7 +129,7 @@ class QueryService:
         if documents:
             await self._repository.save_context(
                 ReferenceContext(
-                    principal_id=principal_id,
+                    principal_id=target_context_id,
                     document_ids=tuple(document.id for document in documents[:3]),
                     expires_at=_now() + self._settings.context_ttl,
                 )

@@ -273,25 +273,39 @@ class DiscordAssistant(discord.Client):
             )
 
     def _authorized_message(self, message: discord.Message) -> bool:
-        return bool(
+        if not (
             message.guild is not None
             and message.guild.id == self._settings.discord_guild_id
-            and not isinstance(message.channel, discord.Thread)
             and message.author.id in self._settings.discord_allowed_user_ids
             and not message.author.bot
             and message.webhook_id is None
+        ):
+            return False
+        if isinstance(message.channel, discord.Thread):
+            return message.channel.parent_id in (
+                self._settings.discord_questions_channel_id,
+                self._settings.discord_uploads_channel_id,
+            )
+        return message.channel.id in (
+            self._settings.discord_questions_channel_id,
+            self._settings.discord_uploads_channel_id,
         )
 
     async def on_message(self, message: discord.Message) -> None:
-        """Route only original allowlisted messages in the two configured channels."""
+        """Route only allowlisted messages in configured channels or their threads."""
         if not self._authorized_message(message):
             return
-        if message.channel.id == self._settings.discord_questions_channel_id:
+        channel_id = (
+            message.channel.parent_id
+            if isinstance(message.channel, discord.Thread)
+            else message.channel.id
+        )
+        if channel_id == self._settings.discord_questions_channel_id:
             await self._questions_message(message)
-        elif message.channel.id == self._settings.discord_uploads_channel_id:
+        else:
             await self._uploads_message(message)
 
-    async def _questions_message(self, message: discord.Message) -> None:  # noqa: PLR0911
+    async def _questions_message(self, message: discord.Message) -> None:  # noqa: PLR0911, PLR0912
         if message.attachments:
             await message.reply(
                 f"Please upload documents in <#{self._settings.discord_uploads_channel_id}>.",
@@ -301,17 +315,27 @@ class DiscordAssistant(discord.Client):
         question = message.content
         if not question.strip():
             return
-        context = await self._query.context(message.author.id)
+        if isinstance(message.channel, discord.Thread):
+            thread = message.channel
+        else:
+            clean_prompt = " ".join(question.strip().split())
+            snippet = clean_prompt[:40] if clean_prompt else "Question"
+            thread = await message.create_thread(
+                name=f"Q: {snippet}",
+                auto_archive_duration=1440,
+            )
+        context_id = thread.id
+        context = await self._query.context(context_id)
         if context and _is_delivery_request(question):
             selected = select_ordinal(question, [int(item) for item in context.document_ids])
             if selected is not None:
                 if not selected:
-                    await message.reply(
+                    await thread.send(
                         "That result number is not available anymore.",
                         allowed_mentions=NO_MENTIONS,
                     )
                 else:
-                    await self._deliver_to_message(message, selected)
+                    await self._deliver_to_message(message, selected, target=thread)
                 return
 
         should_continue, target_document = await self._reply_target(message, context)
@@ -321,17 +345,18 @@ class DiscordAssistant(discord.Client):
             if len(context.document_ids) == 1:
                 target_document = int(context.document_ids[0])
             else:
-                await message.reply(
+                await thread.send(
                     "Which result do you mean—first, second, or third?",
                     allowed_mentions=NO_MENTIONS,
                 )
                 return
-        status = await message.reply("Searching Paperless…", allowed_mentions=NO_MENTIONS)
+        status = await thread.send("Searching Paperless…", allowed_mentions=NO_MENTIONS)
         try:
             response = await self._query.ask(
                 message.author.id,
                 question,
                 document_id=target_document,
+                context_id=context_id,
             )
         except RateLimitedError:
             await status.edit(
@@ -347,7 +372,7 @@ class DiscordAssistant(discord.Client):
                 allowed_mentions=NO_MENTIONS,
             )
             return
-        await self._render_query(status, response, message.author.id)
+        await self._render_query(status, response, message.author.id, context_id=context_id)
 
     async def _reply_target(
         self, message: discord.Message, context: ReferenceContext | None
@@ -364,10 +389,15 @@ class DiscordAssistant(discord.Client):
         return False, None
 
     async def _render_query(
-        self, status: discord.Message, response: QueryResponse, principal_id: int
+        self,
+        status: discord.Message,
+        response: QueryResponse,
+        principal_id: int,
+        context_id: int | None = None,
     ) -> None:
         chunks = discord_safe_chunks(response.answer)
         first = chunks[0] if chunks else "Paperless returned no answer."
+        target_context_id = context_id if context_id is not None else principal_id
         try:
             await status.edit(content=first, allowed_mentions=NO_MENTIONS)
         except discord.HTTPException:
@@ -375,6 +405,7 @@ class DiscordAssistant(discord.Client):
         for chunk in chunks[1:]:
             await status.channel.send(chunk, allowed_mentions=NO_MENTIONS)
         result_message_ids: list[int] = []
+        limit = self._attachment_limit(status.guild)
         for index, document in enumerate(response.documents, start=1):
             url = self._delivery_url(int(document.id))
             result_message = await status.channel.send(
@@ -385,9 +416,31 @@ class DiscordAssistant(discord.Client):
                 allowed_mentions=NO_MENTIONS,
             )
             result_message_ids.append(result_message.id)
+            try:
+                plan = await self._delivery.prepare(principal_id, int(document.id), limit)
+                if plan.attachment is not None:
+                    prefix = (
+                        f"Archived PDF attached; [download original]({plan.original_url})."
+                        if plan.used_archived
+                        else "Here's the original file."
+                    )
+                    await status.channel.send(
+                        prefix,
+                        file=discord.File(
+                            plan.attachment.path,
+                            filename=plan.attachment.filename,
+                        ),
+                        allowed_mentions=NO_MENTIONS,
+                    )
+            except PaperlessUnavailableError:
+                pass
+            finally:
+                if "plan" in locals():
+                    self._delivery.cleanup(plan)
+                    del plan
         if response.documents:
             await self._query.save_rendered_context(
-                principal_id,
+                target_context_id,
                 tuple(document.id for document in response.documents),
                 tuple(result_message_ids),
             )
@@ -397,37 +450,45 @@ class DiscordAssistant(discord.Client):
         return f"{base}/documents/{document_id}/details"
 
     async def _deliver_to_message(
-        self, message: discord.Message, document_ids: Sequence[int]
+        self,
+        message: discord.Message,
+        document_ids: Sequence[int],
+        *,
+        target: discord.abc.Messageable | None = None,
     ) -> None:
         limit = self._attachment_limit(message.guild)
         for document_id in document_ids:
             try:
                 plan = await self._delivery.prepare(message.author.id, document_id, limit)
                 if plan.attachment is None:
-                    await message.reply(
+                    content = (
                         "This file is too large for Discord. "
-                        f"[Download original]({plan.original_url})",
-                        allowed_mentions=NO_MENTIONS,
+                        f"[Download original]({plan.original_url})"
                     )
+                    if target is not None:
+                        await target.send(content, allowed_mentions=NO_MENTIONS)
+                    else:
+                        await message.reply(content, allowed_mentions=NO_MENTIONS)
                 else:
                     prefix = (
                         f"Archived PDF attached; [download original]({plan.original_url})."
                         if plan.used_archived
                         else "Here's the original file."
                     )
-                    await message.reply(
-                        prefix,
-                        file=discord.File(
-                            plan.attachment.path,
-                            filename=plan.attachment.filename,
-                        ),
-                        allowed_mentions=NO_MENTIONS,
+                    file = discord.File(
+                        plan.attachment.path,
+                        filename=plan.attachment.filename,
                     )
+                    if target is not None:
+                        await target.send(prefix, file=file, allowed_mentions=NO_MENTIONS)
+                    else:
+                        await message.reply(prefix, file=file, allowed_mentions=NO_MENTIONS)
             except PaperlessUnavailableError:
-                await message.reply(
-                    "That document is unavailable right now.",
-                    allowed_mentions=NO_MENTIONS,
-                )
+                content = "That document is unavailable right now."
+                if target is not None:
+                    await target.send(content, allowed_mentions=NO_MENTIONS)
+                else:
+                    await message.reply(content, allowed_mentions=NO_MENTIONS)
             finally:
                 if "plan" in locals():
                     self._delivery.cleanup(plan)
@@ -450,9 +511,13 @@ class DiscordAssistant(discord.Client):
             document_id = int(document_raw)
         except TypeError, ValueError:
             return
+        channel = getattr(interaction, "channel", None)
+        channel_id = (
+            channel.parent_id if isinstance(channel, discord.Thread) else interaction.channel_id
+        )
         authorized = bool(
             interaction.guild_id == self._settings.discord_guild_id
-            and interaction.channel_id == self._settings.discord_questions_channel_id
+            and channel_id == self._settings.discord_questions_channel_id
             and interaction.user.id == principal_id
             and principal_id in self._settings.discord_allowed_user_ids
         )
@@ -512,7 +577,16 @@ class DiscordAssistant(discord.Client):
                 allowed_mentions=NO_MENTIONS,
             )
             return
-        status = await message.reply(
+        if isinstance(message.channel, discord.Thread):
+            thread = message.channel
+        else:
+            first_filename = message.attachments[0].filename
+            snippet = first_filename[:40]
+            thread = await message.create_thread(
+                name=f"Upload: {snippet}",
+                auto_archive_duration=1440,
+            )
+        status = await thread.send(
             f"Received {len(message.attachments)} file(s); validating…",
             allowed_mentions=NO_MENTIONS,
         )

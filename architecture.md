@@ -51,7 +51,7 @@ container-local listener.
 
 ## 4. Ports and adapters
 
-- inbound Discord adapter: validates transport identity, translates messages/interactions, handles the `/clean` slash command, and provides interactive `Dismiss` buttons;
+- inbound Discord adapter: validates transport identity, auto-creates public threads on top-level user messages in `#questions` and `#uploads`, routes thread-scoped context follow-ups, handles the `/clean` slash command, and provides interactive `Dismiss` buttons;
 - application services: authorize users and enforce query, delivery, ingestion, inbox tag polling, and cleanup policy;
 - Paperless gateway: the only component that performs Paperless HTTP calls (including document tag checks for auto-cleanup);
 - ingestion and audit repositories: durable SQLite implementations tracking active upload notifications;

@@ -108,6 +108,11 @@ class FakeMessage:
         self.replies.append(sent)
         return sent
 
+    async def create_thread(self, name: str, auto_archive_duration: int = 1440) -> FakeThread:
+        thread = FakeThread(parent_id=self.channel.id, thread_id=3000 + self.id, name=name)
+        self.thread = thread
+        return thread
+
     async def edit(self, **kwargs: Any) -> None:
         self.edits.append(kwargs)
         if "content" in kwargs:
@@ -115,6 +120,25 @@ class FakeMessage:
 
     async def delete(self) -> None:
         self.deleted = True
+
+
+class FakeThread(discord.Thread):
+    def __init__(self, parent_id: int, thread_id: int = 3500, name: str = "Thread") -> None:
+        self.id = thread_id
+        self.parent_id = parent_id
+        self.name = name
+        self.sent: list[FakeMessage] = []
+        self.guild = cast(discord.Guild, SimpleNamespace(id=100, filesize_limit=10 * 1024 * 1024))
+
+    async def send(self, content: str | None = None, **kwargs: Any) -> Any:
+        message = FakeMessage(
+            channel=cast(Any, self),
+            content=content or "",
+            identifier=1000 + len(self.sent),
+        )
+        message.send_kwargs = kwargs
+        self.sent.append(message)
+        return message
 
 
 class FakeAttachment:
@@ -157,7 +181,6 @@ class FakeQuery:
         self.saved: tuple[int, tuple[DocumentId, ...], tuple[int, ...]] | None = None
 
     async def context(self, principal_id: int) -> ReferenceContext | None:
-        assert principal_id == 201
         return self.current_context
 
     async def ask(
@@ -166,6 +189,7 @@ class FakeQuery:
         question: str,
         *,
         document_id: int | None = None,
+        context_id: int | None = None,
     ) -> QueryResponse:
         self.asked.append((principal_id, question, document_id))
         if self.error:
@@ -453,10 +477,10 @@ async def test_questions_guidance_answer_followup_and_errors(
 
     question = FakeMessage(channel=channel, content="Find my record")
     await assistant._questions_message(cast(discord.Message, question))
-    assert question.replies[0].content == "Native answer"
+    assert question.thread.sent[0].content == "Native answer"
     assert query.asked[-1] == (201, "Find my record", None)
     assert query.saved is not None
-    assert channel.sent[-1].content.startswith("**Result 1**")
+    assert question.thread.sent[1].content.startswith("**Result 1**")
 
     query.current_context = _context(7, message_ids=(1234,))
     followup = FakeMessage(channel=channel, content="What about its date?")
@@ -467,7 +491,7 @@ async def test_questions_guidance_answer_followup_and_errors(
     query.current_context = _context(7, 8)
     ambiguous = FakeMessage(channel=channel, content="What about the date?")
     await assistant._questions_message(cast(discord.Message, ambiguous))
-    assert "Which result" in ambiguous.replies[0].content
+    assert "Which result" in ambiguous.thread.sent[0].content
 
     query.current_context = _context(7)
     single = FakeMessage(channel=channel, content="Tell me more")
@@ -482,18 +506,18 @@ async def test_questions_guidance_answer_followup_and_errors(
     invalid_reply = FakeMessage(channel=channel, content="Tell me more")
     invalid_reply.reference = SimpleNamespace(message_id=1234)
     await assistant._questions_message(cast(discord.Message, invalid_reply))
-    assert not invalid_reply.replies
+    assert not hasattr(invalid_reply, "thread") or not invalid_reply.thread.sent
 
     query.current_context = None
     query.error = RateLimitedError("synthetic")
     limited = FakeMessage(channel=channel, content="question")
     await assistant._questions_message(cast(discord.Message, limited))
-    assert "quickly" in limited.replies[0].content
+    assert "quickly" in limited.thread.sent[0].content
 
     query.error = PaperlessUnavailableError("synthetic")
     unavailable = FakeMessage(channel=channel, content="question")
     await assistant._questions_message(cast(discord.Message, unavailable))
-    assert "unavailable" in unavailable.replies[0].content
+    assert "unavailable" in unavailable.thread.sent[0].content
     await assistant.close()
 
 
@@ -511,7 +535,7 @@ async def test_conversational_and_direct_delivery(
 
     send_second = FakeMessage(channel=channel, content="send me the second one")
     await assistant._questions_message(cast(discord.Message, send_second))
-    assert send_second.replies[-1].send_kwargs["file"].filename == "Formatted.pdf"
+    assert send_second.thread.sent[-1].send_kwargs["file"].filename == "Formatted.pdf"
     assert delivery.cleaned
 
     delivery.mode = "link"
@@ -528,40 +552,28 @@ async def test_conversational_and_direct_delivery(
 
     unavailable_number = FakeMessage(channel=channel, content="send me the third one")
     await assistant._questions_message(cast(discord.Message, unavailable_number))
-    assert "not available" in unavailable_number.replies[-1].content
+    assert "not available" in unavailable_number.thread.sent[-1].content
     await assistant.close()
 
 
 class FakeInteractionResponse:
     def __init__(self) -> None:
-        self.messages: list[tuple[str, dict[str, Any]]] = []
+        self.sent: list[str] = []
         self.deferred = False
 
     async def send_message(self, content: str, **kwargs: Any) -> None:
-        self.messages.append((content, kwargs))
+        self.sent.append(content)
 
-    async def defer(self, **_: Any) -> None:
+    async def defer(self, **kwargs: Any) -> None:
         self.deferred = True
 
 
 class FakeFollowup:
     def __init__(self) -> None:
-        self.messages: list[tuple[str, dict[str, Any]]] = []
+        self.sent: list[dict[str, Any]] = []
 
     async def send(self, content: str, **kwargs: Any) -> None:
-        self.messages.append((content, kwargs))
-
-
-class FakeInteraction:
-    def __init__(self, settings: Settings, custom_id: str) -> None:
-        self.data = {"custom_id": custom_id}
-        self.guild_id = settings.discord_guild_id
-        self.channel_id = settings.discord_questions_channel_id
-        self.user = SimpleNamespace(id=201)
-        self.response = FakeInteractionResponse()
-        self.followup = FakeFollowup()
-        self.guild = SimpleNamespace(filesize_limit=10 * 1024 * 1024)
-        self.filesize_limit = 10 * 1024 * 1024
+        self.sent.append({"content": content, **kwargs})
 
 
 @pytest.mark.asyncio
@@ -574,34 +586,75 @@ async def test_persistent_delivery_interaction(
     delivery = FakeDelivery(tmp_path)
     assistant = _assistant(settings, query, FakeIngestion(), delivery, FakeTaxonomy())
 
-    ignored = FakeInteraction(settings, "other:button")
-    await assistant.on_interaction(cast(discord.Interaction, ignored))
-    assert not ignored.response.messages
-
-    malformed = FakeInteraction(settings, "paperless:send:not-an-id:7")
-    await assistant.on_interaction(cast(discord.Interaction, malformed))
-    assert not malformed.response.messages
-
-    query.current_context = None
-    expired = FakeInteraction(settings, "paperless:send:201:7")
+    expired = SimpleNamespace(
+        data={"custom_id": "paperless:send:201:7"},
+        guild_id=settings.discord_guild_id,
+        channel_id=settings.discord_questions_channel_id,
+        user=SimpleNamespace(id=201),
+        response=FakeInteractionResponse(),
+        followup=FakeFollowup(),
+    )
     await assistant.on_interaction(cast(discord.Interaction, expired))
-    assert "expired" in expired.response.messages[0][0]
+    assert "expired" in expired.response.sent[0]
 
     query.current_context = _context(7)
-    valid = FakeInteraction(settings, "paperless:send:201:7")
+    valid = SimpleNamespace(
+        data={"custom_id": "paperless:send:201:7"},
+        guild_id=settings.discord_guild_id,
+        channel_id=settings.discord_questions_channel_id,
+        user=SimpleNamespace(id=201),
+        response=FakeInteractionResponse(),
+        followup=FakeFollowup(),
+        guild=SimpleNamespace(id=100, filesize_limit=10 * 1024 * 1024),
+    )
     await assistant.on_interaction(cast(discord.Interaction, valid))
-    assert valid.response.deferred
-    assert valid.followup.messages[0][1]["file"].filename == "Formatted.pdf"
+    assert valid.followup.sent[0]["file"].filename == "Formatted.pdf"
 
     delivery.mode = "link"
-    linked = FakeInteraction(settings, "paperless:send:201:7")
-    await assistant.on_interaction(cast(discord.Interaction, linked))
-    assert "Too large" in linked.followup.messages[0][0]
+    link_valid = SimpleNamespace(
+        data={"custom_id": "paperless:send:201:7"},
+        guild_id=settings.discord_guild_id,
+        channel_id=settings.discord_questions_channel_id,
+        user=SimpleNamespace(id=201),
+        response=FakeInteractionResponse(),
+        followup=FakeFollowup(),
+        guild=SimpleNamespace(id=100, filesize_limit=10 * 1024 * 1024),
+    )
+    await assistant.on_interaction(cast(discord.Interaction, link_valid))
+    assert "Too large" in link_valid.followup.sent[0]["content"]
+
+    delivery.mode = "archived"
+    archived_valid = SimpleNamespace(
+        data={"custom_id": "paperless:send:201:7"},
+        guild_id=settings.discord_guild_id,
+        channel_id=settings.discord_questions_channel_id,
+        user=SimpleNamespace(id=201),
+        response=FakeInteractionResponse(),
+        followup=FakeFollowup(),
+        guild=SimpleNamespace(id=100, filesize_limit=10 * 1024 * 1024),
+    )
+    await assistant.on_interaction(cast(discord.Interaction, archived_valid))
+    assert "Archived" in archived_valid.followup.sent[0]["content"]
 
     delivery.mode = "error"
-    failed = FakeInteraction(settings, "paperless:send:201:7")
-    await assistant.on_interaction(cast(discord.Interaction, failed))
-    assert "unavailable" in failed.followup.messages[0][0]
+    err_valid = SimpleNamespace(
+        data={"custom_id": "paperless:send:201:7"},
+        guild_id=settings.discord_guild_id,
+        channel_id=settings.discord_questions_channel_id,
+        user=SimpleNamespace(id=201),
+        response=FakeInteractionResponse(),
+        followup=FakeFollowup(),
+        guild=SimpleNamespace(id=100, filesize_limit=10 * 1024 * 1024),
+    )
+    await assistant.on_interaction(cast(discord.Interaction, err_valid))
+    assert "unavailable" in err_valid.followup.sent[0]["content"]
+
+    ignored = SimpleNamespace(
+        data={"custom_id": "other:action"},
+        response=FakeInteractionResponse(),
+    )
+    await assistant.on_interaction(cast(discord.Interaction, ignored))
+    assert not ignored.response.sent
     await assistant.close()
 
 
@@ -645,7 +698,7 @@ async def test_upload_guidance_missing_tag_and_partial_validation(
         ],
     )
     await assistant._uploads_message(cast(discord.Message, partial))
-    status = partial.replies[0]
+    status = partial.thread.sent[0]
     combined = "\n".join(edit["content"] for edit in status.edits)
     assert "too large" in combined
     assert "staging quota" in combined
@@ -677,7 +730,7 @@ async def test_upload_success_duplicate_invalid_and_uncertain(
     )
     await assistant._uploads_message(cast(discord.Message, success))
     assert success.deleted
-    assert ingestion.last_stage_kwargs["discord_status_message_id"] == success.replies[0].id
+    assert ingestion.last_stage_kwargs["discord_status_message_id"] == success.thread.sent[0].id
 
     ingestion.stage_duplicate = True
     duplicate = FakeMessage(
@@ -694,7 +747,7 @@ async def test_upload_success_duplicate_invalid_and_uncertain(
         attachments=[FakeAttachment(3, "three.pdf", b"bad")],
     )
     await assistant._uploads_message(cast(discord.Message, invalid))
-    assert "bad signature" in invalid.replies[0].edits[-1]["content"]
+    assert "bad signature" in invalid.thread.sent[0].edits[-1]["content"]
 
     ingestion.stage_error = None
     ingestion.submit_state = JobState.RECONCILIATION_REQUIRED
@@ -703,7 +756,7 @@ async def test_upload_success_duplicate_invalid_and_uncertain(
         attachments=[FakeAttachment(4, "four.pdf", b"%PDF-1.7")],
     )
     await assistant._uploads_message(cast(discord.Message, uncertain))
-    assert "uncertain" in uncertain.replies[0].edits[-1]["content"]
+    assert "uncertain" in uncertain.thread.sent[0].edits[-1]["content"]
     await assistant.close()
 
 
@@ -737,7 +790,7 @@ async def test_upload_limits_download_failures_and_rejected_submission(
         ],
     )
     await assistant._uploads_message(cast(discord.Message, too_many))
-    assert "Only the first 1" in too_many.replies[0].edits[-1]["content"]
+    assert "Only the first 1" in too_many.thread.sent[0].edits[-1]["content"]
 
     actual_too_large = FakeMessage(
         channel=channel,
@@ -746,14 +799,14 @@ async def test_upload_limits_download_failures_and_rejected_submission(
         ],
     )
     await assistant._uploads_message(cast(discord.Message, actual_too_large))
-    assert "downloaded file exceeds" in actual_too_large.replies[0].edits[-1]["content"]
+    assert "downloaded file exceeds" in actual_too_large.thread.sent[0].edits[-1]["content"]
 
     failed_download = FakeMessage(
         channel=channel,
         attachments=[FakeAttachment(4, "failed.pdf", b"x", fail=True)],
     )
     await assistant._uploads_message(cast(discord.Message, failed_download))
-    assert "download failed" in failed_download.replies[0].edits[-1]["content"]
+    assert "download failed" in failed_download.thread.sent[0].edits[-1]["content"]
 
     ingestion.submit_state = JobState.FAILED
     rejected = FakeMessage(
@@ -761,7 +814,7 @@ async def test_upload_limits_download_failures_and_rejected_submission(
         attachments=[FakeAttachment(5, "rejected.pdf", b"%PDF")],
     )
     await assistant._uploads_message(cast(discord.Message, rejected))
-    assert "rejected" in rejected.replies[0].edits[-1]["content"]
+    assert "rejected" in rejected.thread.sent[0].edits[-1]["content"]
     await assistant.close()
 
 
@@ -795,7 +848,7 @@ async def test_upload_post_download_quota_and_poll_recovery_states(
         ],
     )
     await assistant._uploads_message(cast(discord.Message, quota))
-    assert "staging quota was exceeded" in quota.replies[0].edits[-1]["content"]
+    assert "staging quota was exceeded" in quota.thread.sent[0].edits[-1]["content"]
 
     existing.unlink()
     cast(Any, ingestion).poll_until_notifiable = AsyncMock(side_effect=RuntimeError("synthetic"))
@@ -804,7 +857,7 @@ async def test_upload_post_download_quota_and_poll_recovery_states(
         attachments=[FakeAttachment(2, "unavailable.pdf", b"%PDF")],
     )
     await assistant._uploads_message(cast(discord.Message, unavailable))
-    assert "status unavailable" in unavailable.replies[0].edits[-1]["content"]
+    assert "status unavailable" in unavailable.thread.sent[0].edits[-1]["content"]
 
     cast(Any, ingestion).poll_until_notifiable = AsyncMock(
         return_value=IngestionOutcome(
@@ -817,7 +870,7 @@ async def test_upload_post_download_quota_and_poll_recovery_states(
         attachments=[FakeAttachment(3, "pending.pdf", b"%PDF")],
     )
     await assistant._uploads_message(cast(discord.Message, timed_out))
-    assert "still processing" in timed_out.replies[0].edits[-1]["content"]
+    assert "still processing" in timed_out.thread.sent[0].edits[-1]["content"]
     await assistant.close()
 
 
@@ -858,7 +911,7 @@ async def test_office_task_failure_includes_setup_guidance(
 
     await assistant._uploads_message(cast(discord.Message, message))
 
-    assert "Tika/Gotenberg" in message.replies[0].edits[-1]["content"]
+    assert "Tika/Gotenberg" in message.thread.sent[0].edits[-1]["content"]
     await assistant.close()
 
 
@@ -1245,3 +1298,71 @@ async def test_clean_command_callback(
     assert user_msg.deleted
     assert not pinned_msg.deleted
     interaction_valid.followup.send.assert_awaited_with("Cleaned 2 message(s).", ephemeral=True)
+
+
+@pytest.mark.asyncio
+async def test_thread_routing_and_render_query_error_handling(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    settings.staging_dir.mkdir(parents=True)
+    query = FakeQuery()
+    delivery = FakeDelivery(tmp_path)
+    assistant = _assistant(settings, query, FakeIngestion(), delivery, FakeTaxonomy())
+
+    q_thread = FakeThread(parent_id=settings.discord_questions_channel_id, thread_id=5001)
+    q_thread_msg = FakeMessage(channel=cast(Any, q_thread), content="Followup in thread")
+    assert assistant._authorized_message(cast(discord.Message, q_thread_msg))
+
+    unauth_thread = FakeThread(parent_id=999, thread_id=5002)
+    unauth_thread_msg = FakeMessage(channel=cast(Any, unauth_thread), content="Forbidden")
+    assert not assistant._authorized_message(cast(discord.Message, unauth_thread_msg))
+
+    await assistant.on_message(cast(discord.Message, q_thread_msg))
+    assert q_thread.sent[0].content == "Native answer"
+
+    u_thread = FakeThread(parent_id=settings.discord_uploads_channel_id, thread_id=5003)
+    u_thread_msg = FakeMessage(
+        channel=cast(Any, u_thread),
+        attachments=[FakeAttachment(1, "doc.pdf", b"%PDF-1.7")],
+    )
+    await assistant.on_message(cast(discord.Message, u_thread_msg))
+    assert "uploaded as" in u_thread.sent[0].content
+
+    delivery.mode = "link"
+    status_msg_link = FakeMessage(channel=cast(Any, q_thread), content="status")
+    await assistant._render_query(
+        cast(discord.Message, status_msg_link),
+        query.response,
+        principal_id=201,
+        context_id=5001,
+    )
+
+    delivery.mode = "error"
+    status_msg_err = FakeMessage(channel=cast(Any, q_thread), content="status")
+    await assistant._render_query(
+        cast(discord.Message, status_msg_err),
+        query.response,
+        principal_id=201,
+        context_id=5001,
+    )
+    assert query.saved is not None
+    assert query.saved[0] == 5001
+
+    dummy_msg = FakeMessage(channel=FakeChannel(settings.discord_questions_channel_id))
+    delivery.mode = "link"
+    await assistant._deliver_to_message(cast(discord.Message, dummy_msg), (7,), target=q_thread)
+    assert "too large" in q_thread.sent[-1].content
+
+    delivery.mode = "error"
+    await assistant._deliver_to_message(cast(discord.Message, dummy_msg), (7,), target=q_thread)
+    assert "unavailable" in q_thread.sent[-1].content
+
+    malformed = SimpleNamespace(
+        data={"custom_id": "paperless:send:invalid"},
+        guild_id=settings.discord_guild_id,
+        user=SimpleNamespace(id=201),
+    )
+    await assistant.on_interaction(cast(discord.Interaction, malformed))
+    await assistant.close()
