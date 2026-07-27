@@ -405,7 +405,6 @@ class DiscordAssistant(discord.Client):
         for chunk in chunks[1:]:
             await status.channel.send(chunk, allowed_mentions=NO_MENTIONS)
         result_message_ids: list[int] = []
-        limit = self._attachment_limit(status.guild)
         for index, document in enumerate(response.documents, start=1):
             url = self._delivery_url(int(document.id))
             result_message = await status.channel.send(
@@ -416,28 +415,6 @@ class DiscordAssistant(discord.Client):
                 allowed_mentions=NO_MENTIONS,
             )
             result_message_ids.append(result_message.id)
-            try:
-                plan = await self._delivery.prepare(principal_id, int(document.id), limit)
-                if plan.attachment is not None:
-                    prefix = (
-                        f"Archived PDF attached; [download original]({plan.original_url})."
-                        if plan.used_archived
-                        else "Here's the original file."
-                    )
-                    await status.channel.send(
-                        prefix,
-                        file=discord.File(
-                            plan.attachment.path,
-                            filename=plan.attachment.filename,
-                        ),
-                        allowed_mentions=NO_MENTIONS,
-                    )
-            except PaperlessUnavailableError:
-                pass
-            finally:
-                if "plan" in locals():
-                    self._delivery.cleanup(plan)
-                    del plan
         if response.documents:
             await self._query.save_rendered_context(
                 target_context_id,
@@ -521,7 +498,8 @@ class DiscordAssistant(discord.Client):
             and interaction.user.id == principal_id
             and principal_id in self._settings.discord_allowed_user_ids
         )
-        context = await self._query.context(principal_id) if authorized else None
+        target_context_id = channel.id if isinstance(channel, discord.Thread) else principal_id
+        context = await self._query.context(target_context_id) if authorized else None
         if context is None or DocumentId(document_id) not in context.document_ids:
             await interaction.response.send_message(
                 "That file request has expired or is unavailable.",
