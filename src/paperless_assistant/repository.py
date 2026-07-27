@@ -446,8 +446,8 @@ class SQLiteRepository:
             rows = cursor.fetchall()
         return tuple(JobState(row["state"]) for row in rows)
 
-    async def active_succeeded_uploads(self) -> tuple[tuple[int, int], ...]:
-        """Return tuple of (discord_message_id, paperless_document_id)
+    async def active_succeeded_uploads(self) -> tuple[tuple[tuple[int, ...], int], ...]:
+        """Return tuple of ((message_id, ...), paperless_document_id)
         for active succeeded uploads.
         """
         with self._connection() as connection:
@@ -462,10 +462,16 @@ class SQLiteRepository:
                 (JobState.SUCCEEDED.value,),
             )
             rows = cursor.fetchall()
-        results: list[tuple[int, int]] = []
+        results: list[tuple[tuple[int, ...], int]] = []
         for row in rows:
-            msg_id = row["discord_status_message_id"] or row["discord_message_id"]
-            results.append((int(msg_id), int(row["paperless_document_id"])))
+            msg_ids = tuple(
+                dict.fromkeys(
+                    int(val)
+                    for val in (row["discord_status_message_id"], row["discord_message_id"])
+                    if val is not None
+                )
+            )
+            results.append((msg_ids, int(row["paperless_document_id"])))
         return tuple(results)
 
     async def protected_staged_paths(self) -> frozenset[Path]:

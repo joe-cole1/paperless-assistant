@@ -194,23 +194,12 @@ class DiscordAssistant(discord.Client):
                 return
             cleaned = 0
             limit = min(max(1, count), 100)
-            bot_user_id = (
-                self.user.id
-                if self.user is not None
-                else (
-                    interaction.client.user.id
-                    if interaction.client is not None and interaction.client.user is not None
-                    else None
-                )
-            )
             async for message in channel.history(limit=limit):
-                if bot_user_id is not None and message.author.id == bot_user_id:
+                if not message.pinned:
                     with suppress(discord.HTTPException):
                         await message.delete()
                         cleaned += 1
-            await interaction.followup.send(
-                f"Cleaned {cleaned} assistant message(s).", ephemeral=True
-            )
+            await interaction.followup.send(f"Cleaned {cleaned} message(s).", ephemeral=True)
 
     async def setup_hook(self) -> None:
         """Initialize downstream policy before accepting messages."""

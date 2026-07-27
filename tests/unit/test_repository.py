@@ -115,7 +115,7 @@ async def test_job_idempotency_roundtrip_and_transitions(tmp_path: Path) -> None
     assert loaded.paperless_task_id == task_id
     assert loaded.paperless_document_id == DocumentId(42)
     assert loaded.state == JobState.SUCCEEDED
-    assert await repository.active_succeeded_uploads() == ((50, 42),)
+    assert await repository.active_succeeded_uploads() == (((50, 10), 42),)
     assert await repository.message_job_states(10) == (JobState.SUCCEEDED,)
     assert await repository.message_job_states(999) == ()
     future = (datetime.now(tz=UTC) + timedelta(days=1)).isoformat()
