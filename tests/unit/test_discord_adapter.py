@@ -17,6 +17,7 @@ import pytest
 from paperless_assistant.config import Settings
 from paperless_assistant.discord_adapter import (
     DiscordAssistant,
+    DismissButton,
     _document_line,
     _is_delivery_request,
     _is_follow_up,
@@ -1153,7 +1154,6 @@ async def test_dismiss_button_and_clean_command(
         FakeDelivery(tmp_path),
         FakeTaxonomy(),
     )
-    from paperless_assistant.discord_adapter import DismissButton
 
     button = DismissButton(settings.discord_allowed_user_ids)
     msg = FakeMessage(channel=FakeChannel(settings.discord_questions_channel_id))

@@ -512,7 +512,7 @@ async def test_check_inbox_tag_removals(
     settings.staging_dir.mkdir(parents=True)
     gateway = FakeGateway()
     gateway.taxonomy = Taxonomy((TaxonomyItem(1, "Discord"), TaxonomyItem(2, "inbox")), (), ())
-    repository, taxonomy, ingestion = await _services(settings, gateway)
+    repository, _, ingestion = await _services(settings, gateway)
     assert await ingestion.check_inbox_tag_removals() == ()
 
     path = settings.staging_dir / "doc"

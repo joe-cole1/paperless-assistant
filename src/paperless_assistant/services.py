@@ -402,7 +402,9 @@ class IngestionService:
         return job
 
     async def check_inbox_tag_removals(self) -> tuple[int, ...]:
-        """Return message IDs for active upload notifications whose inbox tag was removed in Paperless."""
+        """Return message IDs for active upload notifications
+        whose inbox tag was removed in Paperless.
+        """
         if not self._settings.cleanup_inbox_tag_enabled:
             return ()
         active_uploads = await self._repository.active_succeeded_uploads()

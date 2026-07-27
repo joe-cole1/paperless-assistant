@@ -447,7 +447,9 @@ class SQLiteRepository:
         return tuple(JobState(row["state"]) for row in rows)
 
     async def active_succeeded_uploads(self) -> tuple[tuple[int, int], ...]:
-        """Return tuple of (discord_message_id, paperless_document_id) for active succeeded uploads."""
+        """Return tuple of (discord_message_id, paperless_document_id)
+        for active succeeded uploads.
+        """
         with self._connection() as connection:
             cursor = connection.execute(
                 """

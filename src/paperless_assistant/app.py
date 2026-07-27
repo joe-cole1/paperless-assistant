@@ -178,7 +178,7 @@ class Runtime:
                 upload_message_ids = await self.ingestion.check_inbox_tag_removals()
                 if upload_message_ids:
                     await self.discord.cleanup_messages((), upload_message_ids)
-            except Exception as error:  # noqa: BLE001
+            except Exception as error:
                 logger.warning(
                     "inbox_tag_cleanup_failed",
                     extra={
