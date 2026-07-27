@@ -65,23 +65,32 @@ class FakeGateway:
         self.last_question: tuple[str, int | None] | None = None
         self.doc_tags: dict[int, tuple[int, ...]] = {}
 
-    async def get_document_tag_ids(self, document_id: int) -> tuple[int, ...]:
+    async def validate_token(self, token: object) -> bool:
+        return True
+
+    async def get_document_tag_ids(
+        self, document_id: int, *, token: object = None
+    ) -> tuple[int, ...]:
         return self.doc_tags.get(document_id, (1,))
 
-    async def chat(self, question: str, document_id: int | None = None) -> ChatResult:
+    async def chat(
+        self, question: str, document_id: int | None = None, *, token: object = None
+    ) -> ChatResult:
         self.last_question = (question, document_id)
         if self.chat_error:
             raise PaperlessUnavailableError("synthetic")
         return self.chat_result
 
-    async def search_documents(self, query: str, limit: int = 3) -> tuple[Document, ...]:
+    async def search_documents(
+        self, query: str, limit: int = 3, *, token: object = None
+    ) -> tuple[Document, ...]:
         assert query
         return self.search[:limit]
 
-    async def get_document(self, document_id: int) -> Document:
+    async def get_document(self, document_id: int, *, token: object = None) -> Document:
         return self.documents[document_id]
 
-    async def get_taxonomy(self) -> Taxonomy:
+    async def get_taxonomy(self, *, token: object = None) -> Taxonomy:
         if self.taxonomy_error:
             raise PaperlessUnavailableError("synthetic")
         return self.taxonomy
@@ -92,6 +101,8 @@ class FakeGateway:
         filename: str,
         media_type: str,
         guidance: MetadataGuidance,
+        *,
+        token: object = None,
     ) -> UUID:
         assert path.exists()  # noqa: ASYNC240
         assert filename
@@ -101,18 +112,23 @@ class FakeGateway:
             raise self.submit_error
         return self.task_id
 
-    async def get_task(self, task_id: UUID) -> PaperlessTask:
+    async def get_task(self, task_id: UUID, *, token: object = None) -> PaperlessTask:
         assert task_id == self.task_id
         return self.task
 
-    async def add_note(self, document_id: int, note: str) -> None:
+    async def add_note(self, document_id: int, note: str, *, token: object = None) -> None:
         assert document_id == 44
         if self.note_error:
             raise PaperlessUnavailableError("synthetic")
         self.notes.append(note)
 
     async def download(
-        self, document_id: int, destination: Path, *, archived: bool = False
+        self,
+        document_id: int,
+        destination: Path,
+        *,
+        archived: bool = False,
+        token: object = None,
     ) -> Download:
         if archived and self.download_error_archived:
             raise PaperlessUnavailableError("synthetic")
@@ -396,7 +412,7 @@ async def test_ingestion_invariants_polling_and_recovery_paths(
         )
     )
 
-    async def next_task(_: UUID) -> PaperlessTask:
+    async def next_task(_: UUID, *, token: object = None) -> PaperlessTask:
         return next(tasks)
 
     monkeypatch.setattr(gateway, "get_task", next_task)

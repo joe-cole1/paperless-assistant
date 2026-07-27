@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import sqlite3
 from collections.abc import AsyncIterator, Iterator
@@ -10,6 +12,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
+
+from cryptography.fernet import Fernet
+from pydantic import SecretStr
 
 from paperless_assistant.models import (
     ALLOWED_JOB_TRANSITIONS,
@@ -25,6 +30,13 @@ SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 PRAGMA busy_timeout=5000;
+
+CREATE TABLE IF NOT EXISTS user_credentials (
+    principal_id INTEGER PRIMARY KEY,
+    encrypted_token BLOB NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS instance_lease (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -105,12 +117,70 @@ def _parse_datetime(value: str) -> datetime:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
-class SQLiteRepository:
-    """One SQLite implementation for the issue #10 persistence ports."""
+def _fernet_from_secret(secret: SecretStr) -> Fernet:
+    key_bytes = secret.get_secret_value().encode("utf-8")
+    derived = base64.urlsafe_b64encode(hashlib.sha256(key_bytes).digest())
+    return Fernet(derived)
 
-    def __init__(self, database_path: Path, *, lease_seconds: int) -> None:
+
+class SQLiteRepository:
+    """One SQLite implementation for persistence ports."""
+
+    def __init__(
+        self,
+        database_path: Path,
+        *,
+        lease_seconds: int,
+        encryption_key: SecretStr | None = None,
+    ) -> None:
         self._database_path = database_path
         self._lease = timedelta(seconds=lease_seconds)
+        self._fernet = _fernet_from_secret(encryption_key) if encryption_key else None
+
+    async def save_user_token(self, principal_id: int, token: SecretStr) -> None:
+        """Encrypt and persist a Discord user's Paperless API token."""
+        if self._fernet is None:
+            raise ValueError("encryption key is not configured")
+        now = _iso(_utc_now())
+        encrypted = self._fernet.encrypt(token.get_secret_value().encode("utf-8"))
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO user_credentials(principal_id, encrypted_token, created_at, updated_at)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(principal_id) DO UPDATE SET
+                    encrypted_token=excluded.encrypted_token,
+                    updated_at=excluded.updated_at
+                """,
+                (principal_id, encrypted, now, now),
+            )
+            connection.commit()
+
+    async def get_user_token(self, principal_id: int) -> SecretStr | None:
+        """Read and decrypt one user's Paperless API token."""
+        if self._fernet is None:
+            raise ValueError("encryption key is not configured")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT encrypted_token FROM user_credentials WHERE principal_id = ?",
+                (principal_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            decrypted = self._fernet.decrypt(row["encrypted_token"])
+            return SecretStr(decrypted.decode("utf-8"))
+        except Exception:
+            return None
+
+    async def delete_user_token(self, principal_id: int) -> bool:
+        """Revoke and delete a mapped user credential."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "DELETE FROM user_credentials WHERE principal_id = ?", (principal_id,)
+            )
+            connection.commit()
+            return cursor.rowcount == 1
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:

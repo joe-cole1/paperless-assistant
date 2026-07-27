@@ -40,24 +40,30 @@ class Runtime:
         self.repository = SQLiteRepository(
             settings.database_path,
             lease_seconds=settings.instance_lease_seconds,
+            encryption_key=settings.encryption_key,
         )
         self.paperless = HttpPaperlessGateway(settings)
         self.taxonomy = TaxonomyCache(settings, self.paperless)
-        self.query = QueryService(settings, self.paperless, self.repository, self.repository)
+        self.query = QueryService(
+            settings, self.paperless, self.repository, self.repository, self.repository
+        )
         self.ingestion = IngestionService(
             settings,
             self.paperless,
             self.repository,
             self.repository,
             self.taxonomy,
+            credentials=self.repository,
         )
-        self.delivery = DeliveryService(settings, self.paperless, self.repository)
+        self.delivery = DeliveryService(settings, self.paperless, self.repository, self.repository)
         self.discord = DiscordAssistant(
             settings,
             self.query,
             self.ingestion,
             self.delivery,
             self.taxonomy,
+            credentials=self.repository,
+            paperless_gateway=self.paperless,
             ready_callback=self._set_ready,
         )
         self.ready = False

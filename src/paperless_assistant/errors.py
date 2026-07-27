@@ -37,3 +37,11 @@ class RateLimitedError(AssistantError):
 
 class ContextUnavailableError(AssistantError):
     """Conversational document context is absent or ambiguous."""
+
+
+class UnlinkedUserError(AssistantError):
+    """The Discord user has not linked their Paperless account yet."""
+
+
+class InvalidTokenError(AssistantError):
+    """The provided Paperless API token was rejected by Paperless."""

@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Protocol
 from uuid import UUID
 
+from pydantic import SecretStr
+
 from paperless_assistant.models import (
     AuditEvent,
     ChatResult,
@@ -25,13 +27,21 @@ from paperless_assistant.models import (
 class PaperlessGateway(Protocol):
     """Narrow Paperless operations required by issue #10."""
 
-    async def chat(self, question: str, document_id: int | None = None) -> ChatResult: ...
+    async def validate_token(self, token: SecretStr) -> bool: ...
 
-    async def search_documents(self, query: str, limit: int = 3) -> tuple[Document, ...]: ...
+    async def chat(
+        self, question: str, document_id: int | None = None, *, token: SecretStr | None = None
+    ) -> ChatResult: ...
 
-    async def get_document(self, document_id: int) -> Document: ...
+    async def search_documents(
+        self, query: str, limit: int = 3, *, token: SecretStr | None = None
+    ) -> tuple[Document, ...]: ...
 
-    async def get_taxonomy(self) -> Taxonomy: ...
+    async def get_document(
+        self, document_id: int, *, token: SecretStr | None = None
+    ) -> Document: ...
+
+    async def get_taxonomy(self, *, token: SecretStr | None = None) -> Taxonomy: ...
 
     async def submit_document(
         self,
@@ -39,21 +49,42 @@ class PaperlessGateway(Protocol):
         filename: str,
         media_type: str,
         guidance: MetadataGuidance,
+        *,
+        token: SecretStr | None = None,
     ) -> UUID: ...
 
-    async def get_task(self, task_id: UUID) -> PaperlessTask: ...
+    async def get_task(self, task_id: UUID, *, token: SecretStr | None = None) -> PaperlessTask: ...
 
-    async def add_note(self, document_id: int, note: str) -> None: ...
+    async def add_note(
+        self, document_id: int, note: str, *, token: SecretStr | None = None
+    ) -> None: ...
 
     async def download(
-        self, document_id: int, destination: Path, *, archived: bool = False
+        self,
+        document_id: int,
+        destination: Path,
+        *,
+        archived: bool = False,
+        token: SecretStr | None = None,
     ) -> Download: ...
 
-    async def get_document_tag_ids(self, document_id: int) -> tuple[int, ...]: ...
+    async def get_document_tag_ids(
+        self, document_id: int, *, token: SecretStr | None = None
+    ) -> tuple[int, ...]: ...
 
     def document_url(self, document_id: int) -> str: ...
 
     def original_download_url(self, document_id: int) -> str: ...
+
+
+class CredentialRepository(Protocol):
+    """Encrypted per-Discord-user Paperless token storage."""
+
+    async def save_user_token(self, principal_id: int, token: SecretStr) -> None: ...
+
+    async def get_user_token(self, principal_id: int) -> SecretStr | None: ...
+
+    async def delete_user_token(self, principal_id: int) -> bool: ...
 
 
 class IngestionRepository(Protocol):

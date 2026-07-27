@@ -11,12 +11,14 @@ from typing import Any
 from uuid import uuid4
 
 import discord
+from pydantic import SecretStr
 
 from paperless_assistant.config import Settings
 from paperless_assistant.errors import (
     InvalidAttachmentError,
     PaperlessUnavailableError,
     RateLimitedError,
+    UnlinkedUserError,
 )
 from paperless_assistant.models import (
     Document,
@@ -26,6 +28,7 @@ from paperless_assistant.models import (
     ReferenceContext,
 )
 from paperless_assistant.policy import discord_safe_chunks, select_ordinal
+from paperless_assistant.ports import CredentialRepository, PaperlessGateway
 from paperless_assistant.services import (
     DeliveryService,
     IngestionOutcome,
@@ -86,7 +89,7 @@ class DismissButton(discord.ui.Button[discord.ui.View]):
         self._allowed_user_ids = allowed_user_ids
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id not in self._allowed_user_ids:
+        if self._allowed_user_ids and interaction.user.id not in self._allowed_user_ids:
             await interaction.response.send_message(
                 "You are not authorized to dismiss this message.",
                 ephemeral=True,
@@ -149,6 +152,8 @@ class DiscordAssistant(discord.Client):
         delivery: DeliveryService,
         taxonomy: TaxonomyCache,
         *,
+        credentials: CredentialRepository | None = None,
+        paperless_gateway: PaperlessGateway | None = None,
         ready_callback: Callable[[bool], None],
     ) -> None:
         intents = discord.Intents.none()
@@ -161,12 +166,19 @@ class DiscordAssistant(discord.Client):
         self._ingestion = ingestion
         self._delivery = delivery
         self._taxonomy = taxonomy
+        self._credentials = credentials
+        self._paperless_gateway = paperless_gateway
         self._ready_callback = ready_callback
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._pending_recovery: list[IngestionOutcome] = []
         self._staging_lock = asyncio.Lock()
         self.tree = discord.app_commands.CommandTree(self)
         self._register_commands()
+
+    def _authorized_user_id(self, user_id: int) -> bool:
+        if not self._settings.discord_allowed_user_ids:
+            return True
+        return user_id in self._settings.discord_allowed_user_ids
 
     def _register_commands(self) -> None:
         @self.tree.command(
@@ -177,7 +189,7 @@ class DiscordAssistant(discord.Client):
             count="Number of recent channel messages to inspect and clean (default: 100)"
         )
         async def clean_command(interaction: discord.Interaction, count: int = 100) -> None:
-            if interaction.user.id not in self._settings.discord_allowed_user_ids:
+            if not self._authorized_user_id(interaction.user.id):
                 await interaction.response.send_message(
                     "You are not authorized to run this command.", ephemeral=True
                 )
@@ -203,6 +215,106 @@ class DiscordAssistant(discord.Client):
                         await message.delete()
                         cleaned += 1
             await interaction.followup.send(f"Cleaned {cleaned} message(s).", ephemeral=True)
+
+        self._register_auth_commands()
+
+    def _register_auth_commands(self) -> None:
+        auth_group = discord.app_commands.Group(
+            name="auth",
+            description="Paperless account authentication commands",
+        )
+
+        @auth_group.command(
+            name="link",
+            description="Securely link your Paperless API token.",
+        )
+        @discord.app_commands.describe(token="Your Paperless API token")  # noqa: S106
+        async def auth_link(interaction: discord.Interaction, token: str) -> None:
+            if not self._authorized_user_id(interaction.user.id):
+                await interaction.response.send_message(
+                    "You are not authorized to run this command.", ephemeral=True
+                )
+                return
+            await interaction.response.defer(ephemeral=True)
+            secret_token = SecretStr(token.strip())
+            valid = False
+            if self._paperless_gateway is not None:
+                valid = await self._paperless_gateway.validate_token(secret_token)
+            if not valid:
+                await interaction.followup.send(
+                    "❌ The provided Paperless API token was rejected by Paperless. "
+                    "Please check your token and try again.",
+                    ephemeral=True,
+                )
+                return
+            if self._credentials is not None:
+                await self._credentials.save_user_token(interaction.user.id, secret_token)
+            await interaction.followup.send(
+                "✅ Your Paperless API token has been securely linked!",
+                ephemeral=True,
+            )
+
+        @auth_group.command(
+            name="unlink",
+            description="Revoke and remove your linked Paperless API token.",
+        )
+        async def auth_unlink(interaction: discord.Interaction) -> None:
+            if not self._authorized_user_id(interaction.user.id):
+                await interaction.response.send_message(
+                    "You are not authorized to run this command.", ephemeral=True
+                )
+                return
+            await interaction.response.defer(ephemeral=True)
+            deleted = False
+            if self._credentials is not None:
+                deleted = await self._credentials.delete_user_token(interaction.user.id)
+            if deleted:
+                await interaction.followup.send(
+                    "✅ Your linked Paperless token has been removed.", ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    "No linked Paperless account token was found.", ephemeral=True
+                )
+
+        @auth_group.command(
+            name="status",
+            description="Check the status of your linked Paperless account.",
+        )
+        async def auth_status(interaction: discord.Interaction) -> None:
+            if not self._authorized_user_id(interaction.user.id):
+                await interaction.response.send_message(
+                    "You are not authorized to run this command.", ephemeral=True
+                )
+                return
+            await interaction.response.defer(ephemeral=True)
+            user_token = (
+                await self._credentials.get_user_token(interaction.user.id)
+                if self._credentials is not None
+                else None
+            )
+            if user_token is None:
+                await interaction.followup.send(
+                    "❌ You have not linked your Paperless account yet. "
+                    "Use `/auth link <token>` to connect.",
+                    ephemeral=True,
+                )
+                return
+            valid = False
+            if self._paperless_gateway is not None:
+                valid = await self._paperless_gateway.validate_token(user_token)
+            if valid:
+                await interaction.followup.send(
+                    "✅ Your Paperless account is linked and active.", ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    "⚠️ Your linked Paperless token was rejected by Paperless (expired or revoked). "
+                    "Please run `/auth link <token>` with a new token.",
+                    ephemeral=True,
+                )
+
+        self.tree.add_command(auth_group)
 
     async def setup_hook(self) -> None:
         """Initialize downstream policy before accepting messages."""
@@ -279,7 +391,7 @@ class DiscordAssistant(discord.Client):
         if not (
             message.guild is not None
             and message.guild.id == self._settings.discord_guild_id
-            and message.author.id in self._settings.discord_allowed_user_ids
+            and self._authorized_user_id(message.author.id)
             and not message.author.bot
             and message.webhook_id is None
         ):
@@ -365,6 +477,15 @@ class DiscordAssistant(discord.Client):
             await status.edit(
                 content=(
                     "You've asked several questions quickly. Please try again in a few minutes."
+                ),
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        except UnlinkedUserError:
+            await status.edit(
+                content=(
+                    "You have not linked your Paperless account yet. "
+                    "Please run `/auth link <token>` to connect."
                 ),
                 allowed_mentions=NO_MENTIONS,
             )
@@ -499,7 +620,7 @@ class DiscordAssistant(discord.Client):
             interaction.guild_id == self._settings.discord_guild_id
             and channel_id == self._settings.discord_questions_channel_id
             and interaction.user.id == principal_id
-            and principal_id in self._settings.discord_allowed_user_ids
+            and self._authorized_user_id(principal_id)
         )
         target_context_id = channel.id if isinstance(channel, discord.Thread) else principal_id
         context = await self._query.context(target_context_id) if authorized else None
@@ -532,6 +653,13 @@ class DiscordAssistant(discord.Client):
                     ephemeral=True,
                     allowed_mentions=NO_MENTIONS,
                 )
+        except UnlinkedUserError:
+            await interaction.followup.send(
+                "You have not linked your Paperless account yet. "
+                "Please run `/auth link <token>` to connect.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
         except PaperlessUnavailableError:
             await interaction.followup.send(
                 "That document is unavailable right now.",
@@ -627,20 +755,30 @@ class DiscordAssistant(discord.Client):
                     all_resolved = False
 
         submitted: list[tuple[int, IngestionJob]] = []
-        for index, job in jobs:
-            outcome = await self._ingestion.submit(job)
-            if outcome.job.state == JobState.SUBMITTED:
-                submitted.append((index, outcome.job))
-                results.append(f"{index}. `{job.original_filename}` — processing in Paperless…")
-            elif outcome.job.state == JobState.RECONCILIATION_REQUIRED:
-                results.append(
-                    f"{index}. `{job.original_filename}` — upload outcome is uncertain; "
-                    f"reconcile job `{job.id}` in Paperless."
-                )
-                all_resolved = False
-            else:
-                results.append(f"{index}. `{job.original_filename}` — Paperless rejected it.")
-                all_resolved = False
+        try:
+            for index, job in jobs:
+                outcome = await self._ingestion.submit(job)
+                if outcome.job.state == JobState.SUBMITTED:
+                    submitted.append((index, outcome.job))
+                    results.append(f"{index}. `{job.original_filename}` — processing in Paperless…")
+                elif outcome.job.state == JobState.RECONCILIATION_REQUIRED:
+                    results.append(
+                        f"{index}. `{job.original_filename}` — upload outcome is uncertain; "
+                        f"reconcile job `{job.id}` in Paperless."
+                    )
+                    all_resolved = False
+                else:
+                    results.append(f"{index}. `{job.original_filename}` — Paperless rejected it.")
+                    all_resolved = False
+        except UnlinkedUserError:
+            await status.edit(
+                content=(
+                    "You have not linked your Paperless account yet. "
+                    "Please run `/auth link <token>` to connect."
+                ),
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
         await self._replace_status(status, results)
 
         if submitted:

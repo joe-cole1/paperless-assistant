@@ -17,6 +17,7 @@ from paperless_assistant.errors import (
     ConfigurationUnavailableError,
     PaperlessUnavailableError,
     RateLimitedError,
+    UnlinkedUserError,
 )
 from paperless_assistant.models import (
     AuditEvent,
@@ -34,7 +35,12 @@ from paperless_assistant.models import (
 )
 from paperless_assistant.paperless import PAPERLESS_CHAT_ERROR, PAPERLESS_NO_CONTENT
 from paperless_assistant.policy import find_required_tag, resolve_taxonomy, validate_attachment
-from paperless_assistant.ports import AuditRepository, IngestionRepository, PaperlessGateway
+from paperless_assistant.ports import (
+    AuditRepository,
+    CredentialRepository,
+    IngestionRepository,
+    PaperlessGateway,
+)
 
 
 def _now() -> datetime:
@@ -82,11 +88,13 @@ class QueryService:
         gateway: PaperlessGateway,
         repository: IngestionRepository,
         audit: AuditRepository,
+        credentials: CredentialRepository | None = None,
     ) -> None:
         self._settings = settings
         self._gateway = gateway
         self._repository = repository
         self._audit = audit
+        self._credentials = credentials
         self._semaphore = asyncio.Semaphore(settings.question_global_concurrency)
         self._rate = QuestionRateLimiter(
             settings.question_user_rate_limit,
@@ -102,13 +110,20 @@ class QueryService:
         context_id: int | None = None,
     ) -> QueryResponse:
         """Ask Paperless unchanged and fetch only its ordered references."""
+        user_token = (
+            await self._credentials.get_user_token(principal_id)
+            if self._credentials is not None
+            else None
+        )
+        if self._credentials is not None and user_token is None:
+            raise UnlinkedUserError("Paperless account is not linked")
         await self._rate.acquire(principal_id)
         correlation_id = uuid4()
         used_fallback = False
         target_context_id = context_id if context_id is not None else principal_id
         try:
             async with self._semaphore:
-                result = await self._gateway.chat(question, document_id)
+                result = await self._gateway.chat(question, document_id, token=user_token)
         except PaperlessUnavailableError:
             result = ChatResult("", ())
         if not result.answer.strip() or result.answer.strip() in {
@@ -116,13 +131,13 @@ class QueryService:
             PAPERLESS_CHAT_ERROR,
         }:
             used_fallback = True
-            documents = await self._gateway.search_documents(question, 3)
+            documents = await self._gateway.search_documents(question, 3, token=user_token)
             answer = "Paperless chat was unavailable; these are basic full-text search results."
         else:
             answer = result.answer
             documents = tuple(
                 [
-                    await self._gateway.get_document(int(identifier))
+                    await self._gateway.get_document(int(identifier), token=user_token)
                     for identifier in result.document_ids
                 ]
             )
@@ -213,19 +228,22 @@ class TaxonomyCache:
 class IngestionService:
     """Durable immediate-ingestion workflow with fail-closed POST recovery."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         settings: Settings,
         gateway: PaperlessGateway,
         repository: IngestionRepository,
         audit: AuditRepository,
         taxonomy: TaxonomyCache,
+        *,
+        credentials: CredentialRepository | None = None,
     ) -> None:
         self._settings = settings
         self._gateway = gateway
         self._repository = repository
         self._audit = audit
         self._taxonomy = taxonomy
+        self._credentials = credentials
 
     async def stage(  # noqa: PLR0913
         self,
@@ -264,6 +282,13 @@ class IngestionService:
 
     async def submit(self, job: IngestionJob) -> IngestionOutcome:
         """Submit a staged job exactly once and persist its task UUID."""
+        user_token = (
+            await self._credentials.get_user_token(job.principal_id)
+            if self._credentials is not None
+            else None
+        )
+        if self._credentials is not None and user_token is None:
+            raise UnlinkedUserError("Paperless account is not linked")
         transitioned = await self._repository.transition_job(
             job.id, JobState.STAGED, JobState.SUBMITTING
         )
@@ -280,6 +305,7 @@ class IngestionService:
                 job.original_filename,
                 job.media_type,
                 job.guidance,
+                token=user_token,
             )
         except AmbiguousSubmissionError:
             await self._repository.transition_job(
@@ -328,7 +354,12 @@ class IngestionService:
         """Poll one saved task UUID without resubmitting document bytes."""
         if job.state != JobState.SUBMITTED or job.paperless_task_id is None:
             return IngestionOutcome(job)
-        task = await self._gateway.get_task(job.paperless_task_id)
+        user_token = (
+            await self._credentials.get_user_token(job.principal_id)
+            if self._credentials is not None
+            else None
+        )
+        task = await self._gateway.get_task(job.paperless_task_id, token=user_token)
         if task.state in {TaskState.PENDING, TaskState.STARTED, TaskState.UNKNOWN}:
             return IngestionOutcome(job)
         if task.state == TaskState.FAILURE or task.document_id is None:
@@ -343,6 +374,7 @@ class IngestionService:
                 await self._gateway.add_note(
                     int(task.document_id),
                     f"Discord upload guidance: {job.caption}",
+                    token=user_token,
                 )
             except PaperlessUnavailableError:
                 note_failed = True
@@ -354,7 +386,7 @@ class IngestionService:
         )
         job.staged_path.unlink(missing_ok=True)
         current = await self._required_job(job.id)
-        document = await self._gateway.get_document(int(task.document_id))
+        document = await self._gateway.get_document(int(task.document_id), token=user_token)
         await self._record(current, "succeeded_note_failed" if note_failed else "succeeded")
         return IngestionOutcome(current, document, note_failed)
 
@@ -453,15 +485,24 @@ class DeliveryService:
         settings: Settings,
         gateway: PaperlessGateway,
         audit: AuditRepository,
+        credentials: CredentialRepository | None = None,
     ) -> None:
         self._settings = settings
         self._gateway = gateway
         self._audit = audit
+        self._credentials = credentials
 
     async def prepare(
         self, principal_id: int, document_id: int, attachment_limit: int
     ) -> DeliveryPlan:
         """Prefer latest original, then archived PDF, then authenticated link."""
+        user_token = (
+            await self._credentials.get_user_token(principal_id)
+            if self._credentials is not None
+            else None
+        )
+        if self._credentials is not None and user_token is None:
+            raise UnlinkedUserError("Paperless account is not linked")
         if (
             shutil.disk_usage(self._settings.delivery_dir).free
             < self._settings.delivery_min_free_bytes
@@ -472,7 +513,9 @@ class DeliveryService:
                 self._gateway.original_download_url(document_id),
             )
         original_path = self._settings.delivery_dir / str(uuid4())
-        original = await self._gateway.download(document_id, original_path, archived=False)
+        original = await self._gateway.download(
+            document_id, original_path, archived=False, token=user_token
+        )
         if original.size <= attachment_limit:
             plan = DeliveryPlan(
                 DocumentId(document_id),
@@ -484,7 +527,9 @@ class DeliveryService:
         original.path.unlink(missing_ok=True)
         archived_path = self._settings.delivery_dir / str(uuid4())
         try:
-            archived = await self._gateway.download(document_id, archived_path, archived=True)
+            archived = await self._gateway.download(
+                document_id, archived_path, archived=True, token=user_token
+            )
         except PaperlessUnavailableError:
             archived = None
         if archived is not None and archived.size <= attachment_limit:
