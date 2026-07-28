@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import unicodedata
 from collections.abc import Callable, Coroutine, Sequence
 from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from difflib import SequenceMatcher
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import discord
 from pydantic import SecretStr
@@ -36,8 +37,13 @@ from paperless_assistant.models import (
     SuggestionReview,
     SuggestionSelection,
     Taxonomy,
+    TaxonomyCapabilities,
     TaxonomyItem,
     TaxonomyKind,
+    UploadBatch,
+    UploadBatchSnapshot,
+    UploadItem,
+    UploadItemState,
 )
 from paperless_assistant.policy import discord_safe_chunks, select_ordinal
 from paperless_assistant.ports import CredentialRepository, PaperlessGateway
@@ -182,6 +188,83 @@ class AISuggestionsTitleModal(discord.ui.Modal, title="Edit Document Title"):
         await self.review_view.render()
 
 
+class AISuggestionsTagModal(discord.ui.Modal, title="Add a Tag"):
+    """Collect one tag name; reopening the modal accumulates more."""
+
+    def __init__(self, review_view: AISuggestionsView) -> None:
+        super().__init__()
+        self.review_view = review_view
+        self.tag_input: discord.ui.TextInput[Any] = discord.ui.TextInput(
+            label="Paperless tag name",
+            placeholder="Existing or new tag",
+            max_length=100,
+            required=True,
+        )
+        self.add_item(self.tag_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.review_view.job.principal_id:
+            await interaction.response.send_message(
+                "Only the uploader can edit this review.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        if not self.review_view.settings.allow_edit_tags:
+            await interaction.response.send_message(
+                "Tag editing is disabled for this deployment.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        name = unicodedata.normalize("NFC", self.tag_input.value).strip()
+        if not name:
+            await interaction.response.send_message(
+                "Enter a non-empty tag name.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        matches = tuple(
+            item
+            for item in self.review_view.review.taxonomy.tags
+            if item.name.casefold() == name.casefold()
+        )
+        if len(matches) > 1:
+            await interaction.response.send_message(
+                "More than one visible Paperless tag has that name. Resolve the ambiguity "
+                "in Paperless first.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        if matches:
+            tag_ids = tuple(dict.fromkeys((*self.review_view.selection.tag_ids, matches[0].id)))
+            self.review_view.selection = replace(
+                self.review_view.selection,
+                tag_ids=tag_ids,
+            )
+            result = f"Added existing tag **{matches[0].name}**."
+        else:
+            names = {value.casefold(): value for value in self.review_view.selection.new_tags}
+            names.setdefault(name.casefold(), name)
+            self.review_view.selection = replace(
+                self.review_view.selection,
+                new_tags=tuple(names.values()),
+            )
+            result = (
+                f"Added pending new tag **{name}**. It will be created only when changes "
+                "are explicitly saved."
+            )
+        await interaction.response.defer(ephemeral=True)
+        await self.review_view.render()
+        await interaction.followup.send(
+            result,
+            ephemeral=True,
+            allowed_mentions=NO_MENTIONS,
+        )
+
+
 class AISuggestionsDateModal(discord.ui.Modal, title="Enter a Custom Document Date"):
     def __init__(self, review_view: AISuggestionsView) -> None:
         super().__init__()
@@ -314,11 +397,19 @@ def _close_existing_items(
     return tuple((item, suggested) for item, suggested, _ in unique.values())
 
 
-def _bounded_lines(lines: Sequence[str]) -> str:
+def _bounded_lines(lines: Sequence[str], *, limit: int = 1024) -> str:
     if not lines:
         return "None"
     rendered = "\n".join(lines)
-    return rendered if len(rendered) <= 1024 else f"{rendered[:1019]}…"
+    return rendered if len(rendered) <= limit else f"{rendered[: limit - 1]}…"
+
+
+def _replace_status_line(content: str, status: str) -> str:
+    lines = tuple(
+        f"**Status:** {status}" if line.startswith("**Status:**") else line
+        for line in content.splitlines()
+    )
+    return "\n".join(lines) or f"**Status:** {status}"
 
 
 class _DateSelect(discord.ui.Select[discord.ui.View]):
@@ -562,12 +653,17 @@ class _ConfirmTaxonomyCreationView(discord.ui.View):
 
 
 class AISuggestionsView(discord.ui.View):
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         job: IngestionJob,
         review: SuggestionReview,
         ingestion: IngestionService,
         settings: Settings,
+        *,
+        ordinal: int = 1,
+        total_items: int = 1,
+        parent_message: discord.Message | discord.PartialMessage | None = None,
+        public_url: str | None = None,
     ) -> None:
         super().__init__(timeout=settings.suggestion_review_timeout_seconds)
         self.clear_items()
@@ -575,6 +671,10 @@ class AISuggestionsView(discord.ui.View):
         self.review = review
         self.ingestion = ingestion
         self.settings = settings
+        self.ordinal = ordinal
+        self.total_items = total_items
+        self.parent_message = parent_message
+        self.public_url = public_url
         self.selection = self._editable_initial_selection(review)
         self.initial_selection = self.selection
         self.saved_selection = SuggestionSelection()
@@ -684,6 +784,106 @@ class AISuggestionsView(discord.ui.View):
                 view=_ReviewActionsView(self),
                 allowed_mentions=NO_MENTIONS,
             )
+        if self.parent_message is not None:
+            await self.parent_message.edit(
+                content=self.parent_content(),
+                allowed_mentions=NO_MENTIONS,
+            )
+
+    @staticmethod
+    def _bounded_metadata_value(value: str, limit: int = 72) -> str:
+        printable = "".join(character if character.isprintable() else "�" for character in value)
+        compact = discord.utils.escape_markdown(" ".join(printable.split()))
+        return compact if len(compact) <= limit else f"{compact[: limit - 1]}…"
+
+    def _taxonomy_value(
+        self,
+        identifier: int | None,
+        kind: TaxonomyKind,
+        limit: int = 72,
+    ) -> str:
+        if identifier is None:
+            return "None"
+        return self._bounded_metadata_value(
+            _taxonomy_name(identifier, _taxonomy_values(self.review.taxonomy, kind)),
+            limit,
+        )
+
+    def _pending_taxonomy_value(self, kind: TaxonomyKind) -> str:
+        identifier = {
+            TaxonomyKind.CORRESPONDENT: self.selection.correspondent_id,
+            TaxonomyKind.DOCUMENT_TYPE: self.selection.document_type_id,
+            TaxonomyKind.STORAGE_PATH: self.selection.storage_path_id,
+        }[kind]
+        names = {
+            TaxonomyKind.CORRESPONDENT: self.selection.new_correspondents,
+            TaxonomyKind.DOCUMENT_TYPE: self.selection.new_document_types,
+            TaxonomyKind.STORAGE_PATH: self.selection.new_storage_paths,
+        }[kind]
+        if names:
+            return f"{self._bounded_metadata_value(names[0])} (new)"
+        if identifier is not None:
+            return self._taxonomy_value(identifier, kind)
+        return "Keep current"
+
+    def parent_content(self, *, status: str | None = None) -> str:
+        """Render a bounded channel-history record without document contents."""
+        document = self.document
+        state = status or ("Saved" if self._applied else "Review ready")
+        title = self._bounded_metadata_value(document.title)
+        pending_title = (
+            self._bounded_metadata_value(self.selection.title)
+            if self.selection.title
+            else "Keep current"
+        )
+        current_date = document.created.isoformat() if document.created else "None"
+        pending_date = (
+            self.selection.created.isoformat() if self.selection.created else "Keep current"
+        )
+        current_tags = tuple(
+            self._taxonomy_value(identifier, TaxonomyKind.TAG, 28)
+            for identifier in document.tag_ids
+        )
+        pending_tags = (
+            *(
+                self._taxonomy_value(identifier, TaxonomyKind.TAG, 28)
+                for identifier in self.selection.tag_ids
+            ),
+            *(
+                f"{self._bounded_metadata_value(name, 28)} (new)"
+                for name in self.selection.new_tags
+            ),
+        )
+        paperless = (
+            f"[{title}]({self.public_url}) · ID {int(document.id)}"
+            if self.public_url and len(self.public_url) <= 300
+            else f"{title} · ID {int(document.id)}"
+        )
+        lines = (
+            f"**Document {self.ordinal}/{self.total_items} · "
+            f"{self._bounded_metadata_value(self.job.original_filename, 90)}**",
+            f"**Status:** {state}",
+            f"**Paperless:** {paperless}",
+            f"**Title:** Current — {title} | Pending — {pending_title}",
+            f"**Date:** Current — {current_date} | Pending — {pending_date}",
+            "**Correspondent:** Current — "
+            f"{self._taxonomy_value(document.correspondent_id, TaxonomyKind.CORRESPONDENT)}"
+            " | Pending — "
+            f"{self._pending_taxonomy_value(TaxonomyKind.CORRESPONDENT)}",
+            "**Document Type:** Current — "
+            f"{self._taxonomy_value(document.document_type_id, TaxonomyKind.DOCUMENT_TYPE)}"
+            " | Pending — "
+            f"{self._pending_taxonomy_value(TaxonomyKind.DOCUMENT_TYPE)}",
+            "**Storage Path:** Current — "
+            f"{self._taxonomy_value(document.storage_path_id, TaxonomyKind.STORAGE_PATH)}"
+            " | Pending — "
+            f"{self._pending_taxonomy_value(TaxonomyKind.STORAGE_PATH)}",
+            f"**Tags:** Current — {', '.join(current_tags[:6]) or 'None'}"
+            f"{f' (+{len(current_tags) - 6} more)' if len(current_tags) > 6 else ''}"
+            f" | Pending additions — {', '.join(pending_tags[:6]) or 'None'}"
+            f"{f' (+{len(pending_tags) - 6} more)' if len(pending_tags) > 6 else ''}",
+        )
+        return _bounded_lines(lines, limit=1900)
 
     def title_content(self) -> str:
         value = self.selection.title or self.document.title
@@ -737,8 +937,19 @@ class AISuggestionsView(discord.ui.View):
                 identifier,
                 _taxonomy_values(self.review.taxonomy, kind),
             )
-            return f"{label}: {value}"
-        return f"{label}: Keep current"
+            return f"{label} - Pending - {value}"
+        current_identifier = {
+            TaxonomyKind.CORRESPONDENT: self.document.correspondent_id,
+            TaxonomyKind.DOCUMENT_TYPE: self.document.document_type_id,
+            TaxonomyKind.STORAGE_PATH: self.document.storage_path_id,
+        }[kind]
+        if current_identifier is not None:
+            current = _taxonomy_name(
+                current_identifier,
+                _taxonomy_values(self.review.taxonomy, kind),
+            )
+            return f"{label} - Existing - {current}"
+        return f"{label} - Keep Current - None"
 
     @property
     def document(self) -> Document:
@@ -769,10 +980,23 @@ class AISuggestionsView(discord.ui.View):
             TaxonomyKind.STORAGE_PATH: self.selection.new_storage_paths,
         }[kind]
         label = _TAXONOMY_LABELS[kind]
+        current_identifier = {
+            TaxonomyKind.CORRESPONDENT: self.document.correspondent_id,
+            TaxonomyKind.DOCUMENT_TYPE: self.document.document_type_id,
+            TaxonomyKind.STORAGE_PATH: self.document.storage_path_id,
+        }.get(kind)
+        current_label = (
+            _taxonomy_name(current_identifier, values) if current_identifier is not None else "None"
+        )
         options.append(
             discord.SelectOption(
-                label=f"{label} · Keep current",
+                label=(
+                    f"{label} · Existing · {current_label}"
+                    if current_identifier is not None
+                    else f"{label} · Keep current · None"
+                )[:100],
                 value="keep",
+                description="Keep the current Paperless value.",
                 default=(
                     not self.selection.tag_ids and not selected_new
                     if kind is TaxonomyKind.TAG
@@ -817,6 +1041,19 @@ class AISuggestionsView(discord.ui.View):
                     default=name in selected_new,
                 )
             )
+        if kind is TaxonomyKind.TAG:
+            suggested_keys = {name.casefold() for name in suggestions}
+            for index, name in enumerate(self.selection.new_tags):
+                if name.casefold() in suggested_keys:
+                    continue
+                options.append(
+                    discord.SelectOption(
+                        label=f"{label} · New · {name}"[:100],
+                        value=f"custom:{index}",
+                        description="Pending custom tag; deselect to remove it.",
+                        default=True,
+                    )
+                )
         return options
 
     def update_selection(
@@ -837,7 +1074,15 @@ class AISuggestionsView(discord.ui.View):
         )
         names = _suggested_names(self.suggestions, kind)
         selected_names = tuple(
-            names[int(value.removeprefix("new:"))] for value in values if value.startswith("new:")
+            dict.fromkeys(
+                (
+                    names[int(value.removeprefix("new:"))]
+                    if value.startswith("new:")
+                    else self.selection.new_tags[int(value.removeprefix("custom:"))]
+                )
+                for value in values
+                if value.startswith(("new:", "custom:"))
+            )
         )
         if kind is TaxonomyKind.TAG:
             self.selection = replace(
@@ -887,9 +1132,12 @@ class AISuggestionsView(discord.ui.View):
         return (
             *(f"id:{identifier}" for identifier in self.selection.tag_ids),
             *(
-                f"new:{suggested_tags.index(name)}"
-                for name in self.selection.new_tags
-                if name in suggested_tags
+                (
+                    f"new:{suggested_tags.index(name)}"
+                    if name in suggested_tags
+                    else f"custom:{index}"
+                )
+                for index, name in enumerate(self.selection.new_tags)
             ),
         )
 
@@ -990,8 +1238,30 @@ class AISuggestionsView(discord.ui.View):
                     updates,
                     expected_modified=self.document.modified,
                 )
-                self.selection = selected
-                self.saved_selection = selected
+                updated_document = replace(
+                    self.document,
+                    title=selected.title or self.document.title,
+                    created=selected.created or self.document.created,
+                    correspondent_id=(
+                        selected.correspondent_id
+                        if selected.correspondent_id is not None
+                        else self.document.correspondent_id
+                    ),
+                    document_type_id=(
+                        selected.document_type_id
+                        if selected.document_type_id is not None
+                        else self.document.document_type_id
+                    ),
+                    storage_path_id=(
+                        selected.storage_path_id
+                        if selected.storage_path_id is not None
+                        else self.document.storage_path_id
+                    ),
+                    tag_ids=tuple(dict.fromkeys((*self.document.tag_ids, *selected.tag_ids))),
+                )
+                self.review = replace(self.review, document=updated_document)
+                self.selection = SuggestionSelection()
+                self.saved_selection = SuggestionSelection()
                 self._applied = True
             except StaleSuggestionError:
                 message = (
@@ -1095,6 +1365,10 @@ class _ReviewActionsView(discord.ui.View):
         self.parent = parent
         self.apply_changes.disabled = parent._applied
         self.reset_changes.disabled = parent._applied
+        if parent.settings.allow_edit_tags:
+            self.add_tag.disabled = parent._applied
+        else:
+            self.remove_item(self.add_tag)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return await self.parent.interaction_check(interaction)
@@ -1117,16 +1391,41 @@ class _ReviewActionsView(discord.ui.View):
         del button
         await self.parent.reset(interaction)
 
+    @discord.ui.button(label="Add Tag", style=discord.ButtonStyle.secondary, emoji="🏷️")
+    async def add_tag(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[discord.ui.View],
+    ) -> None:
+        del button
+        await interaction.response.send_modal(AISuggestionsTagModal(self.parent))
+
 
 class _ReviewThreadController:
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         principal_id: int,
         timeout_seconds: float,
+        *,
+        ingestion: IngestionService | None = None,
+        source_message_id: int | None = None,
+        attachment_id: int | None = None,
+        parent_message: discord.Message | discord.PartialMessage | None = None,
+        thread: discord.Thread | None = None,
+        cleanup_callback: (
+            Callable[[Sequence[DiscordMessageTarget]], Coroutine[Any, Any, None]] | None
+        ) = None,
     ) -> None:
         self.principal_id = principal_id
         self.timeout_seconds = timeout_seconds
         self.sessions: list[AISuggestionsView] = []
+        self.ingestion = ingestion
+        self.source_message_id = source_message_id
+        self.attachment_id = attachment_id
+        self.parent_message = parent_message
+        self.thread = thread
+        self.cleanup_callback = cleanup_callback
+        self.closed = False
 
     @property
     def is_dirty(self) -> bool:
@@ -1179,7 +1478,7 @@ class _ReviewThreadController:
     async def request_finish(self, interaction: discord.Interaction) -> None:
         if self.is_dirty:
             await interaction.response.send_message(
-                "You have unapplied changes. Closing will discard them and delete this thread.",
+                "You have unapplied changes. Closing will discard them and archive this thread.",
                 view=_ConfirmCloseThreadView(self),
                 ephemeral=True,
                 allowed_mentions=NO_MENTIONS,
@@ -1188,8 +1487,56 @@ class _ReviewThreadController:
         await interaction.response.defer(ephemeral=True)
         await self.finish(interaction)
 
-    @staticmethod
-    async def finish(interaction: discord.Interaction) -> None:
+    async def finish(self, interaction: discord.Interaction) -> None:
+        """Archive one bound review, or retain legacy deletion for old controllers."""
+        if self.closed:
+            await interaction.followup.send(
+                "This document review is already closed.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        if (
+            self.ingestion is not None
+            and self.source_message_id is not None
+            and self.attachment_id is not None
+            and self.thread is not None
+        ):
+            try:
+                if self.parent_message is not None and self.sessions:
+                    await self.parent_message.edit(
+                        content=self.sessions[0].parent_content(status="Closed"),
+                        allowed_mentions=NO_MENTIONS,
+                    )
+                edit_thread = getattr(self.thread, "edit", None)
+                if edit_thread is not None:
+                    await edit_thread(
+                        archived=True,
+                        locked=True,
+                        reason="Uploader finished Paperless document review",
+                    )
+                targets = await self.ingestion.resolve_upload_item(
+                    self.source_message_id,
+                    self.attachment_id,
+                    UploadItemState.CLOSED,
+                )
+                if targets and self.cleanup_callback is not None:
+                    await self.cleanup_callback(targets)
+                self.closed = True
+            except discord.HTTPException:
+                await interaction.followup.send(
+                    "Discord could not archive this thread. Check the bot's Manage Threads "
+                    "permission.",
+                    ephemeral=True,
+                    allowed_mentions=NO_MENTIONS,
+                )
+                return
+            await interaction.followup.send(
+                "Document review closed.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
         delete = getattr(interaction.channel, "delete", None)
         if delete is None:
             await interaction.followup.send(
@@ -1206,6 +1553,228 @@ class _ReviewThreadController:
                 ephemeral=True,
                 allowed_mentions=NO_MENTIONS,
             )
+
+
+class _UploadBatchController:
+    """Owner-only batch operations that never conflate saving and closing."""
+
+    def __init__(
+        self,
+        principal_id: int,
+        timeout_seconds: float,
+    ) -> None:
+        self.principal_id = principal_id
+        self.timeout_seconds = timeout_seconds
+        self.controllers: list[_ReviewThreadController] = []
+        self._operation_lock = asyncio.Lock()
+
+    @property
+    def sessions(self) -> tuple[AISuggestionsView, ...]:
+        sessions = tuple(
+            session
+            for controller in self.controllers
+            if not controller.closed
+            for session in controller.sessions
+        )
+        return tuple(sorted(sessions, key=lambda session: session.ordinal))
+
+    @property
+    def dirty_sessions(self) -> tuple[AISuggestionsView, ...]:
+        return tuple(session for session in self.sessions if session.is_dirty)
+
+    def add(self, controller: _ReviewThreadController) -> None:
+        self.controllers.append(controller)
+
+    def build_view(self) -> _UploadBatchControlsView:
+        return _UploadBatchControlsView(self)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.principal_id:
+            return True
+        await interaction.response.send_message(
+            "Only the uploader can control this upload batch.",
+            ephemeral=True,
+            allowed_mentions=NO_MENTIONS,
+        )
+        return False
+
+    async def refresh_all(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        errors: list[str] = []
+        for session in self.sessions:
+            error = await session.reload()
+            if error is not None:
+                errors.append(error)
+        await interaction.followup.send(
+            (
+                _bounded_lines(tuple(errors))
+                if errors
+                else f"Refreshed {len(self.sessions)} open document review(s)."
+            ),
+            ephemeral=True,
+            allowed_mentions=NO_MENTIONS,
+        )
+
+    async def request_save_all(self, interaction: discord.Interaction) -> None:
+        dirty = self.dirty_sessions
+        if not dirty:
+            await interaction.response.send_message(
+                "There are no pending document changes to save.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        new_items = tuple(value for session in dirty for value in session._new_taxonomy_summary())
+        creation_note = (
+            "\nPotential new Paperless objects:\n"
+            f"{_bounded_lines(tuple(f'• {value}' for value in new_items))}"
+            if new_items
+            else ""
+        )
+        await interaction.response.send_message(
+            f"Save pending AI selections for {len(dirty)} document(s)? "
+            "Documents are saved sequentially and remain open."
+            f"{creation_note}",
+            view=_ConfirmSaveAllView(self),
+            ephemeral=True,
+            allowed_mentions=NO_MENTIONS,
+        )
+
+    async def save_all(self, interaction: discord.Interaction) -> None:
+        async with self._operation_lock:
+            dirty = self.dirty_sessions
+            saved = 0
+            failures = 0
+            for session in dirty:
+                await session.apply(
+                    interaction,
+                    confirm_create=bool(session._new_taxonomy_summary()),
+                )
+                if session._applied:
+                    saved += 1
+                else:
+                    failures += 1
+            await interaction.followup.send(
+                f"Save All finished: {saved} saved, {failures} failed. "
+                "All document threads remain open.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+
+    async def request_close_all(self, interaction: discord.Interaction) -> None:
+        open_controllers = tuple(
+            controller for controller in self.controllers if not controller.closed
+        )
+        if not open_controllers:
+            await interaction.response.send_message(
+                "There are no successful document reviews left to close.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        dirty = sum(controller.is_dirty for controller in open_controllers)
+        warning = (
+            f" {dirty} document(s) have pending choices that will be discarded." if dirty else ""
+        )
+        await interaction.response.send_message(
+            f"Close {len(open_controllers)} successful document review(s)?{warning} "
+            "Failed uploads and unresolved items are not dismissed.",
+            view=_ConfirmCloseAllView(self),
+            ephemeral=True,
+            allowed_mentions=NO_MENTIONS,
+        )
+
+    async def close_all(self, interaction: discord.Interaction) -> None:
+        async with self._operation_lock:
+            closed = 0
+            for controller in sorted(
+                self.controllers,
+                key=lambda item: item.sessions[0].ordinal if item.sessions else 0,
+            ):
+                if controller.closed:
+                    continue
+                await controller.finish(interaction)
+                closed += int(controller.closed)
+            await interaction.followup.send(
+                f"Close All finished: {closed} successful review(s) closed. "
+                "Failures still require individual dismissal.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+
+
+class _UploadBatchControlsView(discord.ui.View):
+    def __init__(self, controller: _UploadBatchController) -> None:
+        super().__init__(timeout=controller.timeout_seconds)
+        self.controller = controller
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await self.controller.interaction_check(interaction)
+
+    @discord.ui.button(label="Refresh All", style=discord.ButtonStyle.secondary, emoji="🔄")
+    async def refresh_all(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[discord.ui.View],
+    ) -> None:
+        del button
+        await self.controller.refresh_all(interaction)
+
+    @discord.ui.button(label="Save All", style=discord.ButtonStyle.green, emoji="✅")
+    async def save_all(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[discord.ui.View],
+    ) -> None:
+        del button
+        await self.controller.request_save_all(interaction)
+
+    @discord.ui.button(label="Close All", style=discord.ButtonStyle.danger, emoji="🗄️")
+    async def close_all(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[discord.ui.View],
+    ) -> None:
+        del button
+        await self.controller.request_close_all(interaction)
+
+
+class _ConfirmSaveAllView(discord.ui.View):
+    def __init__(self, controller: _UploadBatchController) -> None:
+        super().__init__(timeout=300)
+        self.controller = controller
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await self.controller.interaction_check(interaction)
+
+    @discord.ui.button(label="Confirm Save All", style=discord.ButtonStyle.green)
+    async def confirm(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[discord.ui.View],
+    ) -> None:
+        del button
+        await interaction.response.defer(ephemeral=True)
+        await self.controller.save_all(interaction)
+
+
+class _ConfirmCloseAllView(discord.ui.View):
+    def __init__(self, controller: _UploadBatchController) -> None:
+        super().__init__(timeout=300)
+        self.controller = controller
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await self.controller.interaction_check(interaction)
+
+    @discord.ui.button(label="Close Successful Reviews", style=discord.ButtonStyle.danger)
+    async def confirm(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[discord.ui.View],
+    ) -> None:
+        del button
+        await interaction.response.defer(ephemeral=True)
+        await self.controller.close_all(interaction)
 
 
 class _ReviewThreadControlsView(discord.ui.View):
@@ -1301,6 +1870,156 @@ class _ConfirmCloseThreadView(discord.ui.View):
         await interaction.response.edit_message(content="Thread left open.", view=None)
 
 
+class _FailedUploadController:
+    """Require explicit uploader acknowledgement before a failed item resolves."""
+
+    def __init__(  # noqa: PLR0913
+        self,
+        *,
+        principal_id: int,
+        ingestion: IngestionService,
+        source_message_id: int,
+        attachment_id: int,
+        parent_message: discord.Message | discord.PartialMessage,
+        thread: discord.Thread,
+        cleanup_callback: Callable[[Sequence[DiscordMessageTarget]], Coroutine[Any, Any, None]],
+        parent_content: str | None = None,
+    ) -> None:
+        self.principal_id = principal_id
+        self.ingestion = ingestion
+        self.source_message_id = source_message_id
+        self.attachment_id = attachment_id
+        self.parent_message = parent_message
+        self.thread = thread
+        self.cleanup_callback = cleanup_callback
+        stored_content = (
+            parent_content if parent_content is not None else getattr(parent_message, "content", "")
+        )
+        self.parent_content = stored_content if isinstance(stored_content, str) else ""
+        self.dismissed = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.principal_id:
+            return True
+        await interaction.response.send_message(
+            "Only the uploader can dismiss this failed upload.",
+            ephemeral=True,
+            allowed_mentions=NO_MENTIONS,
+        )
+        return False
+
+    async def request_dismiss(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(
+            "Dismiss this failed upload? If it is the final unresolved item, the original "
+            "Discord attachment message and batch summary will be deleted.",
+            view=_ConfirmDismissFailedView(self),
+            ephemeral=True,
+            allowed_mentions=NO_MENTIONS,
+        )
+
+    async def dismiss(self, interaction: discord.Interaction) -> None:
+        if self.dismissed:
+            await interaction.followup.send(
+                "This failed upload was already dismissed.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        await self.parent_message.edit(
+            content=_replace_status_line(self.parent_content, "Failure dismissed"),
+            allowed_mentions=NO_MENTIONS,
+        )
+        edit_thread = getattr(self.thread, "edit", None)
+        if edit_thread is not None:
+            await edit_thread(
+                archived=True,
+                locked=True,
+                reason="Uploader dismissed failed Paperless upload",
+            )
+        targets = await self.ingestion.resolve_upload_item(
+            self.source_message_id,
+            self.attachment_id,
+            UploadItemState.DISMISSED,
+        )
+        if targets:
+            await self.cleanup_callback(targets)
+        self.dismissed = True
+        await interaction.followup.send(
+            "Failed upload dismissed.",
+            ephemeral=True,
+            allowed_mentions=NO_MENTIONS,
+        )
+
+
+class _FailedUploadView(discord.ui.View):
+    def __init__(self, controller: _FailedUploadController, timeout: float) -> None:
+        super().__init__(timeout=timeout)
+        self.controller = controller
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await self.controller.interaction_check(interaction)
+
+    @discord.ui.button(label="Dismiss Failed Upload", style=discord.ButtonStyle.danger)
+    async def dismiss(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[discord.ui.View],
+    ) -> None:
+        del button
+        await self.controller.request_dismiss(interaction)
+
+
+class _ConfirmDismissFailedView(discord.ui.View):
+    def __init__(self, controller: _FailedUploadController) -> None:
+        super().__init__(timeout=300)
+        self.controller = controller
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await self.controller.interaction_check(interaction)
+
+    @discord.ui.button(label="Dismiss Failure", style=discord.ButtonStyle.danger)
+    async def confirm(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[discord.ui.View],
+    ) -> None:
+        del button
+        await interaction.response.defer(ephemeral=True)
+        await self.controller.dismiss(interaction)
+
+
+class _PendingUploadView(discord.ui.View):
+    """Actionable status control for jobs recovery must continue polling."""
+
+    def __init__(self, principal_id: int, timeout: float) -> None:
+        super().__init__(timeout=timeout)
+        self.principal_id = principal_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.principal_id:
+            return True
+        await interaction.response.send_message(
+            "Only the uploader can check this upload.",
+            ephemeral=True,
+            allowed_mentions=NO_MENTIONS,
+        )
+        return False
+
+    @discord.ui.button(label="Check Status", style=discord.ButtonStyle.secondary, emoji="🔄")
+    async def check_status(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[discord.ui.View],
+    ) -> None:
+        del button
+        await interaction.response.send_message(
+            "Recovery is still checking the saved Paperless task. The attachment will not be "
+            "resubmitted automatically.",
+            ephemeral=True,
+            allowed_mentions=NO_MENTIONS,
+        )
+
+
 class DiscordAssistant(discord.Client):
     """Exact-allowlist Discord inbound adapter."""
 
@@ -1331,6 +2050,9 @@ class DiscordAssistant(discord.Client):
         self._ready_callback = ready_callback
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._pending_recovery: list[IngestionOutcome] = []
+        self._restored_upload_jobs: set[UUID] = set()
+        self._restored_upload_items: set[tuple[int, int]] = set()
+        self._upload_batch_controllers: dict[int, _UploadBatchController] = {}
         self._staging_lock = asyncio.Lock()
         self.tree = discord.app_commands.CommandTree(self)
         self._register_commands()
@@ -1361,6 +2083,17 @@ class DiscordAssistant(discord.Client):
                 )
                 return
             await interaction.response.defer(ephemeral=True)
+            if interaction.channel_id == self._settings.discord_uploads_channel_id:
+                targets = await self._ingestion.terminal_upload_cleanup_targets()
+                confirmed = await self.cleanup_messages((), targets)
+                if confirmed:
+                    await self._ingestion.confirm_upload_cleanup(confirmed)
+                await interaction.followup.send(
+                    f"Cleaned {len(confirmed)} tracked batch message(s); "
+                    "active and uncertain batches were skipped.",
+                    ephemeral=True,
+                )
+                return
             channel = interaction.channel
             if not isinstance(channel, discord.TextChannel):
                 await interaction.followup.send("Invalid channel type.", ephemeral=True)
@@ -1509,6 +2242,7 @@ class DiscordAssistant(discord.Client):
         """Publish safe readiness and the bounded missing-tag warning."""
         self._ready_callback(self._taxonomy.ingestion_ready)
         await self._flush_recovery_notifications()
+        await self._restore_active_upload_reviews()
         if self._taxonomy.ingestion_ready:
             await self._clear_missing_tag_warning()
         else:
@@ -1828,6 +2562,240 @@ class DiscordAssistant(discord.Client):
             if "plan" in locals():
                 self._delivery.cleanup(plan)
 
+    @staticmethod
+    def _safe_upload_filename(filename: str, limit: int = 120) -> str:
+        cleaned = "".join(character if character.isprintable() else "�" for character in filename)
+        escaped = discord.utils.escape_markdown(cleaned.strip() or "attachment")
+        return escaped if len(escaped) <= limit else f"{escaped[: limit - 1]}…"
+
+    def _upload_summary_line(self, ordinal: int, filename: str, status: str) -> str:
+        safe_filename = self._safe_upload_filename(filename, 60)
+        bounded_status = status if len(status) <= 105 else f"{status[:104]}…"
+        return f"{ordinal}. `{safe_filename}` — {bounded_status}"
+
+    def _upload_parent_channel(self, message: discord.Message) -> Any:
+        if isinstance(message.channel, discord.Thread):
+            return getattr(message.channel, "parent", None)
+        return message.channel
+
+    async def _create_upload_item_thread(  # noqa: PLR0913
+        self,
+        channel: Any,
+        *,
+        ordinal: int,
+        total_items: int,
+        filename: str,
+        parent_content: str,
+        uploader: Any,
+    ) -> tuple[discord.Message, discord.Thread]:
+        parent = await channel.send(parent_content, allowed_mentions=NO_MENTIONS)
+        thread = await parent.create_thread(
+            name=(f"Document {ordinal}/{total_items}: {self._safe_upload_filename(filename, 70)}")[
+                :100
+            ],
+            auto_archive_duration=1440,
+        )
+        add_user = getattr(thread, "add_user", None)
+        if add_user is not None:
+            with suppress(discord.HTTPException):
+                await add_user(uploader)
+        return parent, thread
+
+    async def _cleanup_upload_targets(self, targets: Sequence[DiscordMessageTarget]) -> None:
+        confirmed = await self.cleanup_messages((), targets)
+        if confirmed:
+            await self._ingestion.confirm_upload_cleanup(confirmed)
+
+    async def _create_failed_upload_review(  # noqa: PLR0913
+        self,
+        *,
+        channel: Any,
+        message: discord.Message,
+        attachment: Any,
+        ordinal: int,
+        total_items: int,
+        reason: str,
+    ) -> None:
+        safe_name = self._safe_upload_filename(attachment.filename)
+        parent_content = (
+            f"**Document {ordinal}/{total_items} · {safe_name}**\n"
+            "**Status:** Upload failed\n"
+            f"**Reason:** {reason}"
+        )
+        parent, thread = await self._create_upload_item_thread(
+            channel,
+            ordinal=ordinal,
+            total_items=total_items,
+            filename=attachment.filename,
+            parent_content=parent_content,
+            uploader=message.author,
+        )
+        await self._ingestion.update_upload_item(
+            message.id,
+            attachment.id,
+            UploadItemState.FAILED,
+            parent_message_id=parent.id,
+            parent_channel_id=channel.id,
+            thread_id=thread.id,
+            failure_reason=reason,
+        )
+        controller = _FailedUploadController(
+            principal_id=message.author.id,
+            ingestion=self._ingestion,
+            source_message_id=message.id,
+            attachment_id=attachment.id,
+            parent_message=parent,
+            thread=thread,
+            cleanup_callback=self._cleanup_upload_targets,
+            parent_content=parent_content,
+        )
+        await thread.send(
+            f"`{safe_name}` was not ingested.\n{reason}",
+            view=_FailedUploadView(
+                controller,
+                self._settings.suggestion_review_timeout_seconds,
+            ),
+            allowed_mentions=NO_MENTIONS,
+        )
+
+    async def _create_pending_upload_review(  # noqa: PLR0913
+        self,
+        *,
+        channel: Any,
+        message: discord.Message,
+        job: IngestionJob,
+        ordinal: int,
+        total_items: int,
+        reason: str,
+        state: UploadItemState,
+    ) -> None:
+        safe_name = self._safe_upload_filename(job.original_filename)
+        parent, thread = await self._create_upload_item_thread(
+            channel,
+            ordinal=ordinal,
+            total_items=total_items,
+            filename=job.original_filename,
+            parent_content=(
+                f"**Document {ordinal}/{total_items} · {safe_name}**\n"
+                "**Status:** Awaiting a certain Paperless outcome\n"
+                f"**Detail:** {reason}"
+            ),
+            uploader=message.author,
+        )
+        await self._ingestion.update_upload_item(
+            message.id,
+            job.discord_attachment_id,
+            state,
+            job_id=job.id,
+            parent_message_id=parent.id,
+            parent_channel_id=channel.id,
+            thread_id=thread.id,
+            failure_reason=reason,
+        )
+        await thread.send(
+            reason,
+            view=_PendingUploadView(
+                message.author.id,
+                self._settings.suggestion_review_timeout_seconds,
+            ),
+            allowed_mentions=NO_MENTIONS,
+        )
+
+    async def _create_success_upload_review(  # noqa: PLR0913
+        self,
+        *,
+        channel: Any,
+        message: discord.Message,
+        outcome: IngestionOutcome,
+        ordinal: int,
+        total_items: int,
+        batch_controller: _UploadBatchController,
+    ) -> bool:
+        if outcome.document is None:
+            return False
+        job = outcome.job
+        review_unavailable = False
+        try:
+            review = await self._ingestion.get_suggestion_review(job)
+        except PaperlessUnavailableError, StaleSuggestionError, UnlinkedUserError:
+            review = None
+        if review is None:
+            review_unavailable = True
+            taxonomy = self._taxonomy.snapshot or Taxonomy((), (), ())
+            review = SuggestionReview(
+                outcome.document,
+                AISuggestions(),
+                taxonomy,
+                capabilities=TaxonomyCapabilities(),
+            )
+        public_url = self._delivery_url(int(outcome.document.id))
+        session = AISuggestionsView(
+            job,
+            review,
+            self._ingestion,
+            self._settings,
+            ordinal=ordinal,
+            total_items=total_items,
+            public_url=public_url,
+        )
+        parent, thread = await self._create_upload_item_thread(
+            channel,
+            ordinal=ordinal,
+            total_items=total_items,
+            filename=job.original_filename,
+            parent_content=session.parent_content(
+                status="AI review unavailable — use Retry Review"
+                if review_unavailable
+                else "Review ready"
+            ),
+            uploader=message.author,
+        )
+        session.parent_message = parent
+        await self._ingestion.update_upload_item(
+            message.id,
+            job.discord_attachment_id,
+            UploadItemState.SUCCEEDED,
+            job_id=job.id,
+            document_id=int(outcome.document.id),
+            parent_message_id=parent.id,
+            parent_channel_id=channel.id,
+            thread_id=thread.id,
+        )
+        await session.send(thread)
+        controller = _ReviewThreadController(
+            message.author.id,
+            self._settings.suggestion_review_timeout_seconds,
+            ingestion=self._ingestion,
+            source_message_id=message.id,
+            attachment_id=job.discord_attachment_id,
+            parent_message=parent,
+            thread=thread,
+            cleanup_callback=self._cleanup_upload_targets,
+        )
+        controller.add(session)
+        batch_controller.add(controller)
+        await thread.send(
+            (
+                "AI suggestions are unavailable. Use **Refresh** to retry the review."
+                if review_unavailable
+                else "Review this document, then save or close it."
+            ),
+            view=controller.build_view(public_url),
+            allowed_mentions=NO_MENTIONS,
+        )
+        return review_unavailable
+
+    async def _poll_upload_job(
+        self, ordinal: int, job: IngestionJob
+    ) -> tuple[int, IngestionJob, IngestionOutcome | BaseException]:
+        try:
+            outcome: IngestionOutcome | BaseException = await self._ingestion.poll_until_notifiable(
+                job
+            )
+        except BaseException as error:
+            outcome = error
+        return ordinal, job, outcome
+
     async def _uploads_message(  # noqa: PLR0912, PLR0915
         self, message: discord.Message
     ) -> None:
@@ -1844,35 +2812,67 @@ class DiscordAssistant(discord.Client):
                 allowed_mentions=NO_MENTIONS,
             )
             return
-        if isinstance(message.channel, discord.Thread):
-            thread = message.channel
-        else:
-            first_filename = message.attachments[0].filename
-            snippet = first_filename[:40]
-            thread = await message.create_thread(
-                name=f"Upload: {snippet}",
-                auto_archive_duration=1440,
+        parent_channel = self._upload_parent_channel(message)
+        if parent_channel is None:
+            await message.reply(
+                "Per-file reviews require access to the upload channel.",
+                allowed_mentions=NO_MENTIONS,
             )
-        status = await thread.send(
-            f"Received {len(message.attachments)} file(s); validating…",
+            return
+        total_items = len(message.attachments)
+        batch_controller = self._upload_batch_controller(
+            message.id,
+            message.author.id,
+        )
+        status = await parent_channel.send(
+            f"Received {total_items} file(s); validating and creating per-file reviews…",
+            view=batch_controller.build_view(),
             allowed_mentions=NO_MENTIONS,
         )
-        attachments = message.attachments[: self._settings.discord_max_attachments]
-        results: list[str] = []
-        jobs: list[tuple[int, IngestionJob]] = []
-        review_controller = _ReviewThreadController(
-            message.author.id,
-            self._settings.suggestion_review_timeout_seconds,
+        await self._ingestion.create_upload_batch(
+            UploadBatch(
+                source_message_id=message.id,
+                source_channel_id=message.channel.id,
+                summary_message_id=status.id,
+                summary_channel_id=parent_channel.id,
+                principal_id=message.author.id,
+                total_items=total_items,
+            ),
+            tuple(
+                UploadItem(
+                    source_message_id=message.id,
+                    attachment_id=attachment.id,
+                    ordinal=index,
+                    original_filename=attachment.filename,
+                )
+                for index, attachment in enumerate(message.attachments, start=1)
+            ),
         )
-        all_resolved = len(message.attachments) <= self._settings.discord_max_attachments
-        if len(message.attachments) > self._settings.discord_max_attachments:
-            results.append(
-                f"Only the first {self._settings.discord_max_attachments} files can be processed."
-            )
-        for index, attachment in enumerate(attachments, start=1):
-            if attachment.size > self._settings.discord_max_attachment_bytes:
-                results.append(f"{index}. `{attachment.filename}` — too large to ingest.")
-                all_resolved = False
+        results: dict[int, str] = {}
+        jobs: list[tuple[int, IngestionJob]] = []
+        for index, attachment in enumerate(message.attachments, start=1):
+            failure: str | None = None
+            if index > self._settings.discord_max_attachments:
+                failure = (
+                    f"Only the first {self._settings.discord_max_attachments} files "
+                    "can be ingested in one batch."
+                )
+            elif attachment.size > self._settings.discord_max_attachment_bytes:
+                failure = "The attachment is too large to ingest."
+            if failure is not None:
+                results[index] = self._upload_summary_line(
+                    index,
+                    attachment.filename,
+                    failure,
+                )
+                await self._create_failed_upload_review(
+                    channel=parent_channel,
+                    message=message,
+                    attachment=attachment,
+                    ordinal=index,
+                    total_items=total_items,
+                    reason=failure,
+                )
                 continue
             staged_path = self._settings.staging_dir / str(uuid4())
             async with self._staging_lock:
@@ -1880,153 +2880,203 @@ class DiscordAssistant(discord.Client):
                     self._staging_usage() + attachment.size
                     > self._settings.ingestion_max_staged_bytes
                 ):
-                    results.append(f"{index}. `{attachment.filename}` — staging quota exceeded.")
-                    all_resolved = False
-                    continue
-                try:
-                    await attachment.save(staged_path, use_cached=False)
-                    staged_path.chmod(0o600)
-                    actual_size = staged_path.stat().st_size
-                    if actual_size > self._settings.discord_max_attachment_bytes:
-                        raise InvalidAttachmentError(
-                            "The downloaded file exceeds the ingestion limit."
-                        )
-                    if self._staging_usage() > self._settings.ingestion_max_staged_bytes:
-                        raise InvalidAttachmentError("The staging quota was exceeded.")
-                    job = await self._ingestion.stage(
-                        discord_message_id=message.id,
-                        discord_attachment_id=attachment.id,
-                        discord_status_message_id=status.id,
-                        principal_id=message.author.id,
-                        staged_path=staged_path,
-                        original_filename=attachment.filename,
-                        caption=message.content,
-                        discord_message_channel_id=message.channel.id,
-                        discord_status_channel_id=thread.id,
-                    )
-                    if job is None:
-                        staged_path.unlink(missing_ok=True)
-                        results.append(f"{index}. `{attachment.filename}` — already received.")
-                    else:
-                        jobs.append((index, job))
-                except InvalidAttachmentError as error:
-                    staged_path.unlink(missing_ok=True)
-                    results.append(f"{index}. `{attachment.filename}` — {error.user_message}")
-                    all_resolved = False
-                except UnlinkedUserError:
-                    staged_path.unlink(missing_ok=True)
-                    results.append(
-                        f"{index}. `{attachment.filename}` — link your Paperless account first."
-                    )
-                    all_resolved = False
-                except discord.HTTPException, OSError:
-                    staged_path.unlink(missing_ok=True)
-                    results.append(f"{index}. `{attachment.filename}` — download failed; retry it.")
-                    all_resolved = False
-
-        submitted: list[tuple[int, IngestionJob]] = []
-        try:
-            for index, job in jobs:
-                outcome = await self._ingestion.submit(job)
-                if outcome.job.state == JobState.SUBMITTED:
-                    submitted.append((index, outcome.job))
-                    results.append(f"{index}. `{job.original_filename}` — processing in Paperless…")
-                elif outcome.job.state == JobState.RECONCILIATION_REQUIRED:
-                    results.append(
-                        f"{index}. `{job.original_filename}` — upload outcome is uncertain; "
-                        f"reconcile job `{job.id}` in Paperless."
-                    )
-                    all_resolved = False
+                    failure = "The staging quota was exceeded."
                 else:
-                    results.append(f"{index}. `{job.original_filename}` — Paperless rejected it.")
-                    all_resolved = False
-        except UnlinkedUserError:
-            await status.edit(
-                content=(
-                    "You have not linked your Paperless account yet. "
-                    "Please run `/auth link <token>` to connect."
-                ),
-                allowed_mentions=NO_MENTIONS,
-            )
-            return
-        await self._replace_status(status, results)
-
-        if submitted:
-            outcomes = await asyncio.gather(
-                *(self._ingestion.poll_until_notifiable(job) for _, job in submitted),
-                return_exceptions=True,
-            )
-            for (index, job), recovered in zip(submitted, outcomes, strict=True):
-                if isinstance(recovered, BaseException):
-                    results.append(
-                        f"{index}. `{job.original_filename}` — status unavailable; "
-                        "recovery will keep checking."
-                    )
-                    all_resolved = False
-                elif recovered.job.state == JobState.SUCCEEDED and recovered.document:
-                    note = " (guidance note failed)" if recovered.note_failed else ""
-                    results.append(
-                        f"{index}. `{job.original_filename}` — uploaded as "
-                        f"[{recovered.document.title}]"
-                        f"({self._delivery_url(int(recovered.document.id))})"
-                        f"{note}."
-                    )
                     try:
-                        review = await self._ingestion.get_suggestion_review(recovered.job)
-                    except PaperlessUnavailableError, StaleSuggestionError:
-                        review = None
-                        results.append(
-                            f"{index}. AI suggestions are unavailable; "
-                            "the server log contains the Paperless error."
+                        await attachment.save(staged_path, use_cached=False)
+                        staged_path.chmod(0o600)
+                        if staged_path.stat().st_size > self._settings.discord_max_attachment_bytes:
+                            raise InvalidAttachmentError(
+                                "The downloaded file exceeds the ingestion limit."
+                            )
+                        if self._staging_usage() > self._settings.ingestion_max_staged_bytes:
+                            raise InvalidAttachmentError("The staging quota was exceeded.")
+                        job = await self._ingestion.stage(
+                            discord_message_id=message.id,
+                            discord_attachment_id=attachment.id,
+                            discord_status_message_id=status.id,
+                            principal_id=message.author.id,
+                            staged_path=staged_path,
+                            original_filename=attachment.filename,
+                            caption=message.content,
+                            discord_message_channel_id=message.channel.id,
+                            discord_status_channel_id=parent_channel.id,
                         )
+                        if job is None:
+                            failure = "This Discord attachment was already received."
+                        else:
+                            jobs.append((index, job))
+                    except InvalidAttachmentError as error:
+                        failure = error.user_message
                     except UnlinkedUserError:
-                        review = None
-                        results.append(
-                            f"{index}. AI suggestions are unavailable because "
-                            "the Paperless account is no longer linked."
-                        )
-                    if review is not None:
-                        session = await self._send_suggestions_ui(thread, recovered.job, review)
-                        review_controller.add(session)
-                elif recovered.notification_timed_out:
-                    results.append(
-                        f"{index}. `{job.original_filename}` — still processing; "
-                        f"task `{job.paperless_task_id}` will keep being checked."
-                    )
-                    all_resolved = False
-                else:
-                    guidance = (
-                        " Verify Paperless Tika/Gotenberg and the Office-upload flag."
-                        if job.office_dependent
-                        else ""
-                    )
-                    results.append(
-                        f"{index}. `{job.original_filename}` — processing failed.{guidance}"
-                    )
-                    all_resolved = False
-            succeeded_url = next(
-                (
-                    self._delivery_url(int(recovered.document.id))
-                    for _, recovered in zip(submitted, outcomes, strict=True)
-                    if not isinstance(recovered, BaseException)
-                    and recovered.job.state == JobState.SUCCEEDED
-                    and recovered.document is not None
-                ),
-                None,
-            )
+                        failure = "Link your Paperless account before uploading."
+                    except discord.HTTPException, OSError:
+                        failure = "The attachment download failed; retry it."
+                if failure is not None:
+                    staged_path.unlink(missing_ok=True)
+            if failure is not None:
+                results[index] = self._upload_summary_line(
+                    index,
+                    attachment.filename,
+                    failure,
+                )
+                await self._create_failed_upload_review(
+                    channel=parent_channel,
+                    message=message,
+                    attachment=attachment,
+                    ordinal=index,
+                    total_items=total_items,
+                    reason=failure,
+                )
+        submitted: list[tuple[int, IngestionJob]] = []
+        for index, job in jobs:
+            try:
+                outcome = await self._ingestion.submit(job)
+            except UnlinkedUserError:
+                reason = "The linked Paperless account is unavailable."
+                results[index] = self._upload_summary_line(
+                    index,
+                    job.original_filename,
+                    reason,
+                )
+                attachment = next(
+                    item for item in message.attachments if item.id == job.discord_attachment_id
+                )
+                await self._create_failed_upload_review(
+                    channel=parent_channel,
+                    message=message,
+                    attachment=attachment,
+                    ordinal=index,
+                    total_items=total_items,
+                    reason=reason,
+                )
+                continue
+            if outcome.job.state is JobState.SUBMITTED:
+                submitted.append((index, outcome.job))
+                results[index] = self._upload_summary_line(
+                    index,
+                    job.original_filename,
+                    "processing in Paperless…",
+                )
+            elif outcome.job.state is JobState.RECONCILIATION_REQUIRED:
+                reason = "The Paperless upload outcome is uncertain; recovery will not resubmit it."
+                results[index] = self._upload_summary_line(
+                    index,
+                    job.original_filename,
+                    reason,
+                )
+                await self._create_pending_upload_review(
+                    channel=parent_channel,
+                    message=message,
+                    job=outcome.job,
+                    ordinal=index,
+                    total_items=total_items,
+                    reason=reason,
+                    state=UploadItemState.RECONCILIATION_REQUIRED,
+                )
+            else:
+                reason = "Paperless rejected the upload."
+                results[index] = self._upload_summary_line(
+                    index,
+                    job.original_filename,
+                    reason,
+                )
+                attachment = next(
+                    item for item in message.attachments if item.id == job.discord_attachment_id
+                )
+                await self._create_failed_upload_review(
+                    channel=parent_channel,
+                    message=message,
+                    attachment=attachment,
+                    ordinal=index,
+                    total_items=total_items,
+                    reason=reason,
+                )
+        await self._replace_status(
+            status,
+            tuple(results[index] for index in sorted(results)),
+            view=batch_controller.build_view(),
+        )
+        tasks = tuple(
+            asyncio.create_task(self._poll_upload_job(index, job)) for index, job in submitted
+        )
+        for completed in asyncio.as_completed(tasks):
+            index, job, recovered = await completed
+            if isinstance(recovered, BaseException):
+                reason = "Status is unavailable; recovery will keep checking the saved task."
+                results[index] = self._upload_summary_line(
+                    index,
+                    job.original_filename,
+                    reason,
+                )
+                await self._create_pending_upload_review(
+                    channel=parent_channel,
+                    message=message,
+                    job=job,
+                    ordinal=index,
+                    total_items=total_items,
+                    reason=reason,
+                    state=UploadItemState.PROCESSING,
+                )
+            elif recovered.job.state is JobState.SUCCEEDED and recovered.document is not None:
+                unavailable = await self._create_success_upload_review(
+                    channel=parent_channel,
+                    message=message,
+                    outcome=recovered,
+                    ordinal=index,
+                    total_items=total_items,
+                    batch_controller=batch_controller,
+                )
+                note = " AI review unavailable; use Refresh." if unavailable else ""
+                safe_title = self._safe_upload_filename(recovered.document.title, 50)
+                results[index] = self._upload_summary_line(
+                    index,
+                    job.original_filename,
+                    f"uploaded as {safe_title}; review ready.{note}",
+                )
+            elif recovered.notification_timed_out:
+                reason = "Paperless is still processing; recovery will keep checking."
+                results[index] = self._upload_summary_line(
+                    index,
+                    job.original_filename,
+                    reason,
+                )
+                await self._create_pending_upload_review(
+                    channel=parent_channel,
+                    message=message,
+                    job=job,
+                    ordinal=index,
+                    total_items=total_items,
+                    reason=reason,
+                    state=UploadItemState.PROCESSING,
+                )
+            else:
+                reason = (
+                    "Processing failed. Verify Paperless Tika/Gotenberg and Office upload."
+                    if job.office_dependent
+                    else "Paperless processing failed."
+                )
+                results[index] = self._upload_summary_line(
+                    index,
+                    job.original_filename,
+                    reason,
+                )
+                attachment = next(
+                    item for item in message.attachments if item.id == job.discord_attachment_id
+                )
+                await self._create_failed_upload_review(
+                    channel=parent_channel,
+                    message=message,
+                    attachment=attachment,
+                    ordinal=index,
+                    total_items=total_items,
+                    reason=reason,
+                )
             await self._replace_status(
                 status,
-                results,
-                succeeded_url,
-                view=(
-                    review_controller.build_view(succeeded_url)
-                    if review_controller.sessions
-                    else None
-                ),
+                tuple(results[index] for index in sorted(results)),
+                view=batch_controller.build_view(),
             )
-        if all_resolved:
-            with suppress(discord.HTTPException):
-                await message.delete()
 
     async def _send_suggestions_ui(
         self,
@@ -2095,8 +3145,61 @@ class DiscordAssistant(discord.Client):
         while True:
             await asyncio.sleep(self._settings.paperless_task_recovery_interval_seconds)
             await self._ingestion.recover(self._notify_recovery)
+            await self._restore_active_upload_reviews()
+
+    def _upload_batch_controller(
+        self,
+        source_message_id: int,
+        principal_id: int,
+    ) -> _UploadBatchController:
+        controller = self._upload_batch_controllers.get(source_message_id)
+        if controller is None:
+            controller = _UploadBatchController(
+                principal_id,
+                self._settings.suggestion_review_timeout_seconds,
+            )
+            self._upload_batch_controllers[source_message_id] = controller
+        return controller
+
+    async def _restore_active_upload_reviews(self) -> None:
+        loader = getattr(self._ingestion, "active_upload_outcomes", None)
+        if loader is None:
+            return
+        for outcome in await loader():
+            if outcome.job.id not in self._restored_upload_jobs:
+                await self._notify_recovery(outcome)
+        item_loader = getattr(self._ingestion, "active_upload_items", None)
+        if item_loader is None:
+            return
+        for item in await item_loader():
+            key = (item.source_message_id, item.attachment_id)
+            if key in self._restored_upload_items or item.state is UploadItemState.SUCCEEDED:
+                continue
+            await self._restore_non_success_upload_item(item)
+
+    async def _restore_batch_summary(
+        self,
+        snapshot: UploadBatchSnapshot | None,
+        controller: _UploadBatchController,
+    ) -> None:
+        if snapshot is None:
+            return
+        channel = self.get_channel(snapshot.batch.summary_channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return
+        summary = channel.get_partial_message(snapshot.batch.summary_message_id)
+        with suppress(discord.HTTPException):
+            await summary.edit(
+                view=controller.build_view(),
+                allowed_mentions=NO_MENTIONS,
+            )
 
     async def _notify_recovery(self, outcome: IngestionOutcome) -> None:
+        item_lookup = getattr(self._ingestion, "upload_item_for_job", None)
+        item = await item_lookup(outcome.job.id) if item_lookup is not None else None
+        if item is not None:
+            await self._notify_upload_item_recovery(outcome, item)
+            return
         channel = self.get_channel(self._settings.discord_uploads_channel_id)
         if not isinstance(channel, discord.TextChannel):
             if all(item.job.id != outcome.job.id for item in self._pending_recovery):
@@ -2131,21 +3234,230 @@ class DiscordAssistant(discord.Client):
             view=_upload_outcome_view(self._settings.discord_allowed_user_ids, public_url),
             allowed_mentions=NO_MENTIONS,
         )
-        if outcome.job.state == JobState.SUCCEEDED and await self._ingestion.message_succeeded(
-            outcome.job.discord_message_id
-        ):
-            source_channel_id = (
-                outcome.job.discord_message_channel_id or self._settings.discord_uploads_channel_id
+
+    async def _notify_upload_item_recovery(
+        self,
+        outcome: IngestionOutcome,
+        item: UploadItem,
+    ) -> None:
+        """Rebuild the saved per-file artifact instead of posting a generic notification."""
+        channel = self.get_channel(
+            item.parent_channel_id or self._settings.discord_uploads_channel_id
+        )
+        if not isinstance(channel, discord.TextChannel):
+            if all(entry.job.id != outcome.job.id for entry in self._pending_recovery):
+                self._pending_recovery.append(outcome)
+            return
+        batch = await self._ingestion.upload_batch(item.source_message_id)
+        total_items = batch.batch.total_items if batch is not None else item.ordinal
+        batch_controller = self._upload_batch_controller(
+            item.source_message_id,
+            batch.batch.principal_id if batch is not None else outcome.job.principal_id,
+        )
+        parent: discord.Message | discord.PartialMessage | None = (
+            channel.get_partial_message(item.parent_message_id)
+            if item.parent_message_id is not None
+            else None
+        )
+        thread = self.get_channel(item.thread_id) if item.thread_id is not None else None
+        if not isinstance(thread, discord.Thread):
+            thread = None
+        uploader = discord.Object(id=outcome.job.principal_id)
+        if outcome.job.state is JobState.SUCCEEDED and outcome.document is not None:
+            try:
+                review = await self._ingestion.get_suggestion_review(outcome.job)
+            except PaperlessUnavailableError, StaleSuggestionError, UnlinkedUserError:
+                review = None
+            unavailable = review is None
+            review = review or SuggestionReview(
+                outcome.document,
+                AISuggestions(),
+                self._taxonomy.snapshot or Taxonomy((), (), ()),
+                TaxonomyCapabilities(),
             )
-            await self.cleanup_messages(
-                (),
-                (
-                    DiscordMessageTarget(
-                        channel_id=source_channel_id,
-                        message_id=outcome.job.discord_message_id,
-                    ),
-                ),
+            session = AISuggestionsView(
+                outcome.job,
+                review,
+                self._ingestion,
+                self._settings,
+                ordinal=item.ordinal,
+                total_items=total_items,
+                public_url=self._delivery_url(int(outcome.document.id)),
             )
+            content = session.parent_content(
+                status="AI review unavailable — use Retry Review"
+                if unavailable
+                else "Recovered review ready"
+            )
+            if parent is None or thread is None:
+                parent, thread = await self._create_upload_item_thread(
+                    channel,
+                    ordinal=item.ordinal,
+                    total_items=total_items,
+                    filename=item.original_filename,
+                    parent_content=content,
+                    uploader=uploader,
+                )
+            else:
+                await parent.edit(content=content, allowed_mentions=NO_MENTIONS)
+            session.parent_message = parent
+            await session.send(thread)
+            controller = _ReviewThreadController(
+                outcome.job.principal_id,
+                self._settings.suggestion_review_timeout_seconds,
+                ingestion=self._ingestion,
+                source_message_id=item.source_message_id,
+                attachment_id=item.attachment_id,
+                parent_message=parent,
+                thread=thread,
+                cleanup_callback=self._cleanup_upload_targets,
+            )
+            controller.add(session)
+            batch_controller.add(controller)
+            await thread.send(
+                "Recovered document review.",
+                view=controller.build_view(self._delivery_url(int(outcome.document.id))),
+                allowed_mentions=NO_MENTIONS,
+            )
+            await self._ingestion.update_upload_item(
+                item.source_message_id,
+                item.attachment_id,
+                UploadItemState.SUCCEEDED,
+                job_id=outcome.job.id,
+                document_id=int(outcome.document.id),
+                parent_message_id=parent.id,
+                parent_channel_id=channel.id,
+                thread_id=thread.id,
+            )
+            await self._restore_batch_summary(batch, batch_controller)
+            self._restored_upload_jobs.add(outcome.job.id)
+            self._restored_upload_items.add((item.source_message_id, item.attachment_id))
+            return
+        state = (
+            UploadItemState.RECONCILIATION_REQUIRED
+            if outcome.job.state is JobState.RECONCILIATION_REQUIRED
+            else UploadItemState.FAILED
+        )
+        detail = (
+            "The upload outcome remains uncertain; inspect Paperless before retrying."
+            if state is UploadItemState.RECONCILIATION_REQUIRED
+            else "Paperless processing failed."
+        )
+        await self._render_non_success_upload_item(
+            item=item,
+            batch=batch,
+            batch_controller=batch_controller,
+            channel=channel,
+            parent=parent,
+            thread=thread,
+            principal_id=outcome.job.principal_id,
+            state=state,
+            job_id=outcome.job.id,
+            detail=detail,
+        )
+        self._restored_upload_jobs.add(outcome.job.id)
+
+    async def _restore_non_success_upload_item(self, item: UploadItem) -> None:
+        batch = await self._ingestion.upload_batch(item.source_message_id)
+        if batch is None:
+            return
+        channel = self.get_channel(item.parent_channel_id or batch.batch.summary_channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return
+        parent: discord.Message | discord.PartialMessage | None = (
+            channel.get_partial_message(item.parent_message_id)
+            if item.parent_message_id is not None
+            else None
+        )
+        thread = self.get_channel(item.thread_id) if item.thread_id is not None else None
+        if not isinstance(thread, discord.Thread):
+            thread = None
+        state = item.state
+        detail = item.failure_reason or "Waiting for a durable Paperless outcome."
+        if state is UploadItemState.PENDING and item.job_id is None:
+            state = UploadItemState.FAILED
+            detail = "The worker restarted before this attachment was durably submitted."
+        await self._render_non_success_upload_item(
+            item=item,
+            batch=batch,
+            batch_controller=self._upload_batch_controller(
+                item.source_message_id,
+                batch.batch.principal_id,
+            ),
+            channel=channel,
+            parent=parent,
+            thread=thread,
+            principal_id=batch.batch.principal_id,
+            state=state,
+            job_id=item.job_id,
+            detail=detail,
+        )
+
+    async def _render_non_success_upload_item(  # noqa: PLR0913
+        self,
+        *,
+        item: UploadItem,
+        batch: UploadBatchSnapshot | None,
+        batch_controller: _UploadBatchController,
+        channel: discord.TextChannel,
+        parent: discord.Message | discord.PartialMessage | None,
+        thread: discord.Thread | None,
+        principal_id: int,
+        state: UploadItemState,
+        job_id: UUID | None,
+        detail: str,
+    ) -> None:
+        total_items = batch.batch.total_items if batch is not None else item.ordinal
+        content = (
+            f"**Document {item.ordinal}/{total_items} · "
+            f"{self._safe_upload_filename(item.original_filename)}**\n"
+            f"**Status:** {state.value.replace('_', ' ').title()}\n"
+            f"**Detail:** {detail}"
+        )
+        if parent is None or thread is None:
+            parent, thread = await self._create_upload_item_thread(
+                channel,
+                ordinal=item.ordinal,
+                total_items=total_items,
+                filename=item.original_filename,
+                parent_content=content,
+                uploader=discord.Object(id=principal_id),
+            )
+        else:
+            await parent.edit(content=content, allowed_mentions=NO_MENTIONS)
+        if state is UploadItemState.FAILED:
+            failure_controller = _FailedUploadController(
+                principal_id=principal_id,
+                ingestion=self._ingestion,
+                source_message_id=item.source_message_id,
+                attachment_id=item.attachment_id,
+                parent_message=parent,
+                thread=thread,
+                cleanup_callback=self._cleanup_upload_targets,
+                parent_content=content,
+            )
+            view: discord.ui.View = _FailedUploadView(
+                failure_controller,
+                self._settings.suggestion_review_timeout_seconds,
+            )
+        else:
+            view = _PendingUploadView(
+                principal_id,
+                self._settings.suggestion_review_timeout_seconds,
+            )
+        await thread.send(detail, view=view, allowed_mentions=NO_MENTIONS)
+        await self._ingestion.update_upload_item(
+            item.source_message_id,
+            item.attachment_id,
+            state,
+            job_id=job_id,
+            parent_message_id=parent.id,
+            parent_channel_id=channel.id,
+            thread_id=thread.id,
+            failure_reason=detail,
+        )
+        await self._restore_batch_summary(batch, batch_controller)
+        self._restored_upload_items.add((item.source_message_id, item.attachment_id))
 
     async def _flush_recovery_notifications(self) -> None:
         pending = tuple(self._pending_recovery)
@@ -2189,6 +3501,63 @@ class DiscordAssistant(discord.Client):
                 else:
                     confirmed.append(target)
         return tuple(dict.fromkeys(confirmed))
+
+    async def close_upload_items(self, items: Sequence[UploadItem]) -> None:
+        """Synchronize rich parents and archive threads closed by Paperless inbox state."""
+        for item in items:
+            if item.parent_channel_id is not None and item.parent_message_id is not None:
+                channel = self.get_channel(item.parent_channel_id)
+                if isinstance(channel, discord.TextChannel):
+                    parent = channel.get_partial_message(item.parent_message_id)
+                    content = self._closed_upload_parent_content(item)
+                    if content is None:
+                        fetch_message = getattr(channel, "fetch_message", None)
+                        if fetch_message is not None:
+                            with suppress(discord.HTTPException):
+                                existing = await fetch_message(item.parent_message_id)
+                                content = _replace_status_line(
+                                    existing.content,
+                                    "Closed after Paperless inbox-tag removal",
+                                )
+                    content = content or (
+                        f"**Document {item.ordinal} · "
+                        f"{self._safe_upload_filename(item.original_filename)}**\n"
+                        "**Status:** Closed after Paperless inbox-tag removal"
+                    )
+                    with suppress(discord.HTTPException):
+                        await parent.edit(
+                            content=content,
+                            allowed_mentions=NO_MENTIONS,
+                        )
+            if item.thread_id is None:
+                continue
+            thread = self.get_channel(item.thread_id)
+            if not isinstance(thread, discord.Thread):
+                continue
+            try:
+                await thread.edit(
+                    archived=True,
+                    locked=True,
+                    reason="Paperless inbox tag removed",
+                )
+            except discord.HTTPException:
+                continue
+
+    def _closed_upload_parent_content(self, item: UploadItem) -> str | None:
+        batch_controller = self._upload_batch_controllers.get(item.source_message_id)
+        if batch_controller is None:
+            return None
+        for controller in batch_controller.controllers:
+            if (
+                controller.source_message_id == item.source_message_id
+                and controller.attachment_id == item.attachment_id
+                and controller.sessions
+            ):
+                controller.closed = True
+                return controller.sessions[0].parent_content(
+                    status="Closed after Paperless inbox-tag removal"
+                )
+        return None
 
     async def _warn_missing_tag(self) -> None:
         now = datetime.now(tz=UTC)

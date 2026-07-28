@@ -187,8 +187,12 @@ class Runtime:
                 continue
             try:
                 upload_targets = await self.ingestion.check_inbox_tag_removals()
-                if upload_targets:
-                    confirmed = await self.discord.cleanup_messages((), upload_targets)
+                closed_items, batch_targets = await self.ingestion.check_inbox_upload_closures()
+                if closed_items:
+                    await self.discord.close_upload_items(closed_items)
+                targets = (*upload_targets, *batch_targets)
+                if targets:
+                    confirmed = await self.discord.cleanup_messages((), targets)
                     await self.repository.confirm_message_cleanup(confirmed)
             except Exception as error:
                 logger.warning(

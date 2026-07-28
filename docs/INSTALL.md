@@ -133,7 +133,10 @@ Discord requires the installing account to have permission to manage the server.
 need Administrator.
 
 After installation, review the two private channels' permission overrides. The bot role must have
-the permissions above in both channels. **Create Public Threads**, **Send Messages in Threads**, and **Manage Threads** allow the bot to nest responses under top-level user comments, while **Manage Messages** lets it remove successfully processed upload messages and retained status messages. Do not grant it access to unrelated private channels.
+the permissions above in both channels. **Create Public Threads**, **Send Messages in Threads**,
+and **Manage Threads** allow the bot to create, populate, archive, and lock per-file reviews, while
+**Manage Messages** lets it remove resolved batches' shared source and summary messages. Do not
+grant it access to unrelated private channels.
 
 Discord explains bot tokens, scopes, and least-privilege server permissions in its
 [OAuth2 and permissions guide](https://docs.discord.com/developers/platform/oauth2-and-permissions).
@@ -403,34 +406,39 @@ does not add another AI or try to make the result exhaustive.
 3. Use a caption containing:
    - an exact existing tag, correspondent, or document-type name;
    - some unmatched guidance prose.
-4. Confirm one batch status tracks both files independently.
+4. Confirm one immediate batch summary tracks both files independently and one bot-authored rich
+   parent plus public review thread appears for each attachment.
 5. In Paperless, verify:
    - both documents were submitted;
    - the exact `Discord` source tag is present;
    - unambiguous exact taxonomy names were applied;
    - Paperless chose the title and performed its normal classification;
    - each successful document has one note beginning `Discord upload guidance:`.
-6. For each successful document, confirm Discord shows:
+6. For each successful document, confirm its rich parent shows the attachment number, safe
+   filename, Paperless ID/link, and bounded current and pending metadata. Inside its thread,
+   confirm Discord shows:
    - a title message with **Edit Title**;
    - one **Editable Metadata** message whose closed menus visibly begin with Date,
      Correspondent, Document Type, Storage Path, and Tags;
    - one action message with **Apply Changes** and **Reset Changes**;
-   - persistent **Open Paperless**, **Refresh**, and **Finish & Close** controls on the batch
-     status message.
+   - persistent per-file **Open Paperless**, **Refresh**, and **Finish & Close** controls.
+   Confirm the batch summary separately exposes **Refresh All**, **Save All**, and **Close All**.
 7. Confirm Paperless-matched existing objects start selected and unmatched AI names start
-   unchecked. Uncheck a match, select a close existing choice, select an unmatched choice, choose
-   an AI date, and enter a custom date. Confirm **Reset Changes** restores the original proposal
+   unchecked. Confirm Correspondent, Document Type, and Storage Path identify the existing value
+   when kept. Uncheck a match, select a close existing choice, add a harmless custom tag, choose an
+   AI date, and enter a custom date. Confirm **Reset Changes** restores the original proposal
    without writing to Paperless.
 8. Repeat the choices and select **Apply Changes**. With the default
    `REQUIRE_NEW_METADATA_CONFIRMATION=true`, confirm selected unmatched names show the separate
    create-and-apply prompt. Verify Paperless receives only the selected fields and preserves its
    existing tags.
-9. Make an unapplied change and select **Refresh**; confirm Discord warns before discarding it.
+9. Make an unapplied change and select per-file **Refresh**; confirm Discord warns before
+   discarding it.
    Cancel once, then confirm the refresh and verify the review remains usable. Paperless may return
    its cached LLM proposal.
-10. Make another unapplied change and select **Finish & Close**; confirm Discord warns that the
-    thread will be deleted. Cancel once. After applying or resetting, select **Finish & Close**
-    again and confirm the complete upload thread is deleted without another warning.
+10. Make another unapplied change and select **Finish & Close**; confirm Discord warns that local
+    choices will be discarded. Cancel once. After applying or resetting, select it again and
+    confirm only that thread is archived and locked while its rich parent remains.
 11. As a different allowlisted user, try an AI or thread control and confirm it is rejected. As the
     uploader, change the document in Paperless before applying another proposal and confirm the
     stale review is rejected instead of overwriting the newer edit.
@@ -440,9 +448,15 @@ does not add another AI or try to make the result exhaustive.
 13. Set `REQUIRE_NEW_METADATA_CONFIRMATION=false`, recreate the container, select a harmless new
     taxonomy name, and choose **Apply Changes**. Confirm there is no second prompt, the object is
     created once, and it is applied. Restore the default `true` unless this is the desired policy.
-14. Confirm the original Discord upload message is removed only after every file succeeds or
-   resolves as a Paperless duplicate.
-15. Upload the same synthetic file again in a separate Discord message. Confirm the assistant sends
+14. Exercise **Save All** and confirm one prompt saves dirty reviews in attachment order without
+    closing them. Exercise **Close All** and confirm one prompt closes successful reviews, warns
+    about discarded local choices, and does not dismiss failures.
+15. Cause one safe validation failure. Confirm it receives a per-file failure thread and the
+    original upload remains. Dismiss that failure only after closing every success; confirm the
+    original upload and batch summary are then deleted together while rich parents remain.
+16. Leave an upload uncertain and confirm neither **Close All**, `/clean`, nor scheduled cleanup
+    removes its shared artifacts or offers failure dismissal.
+17. Upload the same synthetic file again in a separate Discord message. Confirm the assistant sends
    it again and Paperless owns duplicate handling.
 
 ### Failure and recovery
@@ -458,7 +472,8 @@ does not add another AI or try to make the result exhaustive.
    docker compose restart paperless-assistant
    ```
 
-   Confirm a saved Paperless task resumes without a second upload.
+   Confirm a saved Paperless task resumes without a second upload and rebuilds the corresponding
+   per-file parent/thread controls rather than posting an unrelated generic notification.
 6. Temporarily rename or remove the exact `Discord` tag:
    - questions and downloads should continue;
    - uploads should pause;

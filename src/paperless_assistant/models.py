@@ -153,6 +153,91 @@ class DiscordMessageTarget:
     message_id: int
 
 
+class UploadItemState(StrEnum):
+    """Durable review lifecycle for one Discord attachment."""
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    RECONCILIATION_REQUIRED = "reconciliation_required"
+    CLOSED = "closed"
+    DISMISSED = "dismissed"
+
+
+RESOLVED_UPLOAD_ITEM_STATES = frozenset({UploadItemState.CLOSED, UploadItemState.DISMISSED})
+
+
+@dataclass(frozen=True, slots=True)
+class UploadBatch:
+    """Shared Discord artifacts and owner for one upload message."""
+
+    source_message_id: int
+    source_channel_id: int
+    summary_message_id: int
+    summary_channel_id: int
+    principal_id: int
+    total_items: int
+    source_cleaned: bool = False
+    summary_cleaned: bool = False
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class UploadItem:
+    """One attachment and its independently reviewable Discord artifacts."""
+
+    source_message_id: int
+    attachment_id: int
+    ordinal: int
+    original_filename: str
+    state: UploadItemState = UploadItemState.PENDING
+    job_id: UUID | None = None
+    document_id: DocumentId | None = None
+    parent_message_id: int | None = None
+    parent_channel_id: int | None = None
+    thread_id: int | None = None
+    failure_reason: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class UploadBatchSnapshot:
+    """One batch and its stable attachment ordering."""
+
+    batch: UploadBatch
+    items: tuple[UploadItem, ...]
+
+    @property
+    def cleanup_ready(self) -> bool:
+        """Return whether user actions resolved every attachment."""
+        return bool(self.items) and all(
+            item.state in RESOLVED_UPLOAD_ITEM_STATES for item in self.items
+        )
+
+    @property
+    def cleanup_targets(self) -> tuple[DiscordMessageTarget, ...]:
+        """Return undeleted shared source and summary artifacts."""
+        targets: list[DiscordMessageTarget] = []
+        if not self.batch.summary_cleaned:
+            targets.append(
+                DiscordMessageTarget(
+                    self.batch.summary_channel_id,
+                    self.batch.summary_message_id,
+                )
+            )
+        if not self.batch.source_cleaned:
+            targets.append(
+                DiscordMessageTarget(
+                    self.batch.source_channel_id,
+                    self.batch.source_message_id,
+                )
+            )
+        return tuple(targets)
+
+
 @dataclass(frozen=True, slots=True)
 class ChatResult:
     """Completed native Paperless chat answer and ordered references."""

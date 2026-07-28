@@ -39,6 +39,9 @@ from paperless_assistant.models import (
     TaxonomyCapabilities,
     TaxonomyItem,
     TaxonomyKind,
+    UploadBatch,
+    UploadItem,
+    UploadItemState,
 )
 from paperless_assistant.repository import SQLiteRepository
 from paperless_assistant.services import (
@@ -720,6 +723,205 @@ async def test_check_inbox_tag_removals(
     )
     _, _, disabled_ingestion = await _services(disabled_settings, gateway)
     assert await disabled_ingestion.check_inbox_tag_removals() == ()
+    assert await disabled_ingestion.check_inbox_upload_closures() == ((), ())
+
+
+@pytest.mark.asyncio
+async def test_upload_batch_service_resolution_and_inbox_closures(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(
+        data_dir=tmp_path / "batch-data",
+        cleanup_inbox_tag="inbox",
+        cleanup_inbox_tag_enabled=True,
+    )
+    settings.staging_dir.mkdir(parents=True)
+    gateway = FakeGateway()
+    gateway.taxonomy = Taxonomy(
+        (TaxonomyItem(1, "Discord"), TaxonomyItem(2, "inbox")),
+        (),
+        (),
+    )
+    repository, taxonomy, ingestion = await _services(settings, gateway)
+    batch = UploadBatch(20, 102, 50, 102, 201, 2)
+    items = (
+        UploadItem(20, 21, 1, "one.pdf"),
+        UploadItem(20, 22, 2, "two.pdf"),
+    )
+    await ingestion.create_upload_batch(batch, items)
+    assert await ingestion.upload_batch(20) is not None
+    assert await ingestion.terminal_upload_cleanup_targets() == ()
+    with pytest.raises(ValueError, match="closed or dismissed"):
+        await ingestion.resolve_upload_item(20, 21, UploadItemState.SUCCEEDED)
+
+    jobs: list[IngestionJob] = []
+    for attachment_id, document_id in ((21, 44), (22, 45)):
+        staged = settings.staging_dir / str(attachment_id)
+        staged.write_bytes(b"%PDF-1.7")
+        job = await ingestion.stage(
+            discord_message_id=20,
+            discord_attachment_id=attachment_id,
+            discord_status_message_id=50,
+            discord_message_channel_id=102,
+            discord_status_channel_id=102,
+            principal_id=201,
+            staged_path=staged,
+            original_filename=f"{attachment_id}.pdf",
+            caption="",
+        )
+        assert job is not None
+        jobs.append(job)
+        await repository.transition_job(job.id, JobState.STAGED, JobState.SUBMITTING)
+        await repository.transition_job(job.id, JobState.SUBMITTING, JobState.SUBMITTED)
+        await repository.transition_job(
+            job.id,
+            JobState.SUBMITTED,
+            JobState.SUCCEEDED,
+            document_id=document_id,
+        )
+    linked = await ingestion.upload_item_for_job(jobs[0].id)
+    assert linked is not None
+    assert linked.document_id == DocumentId(44)
+    updated = await ingestion.update_upload_item(
+        20,
+        21,
+        UploadItemState.SUCCEEDED,
+        parent_message_id=301,
+        parent_channel_id=102,
+        thread_id=401,
+    )
+    assert updated.items[0].thread_id == 401
+
+    gateway.doc_tags = {44: (1, 2), 45: (1,)}
+    closed, targets = await ingestion.check_inbox_upload_closures()
+    assert tuple(item.document_id for item in closed) == (DocumentId(45),)
+    assert targets == ()
+
+    gateway.doc_tags[44] = (1,)
+    closed, targets = await ingestion.check_inbox_upload_closures()
+    assert tuple(item.document_id for item in closed) == (DocumentId(44),)
+    assert targets == (
+        DiscordMessageTarget(102, 50),
+        DiscordMessageTarget(102, 20),
+    )
+    await ingestion.confirm_upload_cleanup(targets)
+    assert await ingestion.terminal_upload_cleanup_targets() == ()
+
+    assert await ingestion.check_inbox_upload_closures() == ((), ())
+    gateway.taxonomy = Taxonomy((TaxonomyItem(1, "Discord"),), (), ())
+    assert await taxonomy.refresh()
+    await repository.update_upload_item(20, 21, UploadItemState.SUCCEEDED)
+    assert await ingestion.check_inbox_upload_closures() == ((), ())
+    gateway.taxonomy = Taxonomy(
+        (TaxonomyItem(1, "Discord"), TaxonomyItem(2, "inbox")),
+        (),
+        (),
+    )
+    assert await taxonomy.refresh()
+    gateway.batch_tags_error = True
+    assert await ingestion.check_inbox_upload_closures() == ((), ())
+    assert tuple(item.attachment_id for item in await ingestion.active_upload_items()) == (21,)
+    assert await ingestion.resolve_upload_item(20, 21, UploadItemState.DISMISSED) == ()
+
+
+@pytest.mark.asyncio
+async def test_active_upload_outcomes_restore_only_terminal_reviews(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / "restore-data")
+    gateway = FakeGateway()
+    repository = AsyncMock()
+    audit = AsyncMock()
+    taxonomy = TaxonomyCache(settings, gateway)
+
+    class FakeCreds:
+        async def get_user_token(self, principal_id: int) -> str | None:
+            return None if principal_id == 301 else "user-token"
+
+    ingestion = IngestionService(
+        settings,
+        gateway,
+        repository,
+        audit,
+        taxonomy,
+        credentials=FakeCreds(),  # type: ignore[arg-type]
+    )
+    base = IngestionJob(
+        id=uuid4(),
+        discord_message_id=1,
+        discord_attachment_id=1,
+        principal_id=300,
+        staged_path=tmp_path / "staged",
+        original_filename="synthetic.pdf",
+        media_type="application/pdf",
+        office_dependent=False,
+        caption="",
+        guidance=MetadataGuidance(),
+    )
+    missing_id = uuid4()
+    jobs = (
+        replace(base, id=uuid4(), state=JobState.SUCCEEDED),
+        replace(
+            base,
+            id=uuid4(),
+            principal_id=301,
+            state=JobState.SUCCEEDED,
+            paperless_document_id=DocumentId(44),
+        ),
+        replace(
+            base,
+            id=uuid4(),
+            state=JobState.SUCCEEDED,
+            paperless_document_id=DocumentId(98),
+        ),
+        replace(
+            base,
+            id=uuid4(),
+            state=JobState.SUCCEEDED,
+            paperless_document_id=DocumentId(44),
+        ),
+        replace(base, id=uuid4(), state=JobState.FAILED),
+        replace(base, id=uuid4(), state=JobState.RECONCILIATION_REQUIRED),
+        replace(base, id=uuid4(), state=JobState.SUBMITTED),
+    )
+    items = (
+        UploadItem(1, 1, 1, "no-job.pdf"),
+        UploadItem(1, 2, 2, "missing-job.pdf", job_id=missing_id),
+        *(
+            UploadItem(1, index, index, f"{index}.pdf", job_id=job.id)
+            for index, job in enumerate(jobs, start=3)
+        ),
+    )
+    repository.active_upload_items.return_value = items
+    jobs_by_id = {job.id: job for job in jobs}
+    repository.get_job.side_effect = jobs_by_id.get
+    original_get_document = gateway.get_document
+
+    async def selective_document(
+        document_id: int,
+        *,
+        token: object = None,
+    ) -> Document:
+        if document_id == 98:
+            raise PaperlessUnavailableError("synthetic")
+        return await original_get_document(document_id, token=token)
+
+    gateway.get_document = selective_document  # type: ignore[method-assign]
+    outcomes = await ingestion.active_upload_outcomes()
+    assert tuple(outcome.job.state for outcome in outcomes) == (
+        JobState.SUCCEEDED,
+        JobState.FAILED,
+        JobState.RECONCILIATION_REQUIRED,
+    )
+    assert outcomes[0].document is not None
+
+    ingestion._credentials = None
+    repository.active_upload_items.return_value = (
+        UploadItem(2, 20, 1, "system.pdf", job_id=jobs[3].id),
+    )
+    assert (await ingestion.active_upload_outcomes())[0].document is not None
 
 
 @pytest.mark.asyncio

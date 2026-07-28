@@ -18,6 +18,9 @@ from paperless_assistant.models import (
     JobState,
     MetadataGuidance,
     ReferenceContext,
+    UploadBatch,
+    UploadItem,
+    UploadItemState,
 )
 from paperless_assistant.repository import SCHEMA, SQLiteRepository
 
@@ -319,3 +322,166 @@ async def test_recovery_context_expiry_audit_and_purge(tmp_path: Path) -> None:
     )
     assert await repository.get_context(30) is None
     assert [action async for action in repository.actions()] == []
+
+
+@pytest.mark.asyncio
+async def test_upload_batch_lifecycle_cleanup_and_purge(  # noqa: PLR0915
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = SQLiteRepository(tmp_path / "batch.sqlite3", lease_seconds=60)
+    await repository.initialize()
+    batch = UploadBatch(
+        source_message_id=100,
+        source_channel_id=102,
+        summary_message_id=200,
+        summary_channel_id=102,
+        principal_id=30,
+        total_items=2,
+    )
+    first = UploadItem(100, 11, 1, "one.pdf")
+    second = UploadItem(
+        100,
+        12,
+        2,
+        "two.pdf",
+        state=UploadItemState.FAILED,
+        failure_reason="synthetic",
+    )
+    with pytest.raises(ValueError, match="item count"):
+        await repository.create_upload_batch(batch, (first,))
+    with pytest.raises(ValueError, match="ordinals"):
+        await repository.create_upload_batch(
+            batch,
+            (replace(first, ordinal=2), second),
+        )
+
+    await repository.create_upload_batch(batch, (first, second))
+    await repository.create_upload_batch(batch, (first, second))
+    assert await repository.get_upload_batch(999) is None
+    snapshot = await repository.get_upload_batch(100)
+    assert snapshot is not None
+    assert not snapshot.cleanup_ready
+    assert snapshot.cleanup_targets == (
+        DiscordMessageTarget(102, 200),
+        DiscordMessageTarget(102, 100),
+    )
+    assert tuple(item.original_filename for item in snapshot.items) == (
+        "one.pdf",
+        "two.pdf",
+    )
+
+    job = _job(tmp_path / "batch-job", message_id=100, attachment_id=11)
+    assert await repository.create_job(job)
+    snapshot = await repository.update_upload_item(
+        100,
+        11,
+        UploadItemState.PENDING,
+        job_id=job.id,
+        document_id=44,
+        parent_message_id=300,
+        parent_channel_id=102,
+        thread_id=400,
+        failure_reason="temporary",
+    )
+    assert snapshot.items[0].job_id == job.id
+    assert snapshot.items[0].document_id == DocumentId(44)
+    assert snapshot.items[0].parent_message_id == 300
+    assert await repository.upload_item_for_job(job.id) == snapshot.items[0]
+    assert await repository.upload_item_for_job(uuid4()) is None
+    assert {item.attachment_id for item in await repository.active_upload_items()} == {
+        11,
+        12,
+    }
+    with pytest.raises(ValueError, match="does not exist"):
+        await repository.update_upload_item(100, 999, UploadItemState.CLOSED)
+
+    assert await repository.transition_job(job.id, JobState.STAGED, JobState.SUBMITTING)
+    linked = await repository.upload_item_for_job(job.id)
+    assert linked is not None
+    assert linked.state is UploadItemState.PROCESSING
+    assert await repository.transition_job(
+        job.id,
+        JobState.SUBMITTING,
+        JobState.SUBMITTED,
+        task_id=uuid4(),
+    )
+    assert await repository.transition_job(
+        job.id,
+        JobState.SUBMITTED,
+        JobState.SUCCEEDED,
+        document_id=44,
+    )
+    linked = await repository.upload_item_for_job(job.id)
+    assert linked is not None
+    assert linked.state is UploadItemState.SUCCEEDED
+    assert await repository.active_succeeded_uploads() == ()
+    assert await repository.terminal_upload_cleanup_targets() == ()
+
+    future = (datetime.now(tz=UTC) + timedelta(days=1)).isoformat()
+    _, scheduled = await repository.cleanup_message_ids(
+        context_before=future,
+        succeeded_before=future,
+        failed_before=future,
+    )
+    assert scheduled == ()
+    _, too_recent = await repository.cleanup_message_ids(
+        context_before="1970-01-01T00:00:00+00:00",
+        succeeded_before="1970-01-01T00:00:00+00:00",
+        failed_before="1970-01-01T00:00:00+00:00",
+    )
+    assert too_recent == ()
+    await repository.update_upload_item(100, 11, UploadItemState.CLOSED)
+    resolved = await repository.update_upload_item(100, 12, UploadItemState.DISMISSED)
+    assert resolved.cleanup_ready
+    assert await repository.active_upload_items() == ()
+    assert await repository.terminal_upload_cleanup_targets() == (
+        DiscordMessageTarget(102, 200),
+        DiscordMessageTarget(102, 100),
+    )
+    _, scheduled = await repository.cleanup_message_ids(
+        context_before=future,
+        succeeded_before=future,
+        failed_before=future,
+    )
+    assert scheduled == (
+        DiscordMessageTarget(102, 200),
+        DiscordMessageTarget(102, 100),
+    )
+
+    await repository.confirm_message_cleanup((DiscordMessageTarget(102, 200),))
+    partially_cleaned = await repository.get_upload_batch(100)
+    assert partially_cleaned is not None
+    assert partially_cleaned.cleanup_targets == (DiscordMessageTarget(102, 100),)
+    assert await repository.terminal_upload_cleanup_targets() == (DiscordMessageTarget(102, 100),)
+    await repository.confirm_message_cleanup((DiscordMessageTarget(102, 100),))
+    cleaned = await repository.get_upload_batch(100)
+    assert cleaned is not None
+    assert cleaned.cleanup_targets == ()
+    _, already_cleaned = await repository.cleanup_message_ids(
+        context_before=future,
+        succeeded_before=future,
+        failed_before=future,
+    )
+    assert already_cleaned == ()
+
+    await repository.purge(
+        expired_before=future,
+        audit_before=future,
+        succeeded_before=future,
+        failed_before=future,
+    )
+    assert await repository.get_upload_batch(100) is None
+
+    other = replace(batch, source_message_id=101, summary_message_id=201, total_items=1)
+    await repository.create_upload_batch(
+        other,
+        (UploadItem(101, 13, 1, "three.pdf"),),
+    )
+
+    async def missing_batch(_: int) -> None:
+        return None
+
+    monkeypatch.setattr(repository, "get_upload_batch", missing_batch)
+    with pytest.raises(ValueError, match="disappeared"):
+        await repository.update_upload_item(101, 13, UploadItemState.CLOSED)
