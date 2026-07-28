@@ -63,3 +63,5 @@ These instructions apply to the entire repository.
 - Keep GitHub Actions pinned to immutable commit SHAs and grant minimal permissions.
 - Never place production secrets in CI. Keep containers non-root and hardened unless an issue documents and reviews an exception.
 - Follow private vulnerability reporting guidance in `SECURITY.md`.
+- When a PR is merged into main, always fetch and create a new branch from `main` before starting follow-up work. Do not commit directly to `main`.
+- For Paperless-ngx v3.0+ integrations, note that AI metadata suggestions are provided by the dedicated `/api/documents/{id}/ai_suggestions/` endpoint, while standard Scikit-Learn suggestions remain at `/api/documents/{id}/suggestions/`.

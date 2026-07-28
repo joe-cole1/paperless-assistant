@@ -461,7 +461,7 @@ async def test_validate_token_and_custom_token_headers(
 @pytest.mark.asyncio
 async def test_get_ai_suggestions(settings_factory: Callable[..., Settings]) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/api/documents/7/suggestions/":
+        if request.url.path == "/api/documents/7/ai_suggestions/":
             return httpx.Response(
                 200,
                 json={
@@ -471,9 +471,19 @@ async def test_get_ai_suggestions(settings_factory: Callable[..., Settings]) -> 
                     "tags": [2, 3],
                 },
             )
+        if request.url.path == "/api/documents/7/suggestions/":
+            return httpx.Response(404)
+        if request.url.path == "/api/documents/8/ai_suggestions/":
+            return httpx.Response(404)
         if request.url.path == "/api/documents/8/suggestions/":
-            return httpx.Response(200, text="not json")
-        if request.url.path == "/api/documents/10/suggestions/":
+            return httpx.Response(
+                200,
+                json={
+                    "title": ["Fallback Title"],
+                    "tags": [4],
+                },
+            )
+        if "10" in request.url.path:
             raise httpx.ConnectError("connection refused")
         return httpx.Response(404)
 
@@ -484,10 +494,11 @@ async def test_get_ai_suggestions(settings_factory: Callable[..., Settings]) -> 
     assert suggestions.document_type_id is None
     assert suggestions.tag_ids == (2, 3)
 
-    with pytest.raises(PaperlessUnavailableError, match="malformed"):
-        await gateway.get_ai_suggestions(8)
+    suggestions_fallback = await gateway.get_ai_suggestions(8)
+    assert suggestions_fallback.title == "Fallback Title"
+    assert suggestions_fallback.tag_ids == (4,)
 
-    with pytest.raises(PaperlessUnavailableError, match="404"):
+    with pytest.raises(PaperlessUnavailableError, match="unavailable"):
         await gateway.get_ai_suggestions(9)
 
     with pytest.raises(PaperlessUnavailableError, match="unavailable"):
