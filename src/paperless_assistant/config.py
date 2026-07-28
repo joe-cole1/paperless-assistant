@@ -78,6 +78,13 @@ class Settings(BaseSettings):
     question_user_rate_window_seconds: int = Field(default=300, ge=10, le=3600)
     reference_context_ttl_seconds: int = Field(default=15 * 60, ge=60, le=24 * 60 * 60)
     suggestion_review_timeout_seconds: int = Field(default=15 * 60, ge=60, le=24 * 60 * 60)
+    allow_edit_title: bool = True
+    allow_edit_date: bool = True
+    allow_edit_correspondent: bool = True
+    allow_edit_document_type: bool = True
+    allow_edit_storage_path: bool = True
+    allow_edit_tags: bool = True
+    require_new_metadata_confirmation: bool = True
 
     cleanup_hour_local: int = Field(default=3, ge=0, le=23)
     cleanup_inbox_tag: str = Field(default="inbox", min_length=1, max_length=100)

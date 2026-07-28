@@ -35,6 +35,35 @@ def test_safe_defaults(settings_factory: Callable[..., Settings]) -> None:
     assert settings.cleanup_inbox_tag_poll_interval_seconds == 300
     assert settings.cleanup_question_delay_minutes == 0
     assert settings.cleanup_upload_delay_minutes == 0
+    assert settings.allow_edit_title is True
+    assert settings.allow_edit_date is True
+    assert settings.allow_edit_correspondent is True
+    assert settings.allow_edit_document_type is True
+    assert settings.allow_edit_storage_path is True
+    assert settings.allow_edit_tags is True
+    assert settings.require_new_metadata_confirmation is True
+
+
+def test_ai_review_flags_parse_compose_boolean_strings(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(
+        allow_edit_title="false",
+        allow_edit_date="false",
+        allow_edit_correspondent="false",
+        allow_edit_document_type="false",
+        allow_edit_storage_path="false",
+        allow_edit_tags="false",
+        require_new_metadata_confirmation="false",
+    )
+
+    assert settings.allow_edit_title is False
+    assert settings.allow_edit_date is False
+    assert settings.allow_edit_correspondent is False
+    assert settings.allow_edit_document_type is False
+    assert settings.allow_edit_storage_path is False
+    assert settings.allow_edit_tags is False
+    assert settings.require_new_metadata_confirmation is False
 
 
 def test_required_secrets_and_ids_have_no_defaults() -> None:

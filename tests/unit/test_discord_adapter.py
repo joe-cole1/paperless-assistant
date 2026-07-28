@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,20 +18,30 @@ from pydantic import SecretStr
 
 from paperless_assistant.config import Settings
 from paperless_assistant.discord_adapter import (
-    AISuggestionsEditModal,
+    AISuggestionsDateModal,
+    AISuggestionsTitleModal,
     AISuggestionsView,
     DiscordAssistant,
     DismissButton,
     _bounded_lines,
     _close_existing_items,
+    _ConfirmCloseThreadView,
+    _ConfirmRefreshView,
     _ConfirmTaxonomyCreationView,
+    _DateSelect,
     _document_embed,
+    _FinishReviewButton,
     _is_delivery_request,
     _is_follow_up,
     _MetadataOverflowView,
     _MetadataPageSelect,
     _MetadataSelect,
+    _RefreshReviewButton,
     _result_view,
+    _ReviewActionsView,
+    _ReviewThreadController,
+    _ReviewThreadControlsView,
+    _TitleEditView,
 )
 from paperless_assistant.errors import (
     InvalidAttachmentError,
@@ -828,6 +839,10 @@ async def test_upload_success_duplicate_invalid_and_uncertain(
     await assistant._uploads_message(cast(discord.Message, success))
     assert success.deleted
     assert ingestion.last_stage_kwargs["discord_status_message_id"] == success.thread.sent[0].id
+    assert isinstance(
+        success.thread.sent[0].edits[-1]["view"],
+        _ReviewThreadControlsView,
+    )
 
     ingestion.stage_duplicate = True
     duplicate = FakeMessage(
@@ -1060,7 +1075,7 @@ async def test_office_task_failure_includes_setup_guidance(
 
 
 @pytest.mark.asyncio
-async def test_warning_recovery_and_status_helpers(
+async def test_warning_recovery_and_status_helpers(  # noqa: PLR0915
     tmp_path: Path,
     settings_factory: Callable[..., Settings],
     monkeypatch: pytest.MonkeyPatch,
@@ -1135,6 +1150,16 @@ async def test_warning_recovery_and_status_helpers(
     await assistant._replace_status(cast(discord.Message, status), ["x" * 2100])
     assert status.edits
     assert channel.sent
+
+    custom_status = FakeMessage(channel=channel)
+    custom_view = discord.ui.View()
+    await assistant._replace_status(
+        cast(discord.Message, custom_status),
+        ["y" * 2100],
+        view=custom_view,
+    )
+    assert custom_status.edits[-1]["view"] is custom_view
+    assert "view" not in channel.sent[-1].send_kwargs
 
     edit_error = discord.HTTPException(
         cast(Any, SimpleNamespace(status=500, reason="synthetic")),
@@ -1847,170 +1872,7 @@ async def test_unlinked_user_responses(
     await assistant.close()
 
 
-@pytest.mark.asyncio
-async def test_ai_suggestions_view_interactions(  # noqa: PLR0915
-    tmp_path: Path,
-    settings_factory: Callable[..., Settings],
-) -> None:
-    _ = settings_factory(data_dir=tmp_path)
-    job = IngestionJob(
-        id=uuid4(),
-        discord_message_id=1,
-        discord_attachment_id=2,
-        discord_status_message_id=3,
-        principal_id=201,
-        staged_path=tmp_path / "synthetic.pdf",
-        original_filename="synthetic.pdf",
-        caption="",
-        media_type="application/pdf",
-        office_dependent=False,
-        guidance=MetadataGuidance((), None, None),
-    )
-    document = Document(
-        DocumentId(7),
-        "Synthetic",
-        date(2024, 1, 2),
-        modified=datetime(2026, 7, 28, tzinfo=UTC),
-    )
-    suggestions = AISuggestions(
-        title="Suggested",
-        correspondent_ids=(1,),
-        document_type_ids=(1,),
-        tag_ids=(2, 3, 99),
-        dates=(SuggestedDate("2026-07-28", date(2026, 7, 28)),),
-        suggested_tags=("New Tag",),
-    )
-    review = SuggestionReview(
-        document,
-        suggestions,
-        FakeTaxonomy().snapshot,
-        TaxonomyCapabilities(True, True, True, True),
-    )
-
-    ingestion = FakeIngestion()
-    ingestion.apply_suggestions = AsyncMock()  # type: ignore[method-assign]
-
-    view = AISuggestionsView(job, review, cast(Any, ingestion), 900)
-
-    # Cross-user interactions are rejected before Discord dispatches a button callback.
-    unauth_interaction = AsyncMock(user=SimpleNamespace(id=999))
-    assert not await view.interaction_check(unauth_interaction)
-    assert "Only the user who uploaded" in unauth_interaction.response.send_message.call_args[0][0]
-    assert await view.interaction_check(AsyncMock(user=SimpleNamespace(id=201)))
-    assert view._selected_option_values(TaxonomyKind.CORRESPONDENT) == ("id:1",)
-
-    # Authorized approve
-    auth_interaction = AsyncMock(user=SimpleNamespace(id=201))
-    auth_interaction.message = SimpleNamespace(
-        embeds=[discord.Embed(title="Old")], edit=AsyncMock()
-    )
-    await view.approve_button.callback(auth_interaction)
-    ingestion.apply_suggestions.assert_called_once()
-    assert auth_interaction.message.edit.call_args[1]["embed"].title == "✅ Applied to Synthetic"
-
-    already_applied = AsyncMock(user=SimpleNamespace(id=201), message=None)
-    await view.approve_button.callback(already_applied)
-    assert "already applied" in already_applied.followup.send.call_args[0][0]
-
-    # Edit modal authorized
-    edit_interaction = AsyncMock(user=SimpleNamespace(id=201))
-    await view.edit_button.callback(edit_interaction)
-    modal = edit_interaction.response.send_modal.call_args[0][0]
-    assert isinstance(modal, AISuggestionsEditModal)
-
-    # Submit modal
-    modal.title_input._value = "User Edited Title"
-    modal_submit_interaction = AsyncMock(user=SimpleNamespace(id=201))
-    modal_submit_interaction.message = SimpleNamespace(
-        embeds=[discord.Embed().add_field(name="Suggested Title", value="Suggested")],
-    )
-    modal_submit_interaction.response.edit_message = AsyncMock()
-    await modal.on_submit(modal_submit_interaction)
-    assert view.current_title == "User Edited Title"
-    assert (
-        "User Edited Title"
-        in modal_submit_interaction.response.edit_message.call_args[1]["embed"].fields[0].value
-    )
-
-    modal.date_input._value = "not-a-date"
-    invalid_date_interaction = AsyncMock()
-    await modal.on_submit(invalid_date_interaction)
-    assert "valid date" in invalid_date_interaction.response.send_message.call_args.args[0]
-    modal.date_input._value = ""
-
-    unauthorized_modal = AsyncMock(user=SimpleNamespace(id=999))
-    await modal.on_submit(unauthorized_modal)
-    assert "Only the uploader" in unauthorized_modal.response.send_message.call_args.args[0]
-
-    # Cancel authorized
-    cancel_interaction = AsyncMock(user=SimpleNamespace(id=201))
-    cancel_interaction.message = AsyncMock()
-    await view.cancel_button.callback(cancel_interaction)
-    cancel_interaction.message.delete.assert_called_once()
-
-    # Unexpected application failures stay generic.
-    error_view = AISuggestionsView(job, review, cast(Any, ingestion), 900)
-    ingestion.apply_suggestions.side_effect = Exception("Test Error")
-    auth_interaction_err = AsyncMock(
-        user=SimpleNamespace(id=201), message=SimpleNamespace(embeds=[discord.Embed()])
-    )
-    await error_view.approve_button.callback(auth_interaction_err)
-    assert "Test Error" not in auth_interaction_err.followup.send.call_args[0][0]
-
-    for error, expected in (
-        (StaleSuggestionError("stale"), "changed after"),
-        (UnlinkedUserError("unlinked"), "no longer linked"),
-        (PaperlessUnavailableError("unavailable"), "could not resolve"),
-    ):
-        ingestion.apply_suggestions = AsyncMock(side_effect=error)  # type: ignore[method-assign]
-        failed_view = AISuggestionsView(job, review, cast(Any, ingestion), 900)
-        failed_apply = AsyncMock(user=SimpleNamespace(id=201), message=None)
-        await failed_view.approve_button.callback(failed_apply)
-        assert expected in failed_apply.followup.send.call_args.args[0]
-
-    ingestion.apply_suggestions = AsyncMock()  # type: ignore[method-assign]
-    no_source_view = AISuggestionsView(job, review, cast(Any, ingestion), 900)
-    no_source_apply = AsyncMock()
-    await no_source_view.apply(no_source_apply, None, confirm_create=False)
-    assert "confirmed" in no_source_apply.followup.send.call_args.args[0]
-
-    # Coverage: modal_submit with no message
-    modal_submit_interaction_no_msg = AsyncMock(
-        user=SimpleNamespace(id=201),
-        message=None,
-    )
-    await modal.on_submit(modal_submit_interaction_no_msg)
-    modal_submit_interaction_no_msg.response.defer.assert_called_once()
-
-    # Refresh authorized
-    auth_refresh = AsyncMock(user=SimpleNamespace(id=201))
-    auth_refresh.message = SimpleNamespace(edit=AsyncMock())
-    await view.refresh_button.callback(auth_refresh)
-    auth_refresh.message.edit.assert_called_once()
-
-    for error, expected in (
-        (StaleSuggestionError("stale"), "changed while"),
-        (UnlinkedUserError("unlinked"), "no longer linked"),
-        (PaperlessUnavailableError("unavailable"), "unavailable"),
-    ):
-        ingestion.get_suggestion_review = AsyncMock(side_effect=error)  # type: ignore[method-assign]
-        failed_refresh = AsyncMock(user=SimpleNamespace(id=201), message=None)
-        await view.refresh_button.callback(failed_refresh)
-        assert expected in failed_refresh.followup.send.call_args.args[0]
-    ingestion.get_suggestion_review = AsyncMock(return_value=None)  # type: ignore[method-assign]
-    empty_refresh = AsyncMock(user=SimpleNamespace(id=201), message=None)
-    await view.refresh_button.callback(empty_refresh)
-    assert "cached" in empty_refresh.followup.send.call_args.args[0]
-
-    # Coverage: cancel_button with no message
-    cancel_interaction_no_msg = AsyncMock(user=SimpleNamespace(id=201), message=None)
-    await view.cancel_button.callback(cancel_interaction_no_msg)
-
-
-@pytest.mark.asyncio
-async def test_ai_suggestion_combined_selectors_and_pagination(  # noqa: PLR0915
-    tmp_path: Path,
-) -> None:
+def _ai_review_fixture(tmp_path: Path) -> tuple[IngestionJob, SuggestionReview, FakeIngestion]:
     job = IngestionJob(
         id=uuid4(),
         discord_message_id=1,
@@ -2035,6 +1897,166 @@ async def test_ai_suggestion_combined_selectors_and_pagination(  # noqa: PLR0915
         document_types=(TaxonomyItem(3, "Chat Log"),),
         storage_paths=(TaxonomyItem(4, "Personal/Chat Logs"),),
     )
+    review = SuggestionReview(
+        Document(
+            DocumentId(7),
+            "Current",
+            date(2026, 7, 1),
+            modified=datetime(2026, 7, 28, tzinfo=UTC),
+            tag_ids=(2,),
+            correspondent_id=1,
+            document_type_id=3,
+            storage_path_id=4,
+        ),
+        AISuggestions(
+            title="Chat Conversation with Mary",
+            dates=(
+                SuggestedDate("2026-07-28", date(2026, 7, 28)),
+                SuggestedDate("invalid", None),
+            ),
+            correspondent_ids=(1,),
+            document_type_ids=(3,),
+            storage_path_ids=(4,),
+            tag_ids=(2,),
+            suggested_correspondents=("Mary Smyth",),
+            suggested_document_types=("Text Message",),
+            suggested_storage_paths=("Messages/Mary",),
+            suggested_tags=("New Tag Zero", "Conversation"),
+        ),
+        taxonomy,
+        TaxonomyCapabilities(True, True, True, True),
+    )
+    return job, review, FakeIngestion()
+
+
+@pytest.mark.asyncio
+async def test_ai_review_layout_title_date_and_metadata_interactions(  # noqa: PLR0915
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    job, review, ingestion = _ai_review_fixture(tmp_path)
+    settings = settings_factory(data_dir=tmp_path)
+    view = AISuggestionsView(job, review, cast(Any, ingestion), settings)
+
+    assert view.is_dirty
+    assert view.has_editable_fields
+    assert view.title_content() == ("**Title**\nChat Conversation with Mary *(pending)*")
+    assert "Each menu identifies its field" in view.metadata_content()
+    assert "Pending changes" in view.actions_content()
+    assert view.current_title == "Chat Conversation with Mary"
+    assert view.date_placeholder() == "Date: 2026-07-28 (Paperless suggestion)"
+    assert view.metadata_placeholder(TaxonomyKind.CORRESPONDENT) == "Correspondent: Mary"
+    assert view.metadata_placeholder(TaxonomyKind.TAG) == "Tags: 1 selected"
+
+    children = list(view.children)
+    assert isinstance(children[0], _DateSelect)
+    assert [item.kind for item in children if isinstance(item, _MetadataSelect)] == [
+        TaxonomyKind.CORRESPONDENT,
+        TaxonomyKind.DOCUMENT_TYPE,
+        TaxonomyKind.STORAGE_PATH,
+        TaxonomyKind.TAG,
+    ]
+    assert all(
+        option.label.startswith("Correspondent ·")
+        for option in view.options_for(TaxonomyKind.CORRESPONDENT)
+    )
+
+    thread = FakeThread(parent_id=102)
+    await view.send(thread)
+    assert [message.content.splitlines()[0] for message in thread.sent] == [
+        "**Title**",
+        "**Editable Metadata**",
+        "**Pending changes**",
+    ]
+    assert isinstance(thread.sent[0].send_kwargs["view"], _TitleEditView)
+    assert thread.sent[1].send_kwargs["view"] is view
+    assert isinstance(thread.sent[2].send_kwargs["view"], _ReviewActionsView)
+
+    unauthorized = AsyncMock(user=SimpleNamespace(id=999))
+    assert not await view.interaction_check(unauthorized)
+    assert "Only the user who uploaded" in unauthorized.response.send_message.call_args.args[0]
+    assert await view.interaction_check(AsyncMock(user=SimpleNamespace(id=201)))
+
+    title_view = thread.sent[0].send_kwargs["view"]
+    assert await title_view.interaction_check(AsyncMock(user=SimpleNamespace(id=201)))
+    title_interaction = AsyncMock(user=SimpleNamespace(id=201))
+    await title_view.edit_title.callback(title_interaction)
+    title_modal = title_interaction.response.send_modal.call_args.args[0]
+    assert isinstance(title_modal, AISuggestionsTitleModal)
+    title_modal.title_input._value = "  User Edited Title  "
+    await title_modal.on_submit(AsyncMock(user=SimpleNamespace(id=201)))
+    assert view.current_title == "User Edited Title"
+    assert view.title_message is not None
+    assert "User Edited Title" in view.title_message.content
+
+    title_modal.title_input._value = ""
+    await title_modal.on_submit(AsyncMock(user=SimpleNamespace(id=201)))
+    assert view.current_title == "Current"
+    denied_title = AsyncMock(user=SimpleNamespace(id=999))
+    await title_modal.on_submit(denied_title)
+    assert "Only the uploader" in denied_title.response.send_message.call_args.args[0]
+
+    date_select = next(item for item in view.children if isinstance(item, _DateSelect))
+    assert date_select.options[0].label.startswith("Date · Keep current")
+    date_select._values = ["date:2026-07-28"]
+    await date_select.callback(AsyncMock())
+    assert view.selection.created == date(2026, 7, 28)
+    date_select = next(item for item in view.children if isinstance(item, _DateSelect))
+    date_select._values = ["keep"]
+    await date_select.callback(AsyncMock())
+    assert view.selection.created is None
+    date_select = next(item for item in view.children if isinstance(item, _DateSelect))
+    date_select._values = ["custom"]
+    custom_interaction = AsyncMock()
+    await date_select.callback(custom_interaction)
+    date_modal = custom_interaction.response.send_modal.call_args.args[0]
+    assert isinstance(date_modal, AISuggestionsDateModal)
+    date_modal.date_input._value = "bad"
+    invalid_date = AsyncMock(user=SimpleNamespace(id=201))
+    await date_modal.on_submit(invalid_date)
+    assert "valid date" in invalid_date.response.send_message.call_args.args[0]
+    denied_date = AsyncMock(user=SimpleNamespace(id=999))
+    await date_modal.on_submit(denied_date)
+    assert "Only the uploader" in denied_date.response.send_message.call_args.args[0]
+    date_modal.date_input._value = "2026-07-30"
+    await date_modal.on_submit(AsyncMock(user=SimpleNamespace(id=201)))
+    assert view.selection.created == date(2026, 7, 30)
+    assert view.date_placeholder() == "Date: 2026-07-30 (custom)"
+
+    correspondent = next(
+        item
+        for item in view.children
+        if isinstance(item, _MetadataSelect) and item.kind is TaxonomyKind.CORRESPONDENT
+    )
+    correspondent._values = ["new:0"]
+    await correspondent.callback(AsyncMock())
+    assert view.selection.correspondent_id is None
+    assert view.selection.new_correspondents == ("Mary Smyth",)
+    assert view.metadata_placeholder(TaxonomyKind.CORRESPONDENT).endswith("(new)")
+
+    reset_interaction = AsyncMock()
+    await view.reset(reset_interaction)
+    assert view.selection == view.initial_selection
+    assert "reset to Paperless" in reset_interaction.followup.send.call_args.args[0]
+
+    actions_view = thread.sent[2].send_kwargs["view"]
+    assert await actions_view.interaction_check(AsyncMock(user=SimpleNamespace(id=201)))
+    request_apply_mock = AsyncMock()
+    reset_mock = AsyncMock()
+    view.request_apply = request_apply_mock
+    view.reset = reset_mock
+    await actions_view.apply_changes.callback(AsyncMock())
+    await actions_view.reset_changes.callback(AsyncMock())
+    request_apply_mock.assert_awaited_once()
+    reset_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ai_suggestion_combined_selectors_and_pagination(  # noqa: PLR0915
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    job, base_review, ingestion = _ai_review_fixture(tmp_path)
     suggestions = AISuggestions(
         correspondent_ids=(1,),
         document_type_ids=(3,),
@@ -2046,22 +2068,17 @@ async def test_ai_suggestion_combined_selectors_and_pagination(  # noqa: PLR0915
         suggested_tags=tuple(f"New Tag {index}" for index in range(30)),
     )
     review = SuggestionReview(
-        Document(
-            DocumentId(7),
-            "Current",
-            None,
-            modified=datetime(2026, 7, 28, tzinfo=UTC),
-            tag_ids=(2,),
-            correspondent_id=1,
-            document_type_id=3,
-            storage_path_id=4,
-        ),
+        base_review.document,
         suggestions,
-        taxonomy,
+        base_review.taxonomy,
         TaxonomyCapabilities(True, True, True, True),
     )
-    ingestion = FakeIngestion()
-    view = AISuggestionsView(job, review, cast(Any, ingestion), 900)
+    view = AISuggestionsView(
+        job,
+        review,
+        cast(Any, ingestion),
+        settings_factory(data_dir=tmp_path),
+    )
     unchanged = await view._resolve_new_selection()
     assert unchanged == view.selection
     selects = {item.kind: item for item in view.children if isinstance(item, _MetadataSelect)}
@@ -2075,11 +2092,9 @@ async def test_ai_suggestion_combined_selectors_and_pagination(  # noqa: PLR0915
     ]
     assert correspondent_options[1].default
     assert not correspondent_options[-1].default
+    assert view._selected_option_values(TaxonomyKind.CORRESPONDENT) == ("id:1",)
     assert selects[TaxonomyKind.TAG].options[-1].value == "more"
-    assert "32 choices" in selects[TaxonomyKind.TAG].options[-1].label
-    assert "☐ Close existing · Mary Smith (for AI: Mary Smyth)" in str(
-        view.build_embed().fields[2].value
-    )
+    assert "33 choices" in selects[TaxonomyKind.TAG].options[-1].label
 
     source_message = AsyncMock(spec=discord.Message)
     more_interaction = AsyncMock(
@@ -2109,12 +2124,10 @@ async def test_ai_suggestion_combined_selectors_and_pagination(  # noqa: PLR0915
     await page_select.callback(page_interaction)
     assert view.selection.tag_ids == (2,)
     assert view.selection.new_tags == ("New Tag 29",)
-    source_message.edit.assert_awaited()
 
     overflow_without_source = _MetadataOverflowView(
         view,
         TaxonomyKind.TAG,
-        None,
         page=1,
     )
     page_without_source = next(
@@ -2154,56 +2167,39 @@ async def test_ai_suggestion_combined_selectors_and_pagination(  # noqa: PLR0915
     assert view._selected_option_values(TaxonomyKind.DOCUMENT_TYPE) == ("new:0",)
     assert view._selected_option_values(TaxonomyKind.TAG) == ("id:2", "new:29")
     view.update_selection(TaxonomyKind.TAG, ("id:2", "id:8", "new:29"))
-    assert "☑ Close existing · New Tag Zero (for AI: New Tag 0)" in str(
-        view.build_embed().fields[5].value
-    )
+    assert view.metadata_placeholder(TaxonomyKind.TAG) == "Tags: 3 selected"
 
     assert _bounded_lines(()) == "None"
     assert _bounded_lines(("x" * 1100,)).endswith("…")
     close = _close_existing_items(
         ("Mary Smit", "Mary Smith"),
-        taxonomy.correspondents,
+        review.taxonomy.correspondents,
         (),
     )
     assert close == ((TaxonomyItem(9, "Mary Smith"), "Mary Smith"),)
     assert _close_existing_items(
         ("Mary Smith", "Mary Smit"),
-        taxonomy.correspondents,
+        review.taxonomy.correspondents,
         (),
     ) == ((TaxonomyItem(9, "Mary Smith"), "Mary Smith"),)
 
 
 @pytest.mark.asyncio
-async def test_ai_new_taxonomy_requires_second_confirmation(tmp_path: Path) -> None:
-    job = IngestionJob(
-        id=uuid4(),
-        discord_message_id=1,
-        discord_attachment_id=2,
-        principal_id=201,
-        staged_path=tmp_path / "synthetic.pdf",
-        original_filename="synthetic.pdf",
-        caption="",
-        media_type="application/pdf",
-        office_dependent=False,
-        guidance=MetadataGuidance(),
-    )
-    review = SuggestionReview(
-        Document(
-            DocumentId(7),
-            "Current",
-            date(2026, 7, 1),
-            modified=datetime(2026, 7, 28, tzinfo=UTC),
-        ),
-        AISuggestions(
+async def test_ai_new_taxonomy_confirmation_is_configurable(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    job, base_review, ingestion = _ai_review_fixture(tmp_path)
+    review = replace(
+        base_review,
+        suggestions=AISuggestions(
             suggested_correspondents=("Abby",),
             suggested_document_types=("Text Message",),
             suggested_storage_paths=("Messages/Mary",),
             suggested_tags=("new-topic",),
         ),
-        Taxonomy((), (), (), ()),
-        TaxonomyCapabilities(True, True, True, True),
+        taxonomy=Taxonomy((), (), (), ()),
     )
-    ingestion = FakeIngestion()
     ingestion.apply_suggestions = AsyncMock()  # type: ignore[method-assign]
     ingestion.resolve_or_create_taxonomy = AsyncMock(  # type: ignore[method-assign]
         side_effect=(
@@ -2213,15 +2209,19 @@ async def test_ai_new_taxonomy_requires_second_confirmation(tmp_path: Path) -> N
             TaxonomyItem(104, "Messages/Mary"),
         )
     )
-    view = AISuggestionsView(job, review, cast(Any, ingestion), 900)
+    view = AISuggestionsView(
+        job,
+        review,
+        cast(Any, ingestion),
+        settings_factory(data_dir=tmp_path),
+    )
     view.update_selection(TaxonomyKind.TAG, ("new:0",))
     view.update_selection(TaxonomyKind.CORRESPONDENT, ("new:0",))
     view.update_selection(TaxonomyKind.DOCUMENT_TYPE, ("new:0",))
     view.update_selection(TaxonomyKind.STORAGE_PATH, ("new:0",))
 
-    source_message = AsyncMock(spec=discord.Message)
-    approve = AsyncMock(user=SimpleNamespace(id=201), message=source_message)
-    await view.approve_button.callback(approve)
+    approve = AsyncMock(user=SimpleNamespace(id=201))
+    await view.request_apply(approve)
     confirmation = approve.response.send_message.call_args.kwargs["view"]
     assert isinstance(confirmation, _ConfirmTaxonomyCreationView)
     assert "New names" not in approve.response.send_message.call_args.args[0]
@@ -2242,4 +2242,233 @@ async def test_ai_new_taxonomy_requires_second_confirmation(tmp_path: Path) -> N
     assert updates.correspondent_id == 102
     assert updates.document_type_id == 103
     assert updates.storage_path_id == 104
-    source_message.edit.assert_awaited_once()
+
+    silent_ingestion = FakeIngestion()
+    silent_ingestion.apply_suggestions = AsyncMock()  # type: ignore[method-assign]
+    silent_ingestion.resolve_or_create_taxonomy = AsyncMock(  # type: ignore[method-assign]
+        return_value=TaxonomyItem(200, "new-topic")
+    )
+    silent = AISuggestionsView(
+        job,
+        review,
+        cast(Any, silent_ingestion),
+        settings_factory(
+            data_dir=tmp_path,
+            require_new_metadata_confirmation=False,
+        ),
+    )
+    silent.update_selection(TaxonomyKind.TAG, ("new:0",))
+    silent_apply = AsyncMock(user=SimpleNamespace(id=201))
+    await silent.request_apply(silent_apply)
+    silent_apply.response.defer.assert_awaited_once_with(ephemeral=True)
+    silent_ingestion.resolve_or_create_taxonomy.assert_awaited_once()
+    silent_ingestion.apply_suggestions.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ai_review_apply_errors_reload_and_disabled_fields(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    job, review, ingestion = _ai_review_fixture(tmp_path)
+    disabled_settings = settings_factory(
+        data_dir=tmp_path,
+        allow_edit_title=False,
+        allow_edit_date=False,
+        allow_edit_correspondent=False,
+        allow_edit_document_type=False,
+        allow_edit_storage_path=False,
+        allow_edit_tags=False,
+    )
+    disabled = AISuggestionsView(job, review, cast(Any, ingestion), disabled_settings)
+    assert not disabled.has_editable_fields
+    assert not disabled.is_dirty
+    assert disabled.current_title == "Current"
+    assert not disabled.children
+    disabled_thread = FakeThread(parent_id=102)
+    await disabled.send(disabled_thread)
+    assert not disabled_thread.sent
+
+    partial = AISuggestionsView(
+        job,
+        review,
+        cast(Any, ingestion),
+        settings_factory(
+            data_dir=tmp_path,
+            allow_edit_title=False,
+            allow_edit_date=False,
+            allow_edit_correspondent=False,
+            allow_edit_document_type=False,
+            allow_edit_storage_path=False,
+        ),
+    )
+    assert partial.selection.title is None
+    assert partial.selection.created is None
+    assert partial.selection.correspondent_id is None
+    assert partial.selection.document_type_id is None
+    assert partial.selection.storage_path_id is None
+    assert partial.selection.tag_ids == (2,)
+    assert [item.kind for item in partial.children if isinstance(item, _MetadataSelect)] == [
+        TaxonomyKind.TAG
+    ]
+
+    for error, expected in (
+        (StaleSuggestionError("stale"), "changed after"),
+        (UnlinkedUserError("unlinked"), "no longer linked"),
+        (PaperlessUnavailableError("unavailable"), "could not resolve"),
+        (Exception("secret detail"), "could not be applied"),
+    ):
+        ingestion.apply_suggestions = AsyncMock(side_effect=error)  # type: ignore[method-assign]
+        failed = AISuggestionsView(
+            job,
+            review,
+            cast(Any, ingestion),
+            settings_factory(data_dir=tmp_path),
+        )
+        interaction = AsyncMock()
+        await failed.apply(interaction, confirm_create=False)
+        assert expected in interaction.followup.send.call_args.args[0]
+        assert "secret detail" not in interaction.followup.send.call_args.args[0]
+
+    ingestion.apply_suggestions = AsyncMock()  # type: ignore[method-assign]
+    applied = AISuggestionsView(
+        job,
+        review,
+        cast(Any, ingestion),
+        settings_factory(data_dir=tmp_path),
+    )
+    interaction = AsyncMock()
+    await applied.apply(interaction, confirm_create=False)
+    assert applied._applied
+    assert not applied.is_dirty
+    assert "Changes applied" in applied.actions_content()
+    assert "confirmed" in interaction.followup.send.call_args.args[0]
+    already = AsyncMock()
+    await applied.apply(already, confirm_create=False)
+    assert "already applied" in already.followup.send.call_args.args[0]
+    actions = _ReviewActionsView(applied)
+    assert actions.apply_changes.disabled
+    assert actions.reset_changes.disabled
+    title_actions = _TitleEditView(applied)
+    assert title_actions.edit_title.disabled
+
+    for error, expected in (
+        (StaleSuggestionError("stale"), "changed while"),
+        (UnlinkedUserError("unlinked"), "no longer linked"),
+        (PaperlessUnavailableError("unavailable"), "unavailable"),
+    ):
+        ingestion.get_suggestion_review = AsyncMock(side_effect=error)  # type: ignore[method-assign]
+        assert expected in (await applied.reload() or "")
+    ingestion.get_suggestion_review = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    assert await applied.reload() is None
+    ingestion.get_suggestion_review = AsyncMock(return_value=review)  # type: ignore[method-assign]
+    assert await applied.reload() is None
+    assert not applied._applied
+    assert applied.is_dirty
+    applied.saved_selection = applied.selection
+    assert applied.actions_content() == "**No pending changes**"
+
+
+@pytest.mark.asyncio
+async def test_ai_review_thread_controls_are_persistent_and_guard_dirty_state(  # noqa: PLR0915
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    job, review, ingestion = _ai_review_fixture(tmp_path)
+    session = AISuggestionsView(
+        job,
+        review,
+        cast(Any, ingestion),
+        settings_factory(data_dir=tmp_path),
+    )
+    controller = _ReviewThreadController(201, 900)
+    controller.add(session)
+    assert controller.is_dirty
+
+    denied = AsyncMock(user=SimpleNamespace(id=999))
+    assert not await controller.interaction_check(denied)
+    assert "Only the uploader" in denied.response.send_message.call_args.args[0]
+    assert await controller.interaction_check(AsyncMock(user=SimpleNamespace(id=201)))
+
+    controls = controller.build_view("https://paperless.example.test/documents/7/details")
+    assert isinstance(controls, _ReviewThreadControlsView)
+    assert await controls.interaction_check(AsyncMock(user=SimpleNamespace(id=201)))
+    assert [cast(discord.ui.Button[Any], child).label for child in controls.children] == [
+        "Open Paperless",
+        "Refresh",
+        "Finish & Close",
+    ]
+    no_link_controls = controller.build_view(None)
+    assert [cast(discord.ui.Button[Any], child).label for child in no_link_controls.children] == [
+        "Refresh",
+        "Finish & Close",
+    ]
+
+    dirty_refresh = AsyncMock(user=SimpleNamespace(id=201))
+    await controller.request_refresh(dirty_refresh)
+    refresh_confirmation = dirty_refresh.response.send_message.call_args.kwargs["view"]
+    assert isinstance(refresh_confirmation, _ConfirmRefreshView)
+    assert await refresh_confirmation.interaction_check(AsyncMock(user=SimpleNamespace(id=201)))
+    back_refresh = AsyncMock(user=SimpleNamespace(id=201))
+    await refresh_confirmation.back.callback(back_refresh)
+    assert "canceled" in back_refresh.response.edit_message.call_args.kwargs["content"]
+
+    session.reload = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    confirmed_refresh = AsyncMock(user=SimpleNamespace(id=201))
+    await refresh_confirmation.confirm.callback(confirmed_refresh)
+    session.reload.assert_awaited_once()
+    assert "refreshed" in confirmed_refresh.followup.send.call_args.args[0]
+
+    session.reload = AsyncMock(return_value="Synthetic refresh error")  # type: ignore[method-assign]
+    session.saved_selection = session.selection
+    direct_refresh = AsyncMock(user=SimpleNamespace(id=201))
+    await controller.request_refresh(direct_refresh)
+    assert "Synthetic refresh error" in direct_refresh.followup.send.call_args.args[0]
+
+    refresh_button = next(
+        child for child in controls.children if isinstance(child, _RefreshReviewButton)
+    )
+    session.reload = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    await refresh_button.callback(AsyncMock(user=SimpleNamespace(id=201)))
+
+    session.selection = replace(session.selection, title="Unsaved")
+    dirty_close = AsyncMock(user=SimpleNamespace(id=201))
+    await controller.request_finish(dirty_close)
+    close_confirmation = dirty_close.response.send_message.call_args.kwargs["view"]
+    assert isinstance(close_confirmation, _ConfirmCloseThreadView)
+    assert await close_confirmation.interaction_check(AsyncMock(user=SimpleNamespace(id=201)))
+    back_close = AsyncMock(user=SimpleNamespace(id=201))
+    await close_confirmation.back.callback(back_close)
+    assert "left open" in back_close.response.edit_message.call_args.kwargs["content"]
+
+    channel = SimpleNamespace(delete=AsyncMock())
+    confirmed_close = AsyncMock(user=SimpleNamespace(id=201), channel=channel)
+    await close_confirmation.confirm.callback(confirmed_close)
+    channel.delete.assert_awaited_once_with(reason="Uploader finished Paperless document review")
+
+    session.saved_selection = session.selection
+    direct_channel = SimpleNamespace(delete=AsyncMock())
+    direct_close = AsyncMock(user=SimpleNamespace(id=201), channel=direct_channel)
+    await controller.request_finish(direct_close)
+    direct_channel.delete.assert_awaited_once()
+
+    finish_button = next(
+        child for child in controls.children if isinstance(child, _FinishReviewButton)
+    )
+    button_channel = SimpleNamespace(delete=AsyncMock())
+    await finish_button.callback(AsyncMock(user=SimpleNamespace(id=201), channel=button_channel))
+    button_channel.delete.assert_awaited_once()
+
+    invalid_channel = AsyncMock()
+    invalid_channel.channel = SimpleNamespace()
+    await controller.finish(invalid_channel)
+    assert "only available" in invalid_channel.followup.send.call_args.args[0]
+
+    delete_error = discord.HTTPException(
+        cast(Any, SimpleNamespace(status=403, reason="Forbidden")),
+        "synthetic",
+    )
+    failed_channel = SimpleNamespace(delete=AsyncMock(side_effect=delete_error))
+    failed_delete = AsyncMock(channel=failed_channel)
+    await controller.finish(failed_delete)
+    assert "Manage Threads" in failed_delete.followup.send.call_args.args[0]

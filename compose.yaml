@@ -9,6 +9,13 @@ services:
       - .env
     environment:
       TZ: ${TZ:-America/New_York}
+      ALLOW_EDIT_TITLE: ${ALLOW_EDIT_TITLE:-true}
+      ALLOW_EDIT_DATE: ${ALLOW_EDIT_DATE:-true}
+      ALLOW_EDIT_CORRESPONDENT: ${ALLOW_EDIT_CORRESPONDENT:-true}
+      ALLOW_EDIT_DOCUMENT_TYPE: ${ALLOW_EDIT_DOCUMENT_TYPE:-true}
+      ALLOW_EDIT_STORAGE_PATH: ${ALLOW_EDIT_STORAGE_PATH:-true}
+      ALLOW_EDIT_TAGS: ${ALLOW_EDIT_TAGS:-true}
+      REQUIRE_NEW_METADATA_CONFIRMATION: ${REQUIRE_NEW_METADATA_CONFIRMATION:-true}
     volumes:
       - paperless-assistant-data:/data
     ports:

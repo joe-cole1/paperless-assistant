@@ -574,6 +574,20 @@ class IngestionService:
         )
         if self._credentials is not None and user_token is None:
             raise UnlinkedUserError("Paperless account is not linked")
+        disabled = (
+            (updates.title is not None and not self._settings.allow_edit_title)
+            or (updates.created is not None and not self._settings.allow_edit_date)
+            or (
+                updates.correspondent_id is not None and not self._settings.allow_edit_correspondent
+            )
+            or (
+                updates.document_type_id is not None and not self._settings.allow_edit_document_type
+            )
+            or (updates.storage_path_id is not None and not self._settings.allow_edit_storage_path)
+            or (updates.tag_ids is not None and not self._settings.allow_edit_tags)
+        )
+        if disabled:
+            raise PaperlessUnavailableError("suggestion field editing is disabled")
         current = await self._gateway.get_document(int(job.paperless_document_id), token=user_token)
         if (
             expected_modified is None
@@ -634,6 +648,14 @@ class IngestionService:
         )
         if self._credentials is not None and user_token is None:
             raise UnlinkedUserError("Paperless account is not linked")
+        editable = {
+            TaxonomyKind.TAG: self._settings.allow_edit_tags,
+            TaxonomyKind.CORRESPONDENT: self._settings.allow_edit_correspondent,
+            TaxonomyKind.DOCUMENT_TYPE: self._settings.allow_edit_document_type,
+            TaxonomyKind.STORAGE_PATH: self._settings.allow_edit_storage_path,
+        }[kind]
+        if not editable:
+            raise PaperlessUnavailableError("taxonomy field editing is disabled")
         matches = await self._gateway.find_taxonomy_items(kind, name, token=user_token)
         if len(matches) == 1:
             return matches[0]
