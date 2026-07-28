@@ -992,8 +992,9 @@ class DiscordAssistant(discord.Client):
                         if job.office_dependent
                         else ""
                     )
+                    reason = f": {recovered.task_message}" if recovered.task_message else "."
                     results.append(
-                        f"{index}. `{job.original_filename}` — processing failed.{guidance}"
+                        f"{index}. `{job.original_filename}` — processing failed{reason}{guidance}"
                     )
                     all_resolved = False
             succeeded_url = next(
@@ -1097,10 +1098,14 @@ class DiscordAssistant(discord.Client):
                 "Check Paperless before retrying."
             )
         elif outcome.job.state == JobState.FAILED and outcome.job.office_dependent:
+            reason = f": {outcome.task_message}" if outcome.task_message else "."
             content = (
-                f"Recovered ingestion job `{outcome.job.id}`: processing failed. "
+                f"Recovered ingestion job `{outcome.job.id}`: processing failed{reason} "
                 "Verify Paperless Tika/Gotenberg and the Office-upload flag."
             )
+        elif outcome.job.state == JobState.FAILED:
+            reason = f": {outcome.task_message}" if outcome.task_message else "."
+            content = f"Recovered ingestion job `{outcome.job.id}`: processing failed{reason}"
         else:
             content = f"Recovered ingestion job `{outcome.job.id}`: {state}."
         await channel.send(

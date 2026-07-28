@@ -351,9 +351,10 @@ async def test_ingestion_failures_and_recovery(
     submitted = await ingestion.submit(failed_task)
     gateway.task = PaperlessTask(gateway.task_id, TaskState.PENDING)
     assert (await ingestion.poll_once(submitted.job)).job.state == JobState.SUBMITTED
-    gateway.task = PaperlessTask(gateway.task_id, TaskState.FAILURE)
+    gateway.task = PaperlessTask(gateway.task_id, TaskState.FAILURE, message="duplicate in trash")
     outcome = await ingestion.poll_once(submitted.job)
     assert outcome.job.state == JobState.FAILED
+    assert outcome.task_message == "duplicate in trash"
 
     interrupted = await make_job(4)
     await repository.transition_job(interrupted.id, JobState.STAGED, JobState.SUBMITTING)
