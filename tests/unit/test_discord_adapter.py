@@ -319,7 +319,9 @@ class FakeIngestion:
     async def clear_warning(self) -> None:
         self.warning_marker = None
 
-    async def get_suggestions_for_job(self, job: IngestionJob) -> AISuggestions | None:
+    async def get_suggestions_for_job(
+        self, job: IngestionJob, *args: Any, **kwargs: Any
+    ) -> AISuggestions | None:
         return getattr(
             self,
             "suggestions",
@@ -1646,7 +1648,7 @@ async def test_unlinked_user_responses(
 
 
 @pytest.mark.asyncio
-async def test_ai_suggestions_view_interactions(
+async def test_ai_suggestions_view_interactions(  # noqa: PLR0915
     tmp_path: Path,
     settings_factory: Callable[..., Settings],
 ) -> None:
@@ -1739,6 +1741,17 @@ async def test_ai_suggestions_view_interactions(
     unauth_cancel = AsyncMock(user=SimpleNamespace(id=999))
     await view.cancel_button.callback(unauth_cancel)
     assert unauth_cancel.response.send_message.call_count == 1
+
+    # Refresh unauthorized
+    unauth_refresh = AsyncMock(user=SimpleNamespace(id=999))
+    await view.refresh_button.callback(unauth_refresh)
+    assert unauth_refresh.response.send_message.call_count == 1
+
+    # Refresh authorized
+    auth_refresh = AsyncMock(user=SimpleNamespace(id=201))
+    auth_refresh.message = SimpleNamespace(edit=AsyncMock())
+    await view.refresh_button.callback(auth_refresh)
+    auth_refresh.message.edit.assert_called_once()
 
     # Coverage: cancel_button with no message
     cancel_interaction_no_msg = AsyncMock(user=SimpleNamespace(id=201), message=None)

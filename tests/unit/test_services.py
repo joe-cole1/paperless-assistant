@@ -618,12 +618,12 @@ async def test_get_suggestions_for_job(
         guidance=MetadataGuidance((), None, None),
     )
 
-    s = await ingestion.get_suggestions_for_job(job)
+    s = await ingestion.get_suggestions_for_job(job, max_attempts=2, delay=0.0)
     assert s is not None
     assert s.title == "Suggested"
 
     gateway.suggestions_error = True
-    assert await ingestion.get_suggestions_for_job(job) is None
+    assert await ingestion.get_suggestions_for_job(job, max_attempts=2, delay=0.0) is None
 
     job_no_doc = replace(job, paperless_document_id=None)
     assert await ingestion.get_suggestions_for_job(job_no_doc) is None

@@ -483,8 +483,10 @@ class IngestionService:
             )
         )
 
-    async def get_suggestions_for_job(self, job: IngestionJob) -> AISuggestions | None:
-        """Fetch AI suggestions for a completed job."""
+    async def get_suggestions_for_job(
+        self, job: IngestionJob, *, max_attempts: int = 4, delay: float = 2.0
+    ) -> AISuggestions | None:
+        """Fetch AI suggestions for a completed job with smart settlement polling."""
         if job.paperless_document_id is None:
             return None
         user_token = (
@@ -494,12 +496,35 @@ class IngestionService:
         )
         if self._credentials is not None and user_token is None:
             raise UnlinkedUserError("Paperless account is not linked")
-        try:
-            return await self._gateway.get_ai_suggestions(
-                int(job.paperless_document_id), token=user_token
-            )
-        except PaperlessUnavailableError:
-            return None
+
+        stem = Path(job.original_filename).stem
+        latest_suggestions: AISuggestions | None = None
+
+        for attempt in range(max_attempts):
+            try:
+                suggestions = await self._gateway.get_ai_suggestions(
+                    int(job.paperless_document_id), token=user_token
+                )
+                latest_suggestions = suggestions
+                has_enriched_title = suggestions.title is not None and suggestions.title not in (
+                    stem,
+                    job.original_filename,
+                )
+                has_metadata = (
+                    suggestions.correspondent_id is not None
+                    or suggestions.document_type_id is not None
+                    or bool(suggestions.tag_ids)
+                )
+                if has_enriched_title or has_metadata:
+                    return suggestions
+            except PaperlessUnavailableError:
+                if attempt == max_attempts - 1:
+                    return None
+
+            if attempt < max_attempts - 1 and delay > 0:
+                await asyncio.sleep(delay)
+
+        return latest_suggestions
 
     async def apply_suggestions(self, job: IngestionJob, updates: DocumentUpdate) -> None:
         """Apply user-approved suggestions to the document."""
