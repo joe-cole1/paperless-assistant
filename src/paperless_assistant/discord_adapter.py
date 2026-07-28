@@ -28,6 +28,7 @@ from paperless_assistant.models import (
     IngestionJob,
     JobState,
     ReferenceContext,
+    Taxonomy,
 )
 from paperless_assistant.policy import discord_safe_chunks, select_ordinal
 from paperless_assistant.ports import CredentialRepository, PaperlessGateway
@@ -163,14 +164,61 @@ class AISuggestionsEditModal(discord.ui.Modal, title="Edit Suggested Title"):
         await self.callback(interaction, self.title_input.value)
 
 
+def _build_suggestions_embed(
+    document: Document,
+    suggestions: AISuggestions,
+    taxonomy: Taxonomy | None,
+    current_title: str | None = None,
+) -> discord.Embed:
+    title_val = current_title or suggestions.title or document.title or "None"
+    embed = discord.Embed(
+        title=f"🤖 AI Suggestions for {document.title}",
+        description="Paperless AI has suggested the following metadata.",
+        color=discord.Color.purple(),
+    )
+    embed.add_field(
+        name="Suggested Title",
+        value=title_val,
+        inline=False,
+    )
+
+    corr_name = "None"
+    if suggestions.correspondent_id and taxonomy:
+        corr_name = next(
+            (c.name for c in taxonomy.correspondents if c.id == suggestions.correspondent_id),
+            str(suggestions.correspondent_id),
+        )
+    embed.add_field(name="Correspondent", value=corr_name, inline=True)
+
+    type_name = "None"
+    if suggestions.document_type_id and taxonomy:
+        type_name = next(
+            (t.name for t in taxonomy.document_types if t.id == suggestions.document_type_id),
+            str(suggestions.document_type_id),
+        )
+    embed.add_field(name="Document Type", value=type_name, inline=True)
+
+    tags_value = "None"
+    if suggestions.tag_ids and taxonomy:
+        names = [
+            next((t.name for t in taxonomy.tags if t.id == tid), str(tid))
+            for tid in suggestions.tag_ids
+        ]
+        tags_value = ", ".join(names)
+    embed.add_field(name="Tags", value=tags_value, inline=False)
+
+    return embed
+
+
 class AISuggestionsView(discord.ui.View):
-    def __init__(
+    def __init__(  # noqa: PLR0913, PLR0917
         self,
         job: IngestionJob,
         document: Document,
         suggestions: AISuggestions,
         ingestion: IngestionService,
         allowed_user_ids: frozenset[int],
+        taxonomy_cache: TaxonomyCache | None = None,
     ) -> None:
         super().__init__(timeout=None)
         self.job = job
@@ -178,6 +226,7 @@ class AISuggestionsView(discord.ui.View):
         self.suggestions = suggestions
         self.ingestion = ingestion
         self.allowed_user_ids = allowed_user_ids
+        self.taxonomy_cache = taxonomy_cache
         self.current_title = suggestions.title or document.title
 
     @discord.ui.button(label="Approve All & Apply", style=discord.ButtonStyle.green, emoji="🟢")
@@ -228,6 +277,27 @@ class AISuggestionsView(discord.ui.View):
         await interaction.response.send_modal(
             AISuggestionsEditModal(self.current_title, on_modal_submit)
         )
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary, emoji="🔄")
+    async def refresh_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button[discord.ui.View]
+    ) -> None:
+        if self.allowed_user_ids and interaction.user.id not in self.allowed_user_ids:
+            await interaction.response.send_message("Unauthorized.", ephemeral=True)
+            return
+        await interaction.response.defer()
+
+        fresh = await self.ingestion.get_suggestions_for_job(self.job, max_attempts=1, delay=0.0)
+        if fresh:
+            self.suggestions = fresh
+            self.current_title = fresh.title or self.document.title
+
+        taxonomy = self.taxonomy_cache.snapshot if self.taxonomy_cache else None
+        embed = _build_suggestions_embed(
+            self.document, self.suggestions, taxonomy, current_title=self.current_title
+        )
+        if interaction.message:
+            await interaction.message.edit(embed=embed, view=self)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="❌")
     async def cancel_button(
@@ -948,46 +1018,15 @@ class DiscordAssistant(discord.Client):
         document: Document,
         suggestions: AISuggestions,
     ) -> None:
-        embed = discord.Embed(
-            title=f"🤖 AI Suggestions for {document.title}",
-            description="Paperless AI has suggested the following metadata.",
-            color=discord.Color.purple(),
-        )
-        embed.add_field(
-            name="Suggested Title",
-            value=suggestions.title or document.title or "None",
-            inline=False,
-        )
-
         taxonomy = self._taxonomy.snapshot
-
-        corr_name = "None"
-        if suggestions.correspondent_id and taxonomy:
-            corr_name = next(
-                (c.name for c in taxonomy.correspondents if c.id == suggestions.correspondent_id),
-                str(suggestions.correspondent_id),
-            )
-        embed.add_field(name="Correspondent", value=corr_name, inline=True)
-
-        type_name = "None"
-        if suggestions.document_type_id and taxonomy:
-            type_name = next(
-                (t.name for t in taxonomy.document_types if t.id == suggestions.document_type_id),
-                str(suggestions.document_type_id),
-            )
-        embed.add_field(name="Document Type", value=type_name, inline=True)
-
-        tags_value = "None"
-        if suggestions.tag_ids and taxonomy:
-            names = []
-            for tid in suggestions.tag_ids:
-                name = next((t.name for t in taxonomy.tags if t.id == tid), str(tid))
-                names.append(name)
-            tags_value = ", ".join(names)
-        embed.add_field(name="Tags", value=tags_value, inline=False)
-
+        embed = _build_suggestions_embed(document, suggestions, taxonomy)
         view = AISuggestionsView(
-            job, document, suggestions, self._ingestion, self._settings.discord_allowed_user_ids
+            job,
+            document,
+            suggestions,
+            self._ingestion,
+            self._settings.discord_allowed_user_ids,
+            taxonomy_cache=self._taxonomy,
         )
         await thread.send(embed=embed, view=view, allowed_mentions=NO_MENTIONS)
 
