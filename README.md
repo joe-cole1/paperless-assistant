@@ -24,9 +24,13 @@ Configure two private Discord text channels:
   Paperless 3.0.4 to run its LLM-backed suggestions and presents the proposed title,
   correspondent, document type, storage path, date, and tags for review. Only the uploader can
   apply them. Existing Paperless matches start selected while unmatched AI names start unchecked;
-  the uploader can change either list. Applying rechecks the document, preserves existing tags,
-  and patches only selected metadata. Selected unmatched names require a separate confirmation,
-  an exact-name check, and the linked user's Paperless creation permission. Once the configured
+  the uploader can change either list in clearly labeled selectors. Title has its own edit action;
+  date offers the current value, AI candidates, and a custom-date action. Applying rechecks the
+  document, preserves existing tags, and patches only selected metadata. Selected unmatched names
+  receive a second confirmation by default, followed by an exact-name check and the linked user's
+  Paperless creation permission. The persistent **Open Paperless**, **Refresh**, and
+  **Finish & Close** controls remain on the status message; refresh and close warn before
+  discarding unapplied choices. Once the configured
   `CLEANUP_INBOX_TAG` (default `inbox`) is removed from a document in Paperless, the bot
   automatically deletes the corresponding upload notification message and thread.
 
@@ -76,6 +80,7 @@ only to the private guild and grant the two configured channels:
 - Attach Files
 - Embed Links
 - Manage Messages
+- Manage Threads
 
 Record the immutable guild and channel IDs with Discord Developer Mode. The assistant
 default-denies DMs, threads, other guilds/channels, bots, webhooks, edited messages, and
@@ -99,6 +104,12 @@ Replace every example ID, URL, and token in `.env`. Important settings:
 - `PAPERLESS_AI_SUGGESTIONS_TIMEOUT_SECONDS=150` — client bound for synchronous Paperless AI
   suggestions; keep it above Paperless's `PAPERLESS_AI_LLM_REQUEST_TIMEOUT`
 - `SUGGESTION_REVIEW_TIMEOUT_SECONDS=900` — lifetime of uploader-only review controls
+- `ALLOW_EDIT_TITLE`, `ALLOW_EDIT_DATE`, `ALLOW_EDIT_CORRESPONDENT`,
+  `ALLOW_EDIT_DOCUMENT_TYPE`, `ALLOW_EDIT_STORAGE_PATH`, and `ALLOW_EDIT_TAGS` — each defaults to
+  `true`; set a field to `false` to omit it from Discord and reject it at the application boundary
+- `REQUIRE_NEW_METADATA_CONFIRMATION=true` — require a second confirmation before selected
+  unmatched taxonomy names are exact-checked, created, and applied; when `false`, **Apply
+  Changes** is the creation authorization and all other safety checks remain
 - `PAPERLESS_OFFICE_UPLOADS_ENABLED=false` — upload policy flag only
 - `CLEANUP_INBOX_TAG=inbox` — tag monitored for removal to auto-delete upload notifications
 - `CLEANUP_INBOX_TAG_POLL_INTERVAL_SECONDS=300` — polling frequency for tag removal checks
@@ -150,7 +161,7 @@ It does not silently fall back to the classic classifier endpoint
 `GET /api/documents/{id}/suggestions/`. Embeddings are optional for per-document suggestions; when
 configured, Paperless can use its LLM index to ground suggestions in similar documents.
 
-Paperless 3.0.4 caches the LLM response. **Reload Review** reads the supported endpoint again and
+Paperless 3.0.4 caches the LLM response. **Refresh** reads the supported endpoint again and
 may return that cached proposal; it does not promise another LLM call. A document metadata change
 invalidates Paperless's cache. The assistant does not make an artificial metadata change or use
 Paperless internals to force invalidation.

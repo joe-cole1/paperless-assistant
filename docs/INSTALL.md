@@ -225,6 +225,13 @@ PAPERLESS_SOURCE_TAG=Discord
 PAPERLESS_OFFICE_UPLOADS_ENABLED=false
 PAPERLESS_AI_SUGGESTIONS_TIMEOUT_SECONDS=150
 SUGGESTION_REVIEW_TIMEOUT_SECONDS=900
+ALLOW_EDIT_TITLE=true
+ALLOW_EDIT_DATE=true
+ALLOW_EDIT_CORRESPONDENT=true
+ALLOW_EDIT_DOCUMENT_TYPE=true
+ALLOW_EDIT_STORAGE_PATH=true
+ALLOW_EDIT_TAGS=true
+REQUIRE_NEW_METADATA_CONFIRMATION=true
 
 CLEANUP_INBOX_TAG=inbox
 CLEANUP_INBOX_TAG_ENABLED=true
@@ -260,8 +267,15 @@ Important details:
 - `CLEANUP_INBOX_TAG` configures the Paperless tag monitored for automatic Discord message removal once removed in Paperless.
 - `PAPERLESS_AI_SUGGESTIONS_TIMEOUT_SECONDS` must be greater than Paperless's
   `PAPERLESS_AI_LLM_REQUEST_TIMEOUT`; the defaults are 150 and 120 seconds respectively.
-- `SUGGESTION_REVIEW_TIMEOUT_SECONDS` bounds how long the uploader-only Apply/Edit/Reload controls
+- `SUGGESTION_REVIEW_TIMEOUT_SECONDS` bounds how long the uploader-only review and thread controls
   remain active.
+- Every `ALLOW_EDIT_*` setting defaults to `true`. Setting one to `false` removes that field's
+  Discord control and causes the application service to reject a forged or stale interaction that
+  attempts to write it.
+- `REQUIRE_NEW_METADATA_CONFIRMATION=true` keeps the default second prompt before creating
+  selected unmatched tags, correspondents, document types, or storage paths. When set to `false`,
+  **Apply Changes** is sufficient creation authorization; exact-name lookup, ambiguity failure,
+  Paperless permission checks, freshness checks, audit, and write verification still run.
 - `CLEANUP_QUESTION_DELAY_MINUTES` and `CLEANUP_UPLOAD_DELAY_MINUTES` optionally set auto-deletion timers (0 = default daily 03:00 purge).
 - `DISCORD_MAX_ATTACHMENT_BYTES` controls incoming uploads only. Outgoing files use Discord's
   effective runtime limit automatically.
@@ -396,18 +410,39 @@ does not add another AI or try to make the result exhaustive.
    - unambiguous exact taxonomy names were applied;
    - Paperless chose the title and performed its normal classification;
    - each successful document has one note beginning `Discord upload guidance:`.
-6. For each successful document, confirm Discord shows **AI Metadata Review** with current values
-   and every proposed title, correspondent, document type, storage path, tag, and date.
-   Paperless-matched existing objects should be selected; unmatched AI names should be unchecked.
-   Change both kinds of selections and confirm **Apply Selected** writes only those choices.
-   Selecting an unmatched name must show a separate create-and-apply confirmation.
-7. As a different allowlisted user, try an AI control and confirm it is rejected. As the uploader,
-   edit and apply the proposal, then verify Paperless metadata changed while its existing tags
-   remained present. Change the document in Paperless before applying another proposal and confirm
-   the stale review is rejected instead of overwriting the newer edit.
-8. Confirm the original Discord upload message is removed only after every file succeeds or
+6. For each successful document, confirm Discord shows:
+   - a title message with **Edit Title**;
+   - one **Editable Metadata** message whose closed menus visibly begin with Date,
+     Correspondent, Document Type, Storage Path, and Tags;
+   - one action message with **Apply Changes** and **Reset Changes**;
+   - persistent **Open Paperless**, **Refresh**, and **Finish & Close** controls on the batch
+     status message.
+7. Confirm Paperless-matched existing objects start selected and unmatched AI names start
+   unchecked. Uncheck a match, select a close existing choice, select an unmatched choice, choose
+   an AI date, and enter a custom date. Confirm **Reset Changes** restores the original proposal
+   without writing to Paperless.
+8. Repeat the choices and select **Apply Changes**. With the default
+   `REQUIRE_NEW_METADATA_CONFIRMATION=true`, confirm selected unmatched names show the separate
+   create-and-apply prompt. Verify Paperless receives only the selected fields and preserves its
+   existing tags.
+9. Make an unapplied change and select **Refresh**; confirm Discord warns before discarding it.
+   Cancel once, then confirm the refresh and verify the review remains usable. Paperless may return
+   its cached LLM proposal.
+10. Make another unapplied change and select **Finish & Close**; confirm Discord warns that the
+    thread will be deleted. Cancel once. After applying or resetting, select **Finish & Close**
+    again and confirm the complete upload thread is deleted without another warning.
+11. As a different allowlisted user, try an AI or thread control and confirm it is rejected. As the
+    uploader, change the document in Paperless before applying another proposal and confirm the
+    stale review is rejected instead of overwriting the newer edit.
+12. Set one `ALLOW_EDIT_*` value to `false`, recreate the container, upload a fresh synthetic
+    document, and confirm that field is absent while the others remain usable. Restore it to
+    `true`.
+13. Set `REQUIRE_NEW_METADATA_CONFIRMATION=false`, recreate the container, select a harmless new
+    taxonomy name, and choose **Apply Changes**. Confirm there is no second prompt, the object is
+    created once, and it is applied. Restore the default `true` unless this is the desired policy.
+14. Confirm the original Discord upload message is removed only after every file succeeds or
    resolves as a Paperless duplicate.
-9. Upload the same synthetic file again in a separate Discord message. Confirm the assistant sends
+15. Upload the same synthetic file again in a separate Discord message. Confirm the assistant sends
    it again and Paperless owns duplicate handling.
 
 ### Failure and recovery
@@ -493,7 +528,7 @@ Only after the normal tests pass and Paperless Tika/Gotenberg are known to work:
   Application Configuration database values override environment values.
 - Keep the assistant's `PAPERLESS_AI_SUGGESTIONS_TIMEOUT_SECONDS` above Paperless's
   `PAPERLESS_AI_LLM_REQUEST_TIMEOUT`.
-- **Reload Review** may return Paperless's cached LLM proposal. Paperless 3.0.4 invalidates it when
+- **Refresh** may return Paperless's cached LLM proposal. Paperless 3.0.4 invalidates it when
   the document changes; the assistant deliberately does not add a temporary tag or otherwise
   mutate the document merely to force another LLM request.
 - Inspect the assistant server log for `paperless_request_failed`; Discord intentionally shows a

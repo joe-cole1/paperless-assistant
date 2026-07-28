@@ -1052,3 +1052,104 @@ async def test_apply_suggestions(
     gateway.documents[7] = replace(gateway.documents[7], modified=None)
     with pytest.raises(StaleSuggestionError):
         await ingestion.apply_suggestions(job, updates, expected_modified=None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("setting_name", "updates"),
+    [
+        ("allow_edit_title", DocumentUpdate(title="Disabled")),
+        ("allow_edit_date", DocumentUpdate(created=date(2026, 7, 30))),
+        ("allow_edit_correspondent", DocumentUpdate(correspondent_id=2)),
+        ("allow_edit_document_type", DocumentUpdate(document_type_id=3)),
+        ("allow_edit_storage_path", DocumentUpdate(storage_path_id=4)),
+        ("allow_edit_tags", DocumentUpdate(tag_ids=(5,))),
+    ],
+)
+async def test_apply_suggestions_rejects_server_disabled_fields(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+    setting_name: str,
+    updates: DocumentUpdate,
+) -> None:
+    settings = settings_factory(
+        data_dir=tmp_path / setting_name,
+        **{setting_name: False},
+    )
+    _, _, ingestion = await _services(settings, FakeGateway())
+
+    class FakeCreds:
+        async def get_user_token(self, user_id: int) -> str:
+            return "token"
+
+    ingestion._credentials = FakeCreds()  # type: ignore[assignment]
+    job = IngestionJob(
+        id=uuid4(),
+        discord_message_id=1,
+        discord_attachment_id=2,
+        principal_id=201,
+        staged_path=Path("synthetic.pdf"),
+        original_filename="synthetic.pdf",
+        caption="",
+        paperless_document_id=DocumentId(7),
+        media_type="application/pdf",
+        office_dependent=False,
+        guidance=MetadataGuidance(),
+    )
+
+    with pytest.raises(PaperlessUnavailableError, match="field editing is disabled"):
+        await ingestion.apply_suggestions(
+            job,
+            updates,
+            expected_modified=datetime(2026, 7, 28, tzinfo=UTC),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("setting_name", "kind"),
+    [
+        ("allow_edit_tags", TaxonomyKind.TAG),
+        ("allow_edit_correspondent", TaxonomyKind.CORRESPONDENT),
+        ("allow_edit_document_type", TaxonomyKind.DOCUMENT_TYPE),
+        ("allow_edit_storage_path", TaxonomyKind.STORAGE_PATH),
+    ],
+)
+async def test_taxonomy_resolution_rejects_server_disabled_fields(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+    setting_name: str,
+    kind: TaxonomyKind,
+) -> None:
+    settings = settings_factory(
+        data_dir=tmp_path / setting_name,
+        **{setting_name: False},
+    )
+    _, _, ingestion = await _services(settings, FakeGateway())
+
+    class FakeCreds:
+        async def get_user_token(self, user_id: int) -> str:
+            return "token"
+
+    ingestion._credentials = FakeCreds()  # type: ignore[assignment]
+    job = IngestionJob(
+        id=uuid4(),
+        discord_message_id=1,
+        discord_attachment_id=2,
+        principal_id=201,
+        staged_path=Path("synthetic.pdf"),
+        original_filename="synthetic.pdf",
+        caption="",
+        paperless_document_id=DocumentId(7),
+        media_type="application/pdf",
+        office_dependent=False,
+        guidance=MetadataGuidance(),
+    )
+
+    with pytest.raises(PaperlessUnavailableError, match="field editing is disabled"):
+        await ingestion.resolve_or_create_taxonomy(
+            job,
+            kind,
+            "Disabled",
+            confirm_create=True,
+        )
