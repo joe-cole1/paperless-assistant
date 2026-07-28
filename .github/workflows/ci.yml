@@ -29,7 +29,7 @@ jobs:
       - name: Run the local quality gate
         run: ./scripts/quality_checks.sh
       - name: Auto-commit formatted code
-        uses: stefanzweifel/git-auto-commit-action@v5
+        uses: stefanzweifel/git-auto-commit-action@v7
         if: always()
         with:
           commit_message: "style: auto-format code"
