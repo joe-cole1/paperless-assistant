@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import date
 from pathlib import Path
 from typing import Any, cast
@@ -16,15 +16,32 @@ from pydantic import SecretStr
 from paperless_assistant.config import Settings
 from paperless_assistant.errors import (
     AmbiguousSubmissionError,
+    PaperlessAIConfigurationError,
+    PaperlessAIDisabledError,
+    PaperlessAITimeoutError,
+    PaperlessAITransportError,
     PaperlessAuthenticationError,
+    PaperlessPermissionError,
     PaperlessUnavailableError,
 )
-from paperless_assistant.models import DocumentId, DocumentUpdate, MetadataGuidance, TaskState
+from paperless_assistant.models import (
+    DocumentId,
+    DocumentUpdate,
+    MetadataGuidance,
+    SuggestedDate,
+    TaskState,
+    TaxonomyItem,
+    TaxonomyKind,
+)
 from paperless_assistant.paperless import (
     CHAT_METADATA_DELIMITER,
     HttpPaperlessGateway,
     _document,
+    _integer_tuple,
+    _operation,
     _parse_date,
+    _parse_datetime,
+    _string_tuple,
     parse_chat_response,
 )
 
@@ -38,6 +55,22 @@ def _gateway(
         transport=httpx.MockTransport(handler),
     )
     return HttpPaperlessGateway(settings_factory(), client)
+
+
+def _json_response(value: object) -> Callable[[httpx.Request], httpx.Response]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, json=value)
+
+    return handler
+
+
+def _fixed_response(value: httpx.Response) -> Callable[[httpx.Request], httpx.Response]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return value
+
+    return handler
 
 
 def test_parse_chat_response_trailer_and_malformed_metadata() -> None:
@@ -62,6 +95,15 @@ def test_document_payload_validation_and_dates() -> None:
         _document([])
     with pytest.raises(PaperlessUnavailableError, match="malformed document"):
         _document({"id": "7", "title": 8})
+    with pytest.raises(PaperlessUnavailableError, match="malformed document"):
+        _document({"id": 7, "title": "Synthetic", "correspondent": "bad"})
+    assert _parse_datetime("2026-07-28T12:00:00") is not None
+    assert _parse_datetime("invalid") is None
+    assert _operation(httpx.Response(500)) == "paperless_request"
+    with pytest.raises(PaperlessUnavailableError, match="malformed"):
+        _integer_tuple({"values": "bad"}, "values")
+    with pytest.raises(PaperlessUnavailableError, match="malformed"):
+        _string_tuple({"values": [1]}, "values")
 
 
 @pytest.mark.asyncio
@@ -200,6 +242,74 @@ async def test_taxonomy_pagination(settings_factory: Callable[..., Settings]) ->
 
 
 @pytest.mark.asyncio
+async def test_taxonomy_capabilities_lookup_and_creation(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    requests: list[tuple[str, str, dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content) if request.content else {}
+        requests.append((request.method, request.url.path, payload))
+        if request.url.path == "/api/ui_settings/":
+            return httpx.Response(
+                200,
+                json={
+                    "permissions": [
+                        "add_tag",
+                        "add_correspondent",
+                        "add_documenttype",
+                        "add_storagepath",
+                    ]
+                },
+            )
+        if request.url.path == "/api/tags/" and request.method == "GET":
+            assert request.url.params["name__iexact"] == "Household"
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"id": 7, "name": "HOUSEHOLD"},
+                        {"id": 8, "name": "Other"},
+                    ]
+                },
+            )
+        if request.url.path == "/api/tags/" and request.method == "POST":
+            return httpx.Response(201, json={"id": 9, "name": payload["name"]})
+        if request.url.path == "/api/storage_paths/" and request.method == "POST":
+            return httpx.Response(201, json={"id": 10, "name": payload["name"]})
+        raise AssertionError(request.url)
+
+    gateway = _gateway(settings_factory, handler)
+    capabilities = await gateway.get_taxonomy_capabilities()
+    matches = await gateway.find_taxonomy_items(TaxonomyKind.TAG, "Household")
+    tag = await gateway.create_taxonomy_item(TaxonomyKind.TAG, "New Tag")
+    storage = await gateway.create_taxonomy_item(
+        TaxonomyKind.STORAGE_PATH,
+        "Personal",
+        storage_path="Personal/{created_year}",
+    )
+
+    assert capabilities.add_tags
+    assert capabilities.add_correspondents
+    assert capabilities.add_document_types
+    assert capabilities.add_storage_paths
+    assert matches == (TaxonomyItem(7, "HOUSEHOLD"),)
+    assert tag == TaxonomyItem(9, "New Tag")
+    assert storage == TaxonomyItem(10, "Personal")
+    assert ("POST", "/api/tags/", {"name": "New Tag", "matching_algorithm": 0, "match": ""}) in (
+        requests
+    )
+    assert (
+        "POST",
+        "/api/storage_paths/",
+        {"name": "Personal", "path": "Personal/{created_year}"},
+    ) in requests
+
+    with pytest.raises(ValueError, match="storage_path"):
+        await gateway.create_taxonomy_item(TaxonomyKind.STORAGE_PATH, "Missing")
+
+
+@pytest.mark.asyncio
 async def test_upload_task_note_and_download(
     tmp_path: Path,
     settings_factory: Callable[..., Settings],
@@ -313,6 +423,34 @@ async def test_sanitized_error_boundaries(
         '{"detail":"bad\\nrequest Token [REDACTED]","token":[REDACTED]}'
     )
     assert cast(Any, record).operation == "GET /api/documents/{id}/"
+
+    forbidden = _gateway(settings_factory, lambda _: httpx.Response(403, text="Forbidden"))
+    with pytest.raises(PaperlessPermissionError):
+        await forbidden.get_document(1)
+
+    class UnreadStream(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield b"x"
+            yield b"x" * 5000
+
+    unread = httpx.Response(
+        500,
+        stream=UnreadStream(),
+        request=httpx.Request("GET", "http://paperless.test/api/documents/1/"),
+    )
+    await HttpPaperlessGateway._log_error_response(unread)
+
+    class EmptyUnreadStream(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            if False:
+                yield b""
+
+    empty_unread = httpx.Response(
+        500,
+        stream=EmptyUnreadStream(),
+        request=httpx.Request("GET", "http://paperless.test/api/documents/1/"),
+    )
+    await HttpPaperlessGateway._log_error_response(empty_unread)
     assert "mustnotlog123" not in caplog.text
 
     malformed = _gateway(settings_factory, lambda _: httpx.Response(200, text="not json"))
@@ -519,27 +657,42 @@ async def test_get_ai_suggestions(settings_factory: Callable[..., Settings]) -> 
                 },
             )
         if request.url.path == "/api/documents/8/ai_suggestions/":
-            return httpx.Response(400, json={"ai": ["AI is required for this feature"]})
+            return httpx.Response(400, text="AI is required for this feature")
+        if request.url.path == "/api/documents/9/ai_suggestions/":
+            return httpx.Response(400, json={"ai": ["Invalid AI configuration."]})
         if "10" in request.url.path:
             raise httpx.ConnectError("connection refused")
+        if request.url.path == "/api/documents/11/ai_suggestions/":
+            return httpx.Response(503, json={"ai": ["AI backend request timed out."]})
+        if request.url.path == "/api/documents/12/ai_suggestions/":
+            raise httpx.ReadTimeout("synthetic timeout", request=request)
         return httpx.Response(404)
 
     gateway = _gateway(settings_factory, handler)
     suggestions = await gateway.get_ai_suggestions(7)
     assert suggestions.title == "Suggested Title"
-    assert suggestions.correspondent_id == 1
-    assert suggestions.document_type_id is None
-    assert suggestions.storage_path_id == 5
+    assert suggestions.correspondent_ids == (1,)
+    assert suggestions.document_type_ids == ()
+    assert suggestions.storage_path_ids == (5,)
     assert suggestions.tag_ids == (2, 3)
-    assert suggestions.dates == (date(2026, 7, 28),)
+    assert suggestions.dates == (
+        SuggestedDate("2026-07-28", date(2026, 7, 28)),
+        SuggestedDate("not-a-date", None),
+    )
     assert suggestions.suggested_tags == ("New Tag",)
     assert suggestions.suggested_correspondents == ("New Person",)
 
-    with pytest.raises(PaperlessUnavailableError, match="request failed"):
+    with pytest.raises(PaperlessAIDisabledError, match="disabled"):
         await gateway.get_ai_suggestions(8)
+    with pytest.raises(PaperlessAIConfigurationError, match="configuration"):
+        await gateway.get_ai_suggestions(9)
 
-    with pytest.raises(PaperlessUnavailableError, match="unavailable"):
+    with pytest.raises(PaperlessAITransportError, match="transport"):
         await gateway.get_ai_suggestions(10)
+    with pytest.raises(PaperlessAITimeoutError, match="backend timed out"):
+        await gateway.get_ai_suggestions(11)
+    with pytest.raises(PaperlessAITimeoutError, match="timed out"):
+        await gateway.get_ai_suggestions(12)
 
 
 @pytest.mark.asyncio
@@ -584,3 +737,109 @@ async def test_update_document(settings_factory: Callable[..., Settings]) -> Non
 
     with pytest.raises(PaperlessUnavailableError, match="unavailable"):
         await gateway.update_document(10, updates)
+
+
+@pytest.mark.asyncio
+async def test_modify_document_tags_uses_bulk_edit(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    payload: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal payload
+        assert request.url.path == "/api/documents/bulk_edit/"
+        payload = json.loads(request.content)
+        return httpx.Response(200, json={})
+
+    gateway = _gateway(settings_factory, handler)
+    await gateway.modify_document_tags(7, add_tag_ids=())
+    assert payload == {}
+
+    await gateway.modify_document_tags(7, add_tag_ids=(2, 3), remove_tag_ids=(4,))
+    assert payload == {
+        "documents": [7],
+        "method": "modify_tags",
+        "parameters": {"add_tags": [2, 3], "remove_tags": [4]},
+    }
+
+
+@pytest.mark.asyncio
+async def test_new_taxonomy_endpoint_failures_are_fail_closed(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    def transport_error(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("synthetic", request=request)
+
+    network = _gateway(settings_factory, transport_error)
+    with pytest.raises(PaperlessUnavailableError, match="capabilities unavailable"):
+        await network.get_taxonomy_capabilities()
+    with pytest.raises(PaperlessUnavailableError, match="lookup unavailable"):
+        await network.find_taxonomy_items(TaxonomyKind.TAG, "Synthetic")
+    with pytest.raises(PaperlessUnavailableError, match="creation unavailable"):
+        await network.create_taxonomy_item(TaxonomyKind.TAG, "Synthetic")
+    with pytest.raises(PaperlessUnavailableError, match="document unavailable"):
+        await network.get_document_tag_ids(7)
+    with pytest.raises(PaperlessUnavailableError, match="documents unavailable"):
+        await network.get_documents_tag_ids((7,))
+    with pytest.raises(PaperlessUnavailableError, match="tag update unavailable"):
+        await network.modify_document_tags(7, add_tag_ids=(1,))
+
+    for capability_payload in ({}, {"permissions": "bad"}, {"permissions": [1]}):
+        malformed = _gateway(settings_factory, _json_response(capability_payload))
+        with pytest.raises(PaperlessUnavailableError, match="capabilities"):
+            await malformed.get_taxonomy_capabilities()
+
+    for lookup_payload in (
+        {},
+        {"results": "bad"},
+        {"results": ["bad"]},
+        {"results": [{"id": "bad", "name": 1}]},
+    ):
+        malformed = _gateway(settings_factory, _json_response(lookup_payload))
+        with pytest.raises(PaperlessUnavailableError, match="lookup"):
+            await malformed.find_taxonomy_items(TaxonomyKind.TAG, "Synthetic")
+
+    for creation_response in (
+        httpx.Response(200, text="not-json"),
+        httpx.Response(200, json=[]),
+        httpx.Response(200, json={"id": "bad", "name": 1}),
+    ):
+        malformed = _gateway(settings_factory, _fixed_response(creation_response))
+        with pytest.raises(PaperlessUnavailableError, match="taxonomy creation"):
+            await malformed.create_taxonomy_item(TaxonomyKind.TAG, "Synthetic")
+
+    for document_response in (
+        httpx.Response(200, text="not-json"),
+        httpx.Response(200, json=[]),
+    ):
+        malformed = _gateway(settings_factory, _fixed_response(document_response))
+        with pytest.raises(PaperlessUnavailableError, match="document"):
+            await malformed.get_document_tag_ids(7)
+
+    for batch_payload in (
+        {},
+        {"results": "bad"},
+        {"results": ["bad"]},
+        {"results": [{"id": 999, "tags": []}]},
+    ):
+        malformed = _gateway(settings_factory, _json_response(batch_payload))
+        with pytest.raises(PaperlessUnavailableError, match="document"):
+            await malformed.get_documents_tag_ids((7,))
+
+
+@pytest.mark.asyncio
+async def test_ai_suggestion_malformed_and_generic_failures(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    responses = (
+        httpx.Response(400, text="different bad request"),
+        httpx.Response(503, text="not-json"),
+        httpx.Response(503, json={"detail": "proxy unavailable"}),
+        httpx.Response(200, text="not-json"),
+        httpx.Response(200, json=[]),
+        httpx.Response(200, json={"title": 7}),
+    )
+    for response in responses:
+        gateway = _gateway(settings_factory, _fixed_response(response))
+        with pytest.raises(PaperlessUnavailableError):
+            await gateway.get_ai_suggestions(7)

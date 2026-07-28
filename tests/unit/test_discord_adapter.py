@@ -21,15 +21,22 @@ from paperless_assistant.discord_adapter import (
     AISuggestionsView,
     DiscordAssistant,
     DismissButton,
+    _bounded_lines,
+    _close_existing_items,
+    _ConfirmTaxonomyCreationView,
     _document_embed,
     _is_delivery_request,
     _is_follow_up,
+    _MetadataOverflowView,
+    _MetadataPageSelect,
+    _MetadataSelect,
     _result_view,
 )
 from paperless_assistant.errors import (
     InvalidAttachmentError,
     PaperlessUnavailableError,
     RateLimitedError,
+    StaleSuggestionError,
     UnlinkedUserError,
 )
 from paperless_assistant.models import (
@@ -44,10 +51,15 @@ from paperless_assistant.models import (
     JobState,
     MetadataGuidance,
     ReferenceContext,
+    SuggestedDate,
+    SuggestionReview,
+    SuggestionSelection,
     Taxonomy,
+    TaxonomyCapabilities,
     TaxonomyItem,
+    TaxonomyKind,
 )
-from paperless_assistant.services import IngestionOutcome, QueryResponse
+from paperless_assistant.services import IngestionOutcome, IngestionService, QueryResponse
 
 
 class FakeChannel:
@@ -242,6 +254,7 @@ class FakeIngestion:
         self.office_dependent = False
         self.last_stage_kwargs: dict[str, Any] = {}
         self.warning_marker: tuple[int, datetime] | None = None
+        self.suggestions_error: Exception | None = None
 
     async def stage(self, **kwargs: Any) -> IngestionJob | None:
         self.last_stage_kwargs = kwargs
@@ -326,22 +339,22 @@ class FakeIngestion:
     async def clear_warning(self) -> None:
         self.warning_marker = None
 
-    async def get_suggestions_for_job(
-        self, job: IngestionJob, *args: Any, **kwargs: Any
-    ) -> AISuggestions | None:
-        return getattr(
+    async def get_suggestion_review(self, job: IngestionJob) -> SuggestionReview | None:
+        if self.suggestions_error:
+            raise self.suggestions_error
+        suggestions = getattr(
             self,
             "suggestions",
-            AISuggestions(title="Fake Title", correspondent_id=1, document_type_id=1, tag_ids=(2,)),
+            AISuggestions(
+                title="Fake Title",
+                correspondent_ids=(1,),
+                document_type_ids=(1,),
+                tag_ids=(2,),
+            ),
         )
-
-    async def reload_suggestions_for_job(
-        self, job: IngestionJob
-    ) -> tuple[Document, AISuggestions] | None:
-        suggestions = await self.get_suggestions_for_job(job)
         if suggestions is None:
             return None
-        return (
+        return SuggestionReview(
             Document(
                 DocumentId(job.paperless_document_id or 44),
                 "Reloaded",
@@ -349,7 +362,26 @@ class FakeIngestion:
                 modified=datetime(2026, 7, 29, tzinfo=UTC),
             ),
             suggestions,
+            FakeTaxonomy().snapshot,
+            TaxonomyCapabilities(True, True, True, True),
         )
+
+    @staticmethod
+    def initial_suggestion_selection(review: SuggestionReview) -> SuggestionSelection:
+        return IngestionService.initial_suggestion_selection(review)
+
+    async def resolve_or_create_taxonomy(
+        self,
+        job: IngestionJob,
+        kind: TaxonomyKind,
+        name: str,
+        *,
+        confirm_create: bool,
+        storage_path: str | None = None,
+    ) -> TaxonomyItem:
+        assert confirm_create
+        del job, storage_path
+        return TaxonomyItem(100 + list(TaxonomyKind).index(kind), name)
 
     async def apply_suggestions(
         self,
@@ -826,6 +858,52 @@ async def test_upload_success_duplicate_invalid_and_uncertain(
 
 
 @pytest.mark.asyncio
+async def test_upload_reports_link_and_ai_review_failures(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    settings.staging_dir.mkdir(parents=True)
+    ingestion = FakeIngestion()
+    assistant = _assistant(
+        settings,
+        FakeQuery(),
+        ingestion,
+        FakeDelivery(tmp_path),
+        FakeTaxonomy(),
+    )
+    channel = FakeChannel(settings.discord_uploads_channel_id)
+
+    ingestion.stage_error = UnlinkedUserError("synthetic")
+    unlinked_stage = FakeMessage(
+        channel=channel,
+        attachments=[FakeAttachment(1, "one.pdf", b"%PDF-1.7")],
+    )
+    await assistant._uploads_message(cast(discord.Message, unlinked_stage))
+    assert "link your Paperless" in unlinked_stage.thread.sent[0].edits[-1]["content"]
+
+    ingestion.stage_error = None
+    for index, error in enumerate(
+        (
+            PaperlessUnavailableError("synthetic"),
+            StaleSuggestionError("synthetic"),
+            UnlinkedUserError("synthetic"),
+        ),
+        start=2,
+    ):
+        ingestion.suggestions_error = error
+        message = FakeMessage(
+            channel=channel,
+            attachments=[FakeAttachment(index, f"{index}.pdf", b"%PDF-1.7")],
+        )
+        await assistant._uploads_message(cast(discord.Message, message))
+        combined = "\n".join(edit["content"] for edit in message.thread.sent[0].edits)
+        assert "AI suggestions are unavailable" in combined
+
+    await assistant.close()
+
+
+@pytest.mark.asyncio
 async def test_upload_limits_download_failures_and_rejected_submission(
     tmp_path: Path,
     settings_factory: Callable[..., Settings],
@@ -1150,7 +1228,7 @@ async def test_background_loops_lifecycle_and_ready_paths(
 
 
 @pytest.mark.asyncio
-async def test_recovery_warning_and_cleanup_edge_paths(
+async def test_recovery_warning_and_cleanup_edge_paths(  # noqa: PLR0915
     tmp_path: Path,
     settings_factory: Callable[..., Settings],
     monkeypatch: pytest.MonkeyPatch,
@@ -1191,11 +1269,48 @@ async def test_recovery_warning_and_cleanup_edge_paths(
     assert "Tika/Gotenberg" in channel.sent[-1].content
     assert "file corrupted" not in channel.sent[-1].content
 
+    not_found = discord.NotFound(
+        cast(Any, SimpleNamespace(status=404, reason="synthetic")),
+        "synthetic",
+    )
+    http_error = discord.HTTPException(
+        cast(Any, SimpleNamespace(status=500, reason="synthetic")),
+        "synthetic",
+    )
     cast(Any, assistant).get_channel = lambda _: None
     await assistant.cleanup_messages(
         (DiscordMessageTarget(settings.discord_questions_channel_id, 1),),
         (DiscordMessageTarget(settings.discord_uploads_channel_id, 2),),
     )
+
+    cleanup_targets = tuple(
+        DiscordMessageTarget(settings.discord_uploads_channel_id, value) for value in (10, 11, 12)
+    )
+    guild = SimpleNamespace(fetch_channel=AsyncMock(side_effect=not_found))
+    cast(Any, assistant).get_guild = lambda _: guild
+    assert await assistant.cleanup_messages(cleanup_targets, ()) == cleanup_targets
+
+    guild.fetch_channel = AsyncMock(side_effect=http_error)
+    assert await assistant.cleanup_messages(cleanup_targets, ()) == ()
+    guild.fetch_channel = AsyncMock(return_value=SimpleNamespace())
+    assert await assistant.cleanup_messages(cleanup_targets, ()) == ()
+
+    deletes = (
+        AsyncMock(side_effect=not_found),
+        AsyncMock(side_effect=http_error),
+        AsyncMock(),
+    )
+    original_partial_message = channel.get_partial_message
+    delete_iterator = iter(deletes)
+    cast(Any, channel).get_partial_message = lambda _identifier: SimpleNamespace(
+        delete=next(delete_iterator)
+    )
+    guild.fetch_channel = AsyncMock(return_value=channel)
+    assert await assistant.cleanup_messages(cleanup_targets, ()) == (
+        cleanup_targets[0],
+        cleanup_targets[2],
+    )
+    cast(Any, channel).get_partial_message = original_partial_message
     await assistant._warn_missing_tag()
 
     ingestion.warning_marker = None
@@ -1208,10 +1323,6 @@ async def test_recovery_warning_and_cleanup_edge_paths(
     await assistant._warn_missing_tag()
     assert channel.partial[-1].deleted
 
-    not_found = discord.NotFound(
-        cast(Any, SimpleNamespace(status=404, reason="synthetic")),
-        "synthetic",
-    )
     ingestion.warning_marker = (20, datetime.now(tz=UTC))
     cast(Any, channel).get_partial_message = lambda identifier: cast(
         Any,
@@ -1220,10 +1331,6 @@ async def test_recovery_warning_and_cleanup_edge_paths(
     await assistant._clear_missing_tag_warning()
     assert ingestion.warning_marker is None
 
-    http_error = discord.HTTPException(
-        cast(Any, SimpleNamespace(status=500, reason="synthetic")),
-        "synthetic",
-    )
     ingestion.warning_marker = (21, datetime.now(tz=UTC))
     cast(Any, channel).get_partial_message = lambda identifier: cast(
         Any,
@@ -1519,6 +1626,32 @@ async def test_auth_link_and_unlink_commands(
     assert "No linked Paperless" in interaction_unlink_again.followup.send.call_args[0][0]
     await assistant.close()
 
+    gateway_only = DiscordAssistant(
+        settings,
+        cast(Any, FakeQuery()),
+        cast(Any, FakeIngestion()),
+        cast(Any, FakeDelivery(tmp_path)),
+        cast(Any, FakeTaxonomy(ready=True)),
+        paperless_gateway=cast(Any, gateway),
+        ready_callback=lambda _: None,
+    )
+    gateway_only_group = gateway_only.tree.get_command("auth")
+    assert isinstance(gateway_only_group, discord.app_commands.Group)
+    gateway_only_link = gateway_only_group.get_command("link")
+    gateway_only_unlink = gateway_only_group.get_command("unlink")
+    assert isinstance(gateway_only_link, discord.app_commands.Command)
+    assert isinstance(gateway_only_unlink, discord.app_commands.Command)
+    link_without_store = AsyncMock(user=SimpleNamespace(id=9999))
+    await cast(Any, gateway_only_link.callback)(
+        cast(discord.Interaction, link_without_store),
+        token="valid-token",  # noqa: S106
+    )
+    assert "securely linked" in link_without_store.followup.send.call_args.args[0]
+    unlink_without_store = AsyncMock(user=SimpleNamespace(id=9999))
+    await cast(Any, gateway_only_unlink.callback)(cast(discord.Interaction, unlink_without_store))
+    assert "No linked" in unlink_without_store.followup.send.call_args.args[0]
+    await gateway_only.close()
+
 
 @pytest.mark.asyncio
 async def test_auth_status_command(
@@ -1581,6 +1714,24 @@ async def test_auth_status_command(
     assert "rejected by Paperless" in interaction_revoked.followup.send.call_args[0][0]
     await assistant.close()
 
+    credentials_only = DiscordAssistant(
+        settings,
+        cast(Any, FakeQuery()),
+        cast(Any, FakeIngestion()),
+        cast(Any, FakeDelivery(tmp_path)),
+        cast(Any, FakeTaxonomy(ready=True)),
+        credentials=creds,
+        ready_callback=lambda _: None,
+    )
+    credentials_only_group = credentials_only.tree.get_command("auth")
+    assert isinstance(credentials_only_group, discord.app_commands.Group)
+    credentials_only_status = credentials_only_group.get_command("status")
+    assert isinstance(credentials_only_status, discord.app_commands.Command)
+    without_gateway = AsyncMock(user=SimpleNamespace(id=9999))
+    await cast(Any, credentials_only_status.callback)(cast(discord.Interaction, without_gateway))
+    assert "rejected by Paperless" in without_gateway.followup.send.call_args.args[0]
+    await credentials_only.close()
+
 
 @pytest.mark.asyncio
 async def test_auth_commands_unauthorized_user(
@@ -1611,6 +1762,13 @@ async def test_auth_commands_unauthorized_user(
     assert isinstance(unlink_cmd, discord.app_commands.Command)
     assert isinstance(status_cmd, discord.app_commands.Command)
     assert isinstance(clean_cmd, discord.app_commands.Command)
+
+    no_gateway_link = AsyncMock(user=SimpleNamespace(id=201))
+    await cast(Any, link_cmd.callback)(
+        cast(discord.Interaction, no_gateway_link),
+        token="synthetic",  # noqa: S106
+    )
+    assert "rejected" in no_gateway_link.followup.send.call_args.args[0]
 
     interaction_unauth = AsyncMock(user=SimpleNamespace(id=9999))
     await cast(Any, clean_cmd.callback)(cast(discord.Interaction, interaction_unauth), 10)
@@ -1690,7 +1848,7 @@ async def test_unlinked_user_responses(
 
 
 @pytest.mark.asyncio
-async def test_ai_suggestions_view_interactions(
+async def test_ai_suggestions_view_interactions(  # noqa: PLR0915
     tmp_path: Path,
     settings_factory: Callable[..., Settings],
 ) -> None:
@@ -1708,20 +1866,38 @@ async def test_ai_suggestions_view_interactions(
         office_dependent=False,
         guidance=MetadataGuidance((), None, None),
     )
-    document = Document(DocumentId(7), "Synthetic", date(2024, 1, 2))
+    document = Document(
+        DocumentId(7),
+        "Synthetic",
+        date(2024, 1, 2),
+        modified=datetime(2026, 7, 28, tzinfo=UTC),
+    )
     suggestions = AISuggestions(
-        title="Suggested", correspondent_id=1, document_type_id=1, tag_ids=(2, 3, 99)
+        title="Suggested",
+        correspondent_ids=(1,),
+        document_type_ids=(1,),
+        tag_ids=(2, 3, 99),
+        dates=(SuggestedDate("2026-07-28", date(2026, 7, 28)),),
+        suggested_tags=("New Tag",),
+    )
+    review = SuggestionReview(
+        document,
+        suggestions,
+        FakeTaxonomy().snapshot,
+        TaxonomyCapabilities(True, True, True, True),
     )
 
     ingestion = FakeIngestion()
     ingestion.apply_suggestions = AsyncMock()  # type: ignore[method-assign]
 
-    view = AISuggestionsView(job, document, suggestions, cast(Any, ingestion), 900)
+    view = AISuggestionsView(job, review, cast(Any, ingestion), 900)
 
     # Cross-user interactions are rejected before Discord dispatches a button callback.
     unauth_interaction = AsyncMock(user=SimpleNamespace(id=999))
     assert not await view.interaction_check(unauth_interaction)
     assert "Only the user who uploaded" in unauth_interaction.response.send_message.call_args[0][0]
+    assert await view.interaction_check(AsyncMock(user=SimpleNamespace(id=201)))
+    assert view._selected_option_values(TaxonomyKind.CORRESPONDENT) == ("id:1",)
 
     # Authorized approve
     auth_interaction = AsyncMock(user=SimpleNamespace(id=201))
@@ -1752,9 +1928,19 @@ async def test_ai_suggestions_view_interactions(
     await modal.on_submit(modal_submit_interaction)
     assert view.current_title == "User Edited Title"
     assert (
-        modal_submit_interaction.response.edit_message.call_args[1]["embed"].fields[0].value
-        == "User Edited Title"
+        "User Edited Title"
+        in modal_submit_interaction.response.edit_message.call_args[1]["embed"].fields[0].value
     )
+
+    modal.date_input._value = "not-a-date"
+    invalid_date_interaction = AsyncMock()
+    await modal.on_submit(invalid_date_interaction)
+    assert "valid date" in invalid_date_interaction.response.send_message.call_args.args[0]
+    modal.date_input._value = ""
+
+    unauthorized_modal = AsyncMock(user=SimpleNamespace(id=999))
+    await modal.on_submit(unauthorized_modal)
+    assert "Only the uploader" in unauthorized_modal.response.send_message.call_args.args[0]
 
     # Cancel authorized
     cancel_interaction = AsyncMock(user=SimpleNamespace(id=201))
@@ -1763,13 +1949,30 @@ async def test_ai_suggestions_view_interactions(
     cancel_interaction.message.delete.assert_called_once()
 
     # Unexpected application failures stay generic.
-    error_view = AISuggestionsView(job, document, suggestions, cast(Any, ingestion), 900)
+    error_view = AISuggestionsView(job, review, cast(Any, ingestion), 900)
     ingestion.apply_suggestions.side_effect = Exception("Test Error")
     auth_interaction_err = AsyncMock(
         user=SimpleNamespace(id=201), message=SimpleNamespace(embeds=[discord.Embed()])
     )
     await error_view.approve_button.callback(auth_interaction_err)
     assert "Test Error" not in auth_interaction_err.followup.send.call_args[0][0]
+
+    for error, expected in (
+        (StaleSuggestionError("stale"), "changed after"),
+        (UnlinkedUserError("unlinked"), "no longer linked"),
+        (PaperlessUnavailableError("unavailable"), "could not resolve"),
+    ):
+        ingestion.apply_suggestions = AsyncMock(side_effect=error)  # type: ignore[method-assign]
+        failed_view = AISuggestionsView(job, review, cast(Any, ingestion), 900)
+        failed_apply = AsyncMock(user=SimpleNamespace(id=201), message=None)
+        await failed_view.approve_button.callback(failed_apply)
+        assert expected in failed_apply.followup.send.call_args.args[0]
+
+    ingestion.apply_suggestions = AsyncMock()  # type: ignore[method-assign]
+    no_source_view = AISuggestionsView(job, review, cast(Any, ingestion), 900)
+    no_source_apply = AsyncMock()
+    await no_source_view.apply(no_source_apply, None, confirm_create=False)
+    assert "confirmed" in no_source_apply.followup.send.call_args.args[0]
 
     # Coverage: modal_submit with no message
     modal_submit_interaction_no_msg = AsyncMock(
@@ -1785,6 +1988,258 @@ async def test_ai_suggestions_view_interactions(
     await view.refresh_button.callback(auth_refresh)
     auth_refresh.message.edit.assert_called_once()
 
+    for error, expected in (
+        (StaleSuggestionError("stale"), "changed while"),
+        (UnlinkedUserError("unlinked"), "no longer linked"),
+        (PaperlessUnavailableError("unavailable"), "unavailable"),
+    ):
+        ingestion.get_suggestion_review = AsyncMock(side_effect=error)  # type: ignore[method-assign]
+        failed_refresh = AsyncMock(user=SimpleNamespace(id=201), message=None)
+        await view.refresh_button.callback(failed_refresh)
+        assert expected in failed_refresh.followup.send.call_args.args[0]
+    ingestion.get_suggestion_review = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    empty_refresh = AsyncMock(user=SimpleNamespace(id=201), message=None)
+    await view.refresh_button.callback(empty_refresh)
+    assert "cached" in empty_refresh.followup.send.call_args.args[0]
+
     # Coverage: cancel_button with no message
     cancel_interaction_no_msg = AsyncMock(user=SimpleNamespace(id=201), message=None)
     await view.cancel_button.callback(cancel_interaction_no_msg)
+
+
+@pytest.mark.asyncio
+async def test_ai_suggestion_combined_selectors_and_pagination(  # noqa: PLR0915
+    tmp_path: Path,
+) -> None:
+    job = IngestionJob(
+        id=uuid4(),
+        discord_message_id=1,
+        discord_attachment_id=2,
+        principal_id=201,
+        staged_path=tmp_path / "synthetic.pdf",
+        original_filename="synthetic.pdf",
+        caption="",
+        media_type="application/pdf",
+        office_dependent=False,
+        guidance=MetadataGuidance(),
+    )
+    taxonomy = Taxonomy(
+        tags=(
+            TaxonomyItem(2, "Existing Tag"),
+            TaxonomyItem(8, "New Tag Zero"),
+        ),
+        correspondents=(
+            TaxonomyItem(1, "Mary"),
+            TaxonomyItem(9, "Mary Smith"),
+        ),
+        document_types=(TaxonomyItem(3, "Chat Log"),),
+        storage_paths=(TaxonomyItem(4, "Personal/Chat Logs"),),
+    )
+    suggestions = AISuggestions(
+        correspondent_ids=(1,),
+        document_type_ids=(3,),
+        storage_path_ids=(4,),
+        tag_ids=(2,),
+        suggested_correspondents=("Mary Smyth",),
+        suggested_document_types=("Text Message",),
+        suggested_storage_paths=("Messages/Mary",),
+        suggested_tags=tuple(f"New Tag {index}" for index in range(30)),
+    )
+    review = SuggestionReview(
+        Document(
+            DocumentId(7),
+            "Current",
+            None,
+            modified=datetime(2026, 7, 28, tzinfo=UTC),
+            tag_ids=(2,),
+            correspondent_id=1,
+            document_type_id=3,
+            storage_path_id=4,
+        ),
+        suggestions,
+        taxonomy,
+        TaxonomyCapabilities(True, True, True, True),
+    )
+    ingestion = FakeIngestion()
+    view = AISuggestionsView(job, review, cast(Any, ingestion), 900)
+    unchanged = await view._resolve_new_selection()
+    assert unchanged == view.selection
+    selects = {item.kind: item for item in view.children if isinstance(item, _MetadataSelect)}
+
+    correspondent_options = view.options_for(TaxonomyKind.CORRESPONDENT)
+    assert [option.value for option in correspondent_options] == [
+        "keep",
+        "id:1",
+        "id:9",
+        "new:0",
+    ]
+    assert correspondent_options[1].default
+    assert not correspondent_options[-1].default
+    assert selects[TaxonomyKind.TAG].options[-1].value == "more"
+    assert "32 choices" in selects[TaxonomyKind.TAG].options[-1].label
+    assert "☐ Close existing · Mary Smith (for AI: Mary Smyth)" in str(
+        view.build_embed().fields[2].value
+    )
+
+    source_message = AsyncMock(spec=discord.Message)
+    more_interaction = AsyncMock(
+        user=SimpleNamespace(id=201),
+        message=source_message,
+    )
+    selects[TaxonomyKind.TAG]._values = ["more"]
+    await selects[TaxonomyKind.TAG].callback(more_interaction)
+    overflow = more_interaction.response.send_message.call_args.kwargs["view"]
+    assert isinstance(overflow, _MetadataOverflowView)
+    assert overflow.page_count == 2
+    assert overflow.previous_button.disabled
+    assert not overflow.next_button.disabled
+
+    other_user = AsyncMock(user=SimpleNamespace(id=999))
+    assert not await overflow.interaction_check(other_user)
+    owner = AsyncMock(user=SimpleNamespace(id=201))
+    assert await overflow.interaction_check(owner)
+
+    next_interaction = AsyncMock()
+    await overflow.next_button.callback(next_interaction)
+    assert overflow.page == 1
+    assert overflow.next_button.disabled
+    page_select = next(item for item in overflow.children if isinstance(item, _MetadataPageSelect))
+    page_select._values = ["new:29"]
+    page_interaction = AsyncMock()
+    await page_select.callback(page_interaction)
+    assert view.selection.tag_ids == (2,)
+    assert view.selection.new_tags == ("New Tag 29",)
+    source_message.edit.assert_awaited()
+
+    overflow_without_source = _MetadataOverflowView(
+        view,
+        TaxonomyKind.TAG,
+        None,
+        page=1,
+    )
+    page_without_source = next(
+        item for item in overflow_without_source.children if isinstance(item, _MetadataPageSelect)
+    )
+    page_without_source._values = ["new:29"]
+    await page_without_source.callback(AsyncMock())
+
+    previous_interaction = AsyncMock()
+    await overflow.previous_button.callback(previous_interaction)
+    assert overflow.page == 0
+    done_interaction = AsyncMock()
+    await overflow.done_button.callback(done_interaction)
+    assert done_interaction.response.edit_message.call_args.kwargs["view"] is None
+
+    scalar_select = selects[TaxonomyKind.CORRESPONDENT]
+    scalar_select._values = ["new:0"]
+    scalar_interaction = AsyncMock(message=source_message)
+    await scalar_select.callback(scalar_interaction)
+    assert view.selection.correspondent_id is None
+    assert view.selection.new_correspondents == ("Mary Smyth",)
+
+    no_message_select = next(
+        item
+        for item in view.children
+        if isinstance(item, _MetadataSelect) and item.kind is TaxonomyKind.CORRESPONDENT
+    )
+    no_message_select._values = ["keep"]
+    no_message_interaction = AsyncMock(message=None)
+    await no_message_select.callback(no_message_interaction)
+    no_message_interaction.response.defer.assert_awaited_once()
+
+    view.update_selection(TaxonomyKind.DOCUMENT_TYPE, ("new:0",))
+    view.update_selection(TaxonomyKind.STORAGE_PATH, ("new:0",))
+    assert view.selection.new_document_types == ("Text Message",)
+    assert view.selection.new_storage_paths == ("Messages/Mary",)
+    assert view._selected_option_values(TaxonomyKind.DOCUMENT_TYPE) == ("new:0",)
+    assert view._selected_option_values(TaxonomyKind.TAG) == ("id:2", "new:29")
+    view.update_selection(TaxonomyKind.TAG, ("id:2", "id:8", "new:29"))
+    assert "☑ Close existing · New Tag Zero (for AI: New Tag 0)" in str(
+        view.build_embed().fields[5].value
+    )
+
+    assert _bounded_lines(()) == "None"
+    assert _bounded_lines(("x" * 1100,)).endswith("…")
+    close = _close_existing_items(
+        ("Mary Smit", "Mary Smith"),
+        taxonomy.correspondents,
+        (),
+    )
+    assert close == ((TaxonomyItem(9, "Mary Smith"), "Mary Smith"),)
+    assert _close_existing_items(
+        ("Mary Smith", "Mary Smit"),
+        taxonomy.correspondents,
+        (),
+    ) == ((TaxonomyItem(9, "Mary Smith"), "Mary Smith"),)
+
+
+@pytest.mark.asyncio
+async def test_ai_new_taxonomy_requires_second_confirmation(tmp_path: Path) -> None:
+    job = IngestionJob(
+        id=uuid4(),
+        discord_message_id=1,
+        discord_attachment_id=2,
+        principal_id=201,
+        staged_path=tmp_path / "synthetic.pdf",
+        original_filename="synthetic.pdf",
+        caption="",
+        media_type="application/pdf",
+        office_dependent=False,
+        guidance=MetadataGuidance(),
+    )
+    review = SuggestionReview(
+        Document(
+            DocumentId(7),
+            "Current",
+            date(2026, 7, 1),
+            modified=datetime(2026, 7, 28, tzinfo=UTC),
+        ),
+        AISuggestions(
+            suggested_correspondents=("Abby",),
+            suggested_document_types=("Text Message",),
+            suggested_storage_paths=("Messages/Mary",),
+            suggested_tags=("new-topic",),
+        ),
+        Taxonomy((), (), (), ()),
+        TaxonomyCapabilities(True, True, True, True),
+    )
+    ingestion = FakeIngestion()
+    ingestion.apply_suggestions = AsyncMock()  # type: ignore[method-assign]
+    ingestion.resolve_or_create_taxonomy = AsyncMock(  # type: ignore[method-assign]
+        side_effect=(
+            TaxonomyItem(101, "new-topic"),
+            TaxonomyItem(102, "Abby"),
+            TaxonomyItem(103, "Text Message"),
+            TaxonomyItem(104, "Messages/Mary"),
+        )
+    )
+    view = AISuggestionsView(job, review, cast(Any, ingestion), 900)
+    view.update_selection(TaxonomyKind.TAG, ("new:0",))
+    view.update_selection(TaxonomyKind.CORRESPONDENT, ("new:0",))
+    view.update_selection(TaxonomyKind.DOCUMENT_TYPE, ("new:0",))
+    view.update_selection(TaxonomyKind.STORAGE_PATH, ("new:0",))
+
+    source_message = AsyncMock(spec=discord.Message)
+    approve = AsyncMock(user=SimpleNamespace(id=201), message=source_message)
+    await view.approve_button.callback(approve)
+    confirmation = approve.response.send_message.call_args.kwargs["view"]
+    assert isinstance(confirmation, _ConfirmTaxonomyCreationView)
+    assert "New names" not in approve.response.send_message.call_args.args[0]
+
+    denied = AsyncMock(user=SimpleNamespace(id=999))
+    await confirmation.confirm.callback(denied)
+    denied.response.send_message.assert_awaited_once()
+
+    back = AsyncMock()
+    await confirmation.back.callback(back)
+    assert "No taxonomy" in back.response.edit_message.call_args.kwargs["content"]
+
+    confirmed = AsyncMock(user=SimpleNamespace(id=201))
+    await confirmation.confirm.callback(confirmed)
+    ingestion.apply_suggestions.assert_awaited_once()
+    updates = ingestion.apply_suggestions.call_args.args[1]
+    assert updates.tag_ids == (101,)
+    assert updates.correspondent_id == 102
+    assert updates.document_type_id == 103
+    assert updates.storage_path_id == 104
+    source_message.edit.assert_awaited_once()

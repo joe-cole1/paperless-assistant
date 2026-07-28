@@ -1,0 +1,69 @@
+services:
+  broker:
+    image: docker.io/library/redis:8.4-alpine@sha256:bd4a0d37e7cd830117ffec9329052b4a1887afa060c265e1768f82b177ff6f43
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  llm:
+    image: docker.io/library/python:3.14.6-alpine3.23@sha256:b165067c5afc37fa5608a3c05609cc3d51aafd808a30fbfd822ee594fef55ad4
+    command: ["python", "/fixture/openai_stub.py"]
+    volumes:
+      - ./openai_stub.py:/fixture/openai_stub.py:ro
+    read_only: true
+    ports:
+      - "127.0.0.1:18080:8080"
+    tmpfs:
+      - /tmp:size=8m,mode=1777,noexec,nosuid,nodev
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          assert urllib.request.urlopen('http://127.0.0.1:8080/stats',timeout=2).status == 200
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  paperless:
+    image: ghcr.io/paperless-ngx/paperless-ngx:3.0.4@sha256:3838b9a4260d23acc5bb63aed407138435e70b56e5806f4baa350ca184e57582
+    depends_on:
+      broker:
+        condition: service_healthy
+      llm:
+        condition: service_healthy
+    environment:
+      PAPERLESS_REDIS: redis://broker:6379
+      PAPERLESS_SECRET_KEY: synthetic-integration-secret-key
+      PAPERLESS_ADMIN_USER: integration
+      PAPERLESS_ADMIN_PASSWORD: synthetic-integration-password
+      PAPERLESS_ADMIN_MAIL: integration@example.invalid
+      PAPERLESS_URL: http://127.0.0.1:${PAPERLESS_AI_TEST_PORT:-18765}
+      PAPERLESS_TIME_ZONE: UTC
+      PAPERLESS_OCR_LANGUAGE: eng
+      PAPERLESS_AI_ENABLED: "true"
+      PAPERLESS_AI_LLM_BACKEND: openai-like
+      PAPERLESS_AI_LLM_MODEL: synthetic-model
+      PAPERLESS_AI_LLM_API_KEY: synthetic-integration-key
+      PAPERLESS_AI_LLM_ENDPOINT: http://llm:8080/v1
+      PAPERLESS_AI_LLM_ALLOW_INTERNAL_ENDPOINTS: "true"
+      PAPERLESS_AI_LLM_REQUEST_TIMEOUT: "15"
+    ports:
+      - "127.0.0.1:${PAPERLESS_AI_TEST_PORT:-18765}:8000"
+    volumes:
+      - data:/usr/src/paperless/data
+      - media:/usr/src/paperless/media
+    tmpfs:
+      - /tmp:size=64m,mode=1777,nosuid,nodev
+
+volumes:
+  data:
+  media:

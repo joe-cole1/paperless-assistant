@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -63,7 +64,19 @@ async def test_initialize_migrates_status_message_column(tmp_path: Path) -> None
     database = tmp_path / "legacy.sqlite3"
     connection = sqlite3.connect(database)
     try:
-        connection.executescript(SCHEMA.replace("    discord_status_message_id INTEGER,\n", ""))
+        legacy_schema = SCHEMA.replace("    discord_status_message_id INTEGER,\n", "")
+        legacy_schema = legacy_schema.replace("    discord_message_channel_id INTEGER,\n", "")
+        legacy_schema = legacy_schema.replace("    discord_status_channel_id INTEGER,\n", "")
+        legacy_schema = legacy_schema.replace(
+            "    discord_message_cleaned INTEGER NOT NULL DEFAULT 0,\n",
+            "",
+        )
+        legacy_schema = legacy_schema.replace(
+            "    discord_status_message_cleaned INTEGER NOT NULL DEFAULT 0,\n",
+            "",
+        )
+        legacy_schema = legacy_schema.replace("    channel_id INTEGER,\n", "")
+        connection.executescript(legacy_schema)
     finally:
         connection.close()
 
@@ -76,6 +89,18 @@ async def test_initialize_migrates_status_message_column(tmp_path: Path) -> None
     finally:
         connection.close()
     assert "discord_status_message_id" in columns
+    assert "discord_message_channel_id" in columns
+    assert "discord_status_channel_id" in columns
+    assert "discord_message_cleaned" in columns
+    assert "discord_status_message_cleaned" in columns
+    connection = sqlite3.connect(database)
+    try:
+        question_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(question_messages)")
+        }
+    finally:
+        connection.close()
+    assert "channel_id" in question_columns
     assert await repository.get_warning_state() is None
     warning_time = datetime.now(tz=UTC)
     await repository.save_warning_state(90, warning_time)
@@ -123,6 +148,31 @@ async def test_job_idempotency_roundtrip_and_transitions(tmp_path: Path) -> None
         DiscordMessageTarget(500, 50),
     )
     assert await repository.active_succeeded_uploads() == ((upload_targets, 42),)
+    no_channel_job = replace(
+        _job(tmp_path / "no-channel", message_id=11, attachment_id=21),
+        discord_status_message_id=None,
+        discord_message_channel_id=None,
+        discord_status_channel_id=None,
+    )
+    assert await repository.create_job(no_channel_job)
+    assert await repository.transition_job(
+        no_channel_job.id,
+        JobState.STAGED,
+        JobState.SUBMITTING,
+    )
+    assert await repository.transition_job(
+        no_channel_job.id,
+        JobState.SUBMITTING,
+        JobState.SUBMITTED,
+        task_id=uuid4(),
+    )
+    assert await repository.transition_job(
+        no_channel_job.id,
+        JobState.SUBMITTED,
+        JobState.SUCCEEDED,
+        document_id=43,
+    )
+    assert ((), 43) in await repository.active_succeeded_uploads()
     assert await repository.message_job_states(10) == (JobState.SUCCEEDED,)
     assert await repository.message_job_states(999) == ()
     future = (datetime.now(tz=UTC) + timedelta(days=1)).isoformat()

@@ -15,6 +15,7 @@ and delivery decisions.
 Issue #9 established the private runtime after retiring Gemini Spark/MCP. Issue #10 added the
 outbound Discord worker, Paperless adapter, application services, and durable local state. Issue
 #65 hardens authorization, credentials, diagnostics, cleanup, CI, and Paperless 3.0.4 AI review.
+Issues #44 and #70 complete selective review, confirmed taxonomy creation, and cache validation.
 
 ## 2. System context
 
@@ -86,13 +87,14 @@ Domain and application code do not import Discord or HTTP client implementations
   routing.
 - No public application route.
 - No MCP, OAuth/JWT/JWKS, Spark, or Pangolin dependency.
-- No taxonomy creation, document delete, unrestricted metadata update, or user administration
-  operation in application code.
+- No unconfirmed taxonomy creation, document delete, unrestricted metadata update, or user
+  administration operation in application code.
 - No tokens, authorization headers, document bytes, or audit payloads containing user content.
   Discord receives only generic Paperless failures. Restricted server logs may contain a bounded,
   JSON-escaped, credential-redacted Paperless error body for operator diagnosis.
 - AI metadata writes require the original uploader, a fresh document-state check, serialized apply,
-  bounded controls, and preservation of existing tags. Unmatched taxonomy names are never created.
+  bounded controls, and preservation of existing tags. Unmatched taxonomy names require a second
+  confirmation, an exact-name race check, and a fresh Paperless `add_*` permission check.
 - Cleanup is fail-closed: Paperless batch failures do not delete Discord messages, and database
   evidence is purged only after Discord confirms deletion or absence at the exact channel/message.
 - Unsafe POST requests are never retried after an ambiguous result.
@@ -154,9 +156,11 @@ SQLite job/audit state is included according to operator policy.
 - ADR 0007: native Paperless chat and immediate durable ingestion.
 - ADR 0008: a Docker-managed volume is the zero-setup persistence default.
 - ADR 0009: fail-closed AI metadata review, diagnostics, cleanup, credentials, and CI writeback.
+- ADR 0010: complete selective AI review, confirmed taxonomy creation, and cache validation.
 
 Issue #10 is the canonical Discord MVP. Issue #20 corrects its default storage deployment. Issue
-#65 is the July 2026 hardening and AI-suggestions correction. Issue #8 remains the broader
-least-privilege Paperless permissions phase. A future inbound
+#65 is the July 2026 hardening and AI-suggestions correction. Issues #44 and #70 complete its
+review UI and Paperless 3.0.4 integration contract. Issue #8 remains the broader least-privilege
+Paperless permissions phase. A future inbound
 interface, custom AI layer, public share-link capability, or additional user population requires
 a separate issue and security review.

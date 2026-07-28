@@ -135,8 +135,16 @@ jobs:
             git apply --check "${FORMAT_PATCH}"
             git apply "${FORMAT_PATCH}"
           fi
+      - name: Install uv for the Paperless integration driver
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.11.31
+          enable-cache: true
+          cache-dependency-glob: uv.lock
       - name: Build and smoke-test Compose stack
         run: ./scripts/container_smoke_test.sh
+      - name: Verify Paperless 3.0.4 AI suggestions and cache behavior
+        run: ./scripts/paperless_ai_integration_test.sh
 
   format-writeback:
     name: Commit validated formatting

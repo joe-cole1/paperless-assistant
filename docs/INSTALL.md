@@ -249,6 +249,10 @@ Important details:
 - Each channel member links their personal Paperless account by typing `/auth link <token>` ephemerally in Discord once the bot is running.
 - The linked Paperless user must be able to view and change the uploaded document; Paperless's AI
   suggestion endpoint enforces its owner-aware `change_document` permission.
+- Matched existing metadata can be reviewed and applied with document-change permission alone.
+  Creating a selected unmatched name additionally requires the linked user to have Paperless's
+  corresponding add permission for tags, correspondents, document types, or storage paths. The
+  assistant checks for an exact existing name again before creating anything.
 - `PAPERLESS_INTERNAL_URL` must work from inside this container, not merely from the Docker host.
 - `PAPERLESS_PUBLIC_URL` must be the HTTPS browser URL your users open.
 - Do not add `Token ` before `PAPERLESS_TOKEN`; supply only the token value.
@@ -392,9 +396,11 @@ does not add another AI or try to make the result exhaustive.
    - unambiguous exact taxonomy names were applied;
    - Paperless chose the title and performed its normal classification;
    - each successful document has one note beginning `Discord upload guidance:`.
-6. For each successful document, confirm Discord shows **Paperless AI suggestions** with any
-   proposed title, correspondent, document type, storage path, date, matched tags, and unmatched
-   names.
+6. For each successful document, confirm Discord shows **AI Metadata Review** with current values
+   and every proposed title, correspondent, document type, storage path, tag, and date.
+   Paperless-matched existing objects should be selected; unmatched AI names should be unchecked.
+   Change both kinds of selections and confirm **Apply Selected** writes only those choices.
+   Selecting an unmatched name must show a separate create-and-apply confirmation.
 7. As a different allowlisted user, try an AI control and confirm it is rejected. As the uploader,
    edit and apply the proposal, then verify Paperless metadata changed while its existing tags
    remained present. Change the document in Paperless before applying another proposal and confirm
@@ -487,6 +493,9 @@ Only after the normal tests pass and Paperless Tika/Gotenberg are known to work:
   Application Configuration database values override environment values.
 - Keep the assistant's `PAPERLESS_AI_SUGGESTIONS_TIMEOUT_SECONDS` above Paperless's
   `PAPERLESS_AI_LLM_REQUEST_TIMEOUT`.
+- **Reload Review** may return Paperless's cached LLM proposal. Paperless 3.0.4 invalidates it when
+  the document changes; the assistant deliberately does not add a temporary tag or otherwise
+  mutate the document merely to force another LLM request.
 - Inspect the assistant server log for `paperless_request_failed`; Discord intentionally shows a
   generic error.
 - Embeddings are optional for per-document suggestions. Diagnose the embedding/index service only
