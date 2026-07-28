@@ -19,20 +19,20 @@ Configure two private Discord text channels:
 
 - **questions** — ask “give me John's vaccine records from 2024” or “find the receipts from our
   Venice trip.” The bot auto-creates a dedicated public thread for each query. Paperless native chat returns up to three references rendered as rich Discord embed cards inside the thread with Open, Send File, and Dismiss controls, and thread-scoped follow-up context.
-- **uploads** — attach up to ten documents. Top-level uploads auto-create a dedicated thread where
-  status updates and Paperless processing progress are reported. After consumption, the bot asks
-  Paperless 3.0.4 to run its LLM-backed suggestions and presents the proposed title,
-  correspondent, document type, storage path, date, and tags for review. Only the uploader can
-  apply them. Existing Paperless matches start selected while unmatched AI names start unchecked;
-  the uploader can change either list in clearly labeled selectors. Title has its own edit action;
-  date offers the current value, AI candidates, and a custom-date action. Applying rechecks the
-  document, preserves existing tags, and patches only selected metadata. Selected unmatched names
-  receive a second confirmation by default, followed by an exact-name check and the linked user's
-  Paperless creation permission. The persistent **Open Paperless**, **Refresh**, and
-  **Finish & Close** controls remain on the status message; refresh and close warn before
-  discarding unapplied choices. Once the configured
-  `CLEANUP_INBOX_TAG` (default `inbox`) is removed from a document in Paperless, the bot
-  automatically deletes the corresponding upload notification message and thread.
+- **uploads** — attach up to ten documents. The bot posts an immediate batch summary and creates
+  one rich metadata parent and public review thread per attachment. Each success has its own
+  Paperless link and review of title, correspondent, document type, storage path, date, and tags;
+  scalar menus identify their existing Paperless value, and the tags controls can add repeatable
+  one-at-a-time custom names. Only the uploader can save changes. Existing matches start selected,
+  unmatched names stay pending until an explicit save, and every write rechecks the document,
+  preserves existing tags, verifies permissions and freshness, and records a privacy-minimized
+  audit. Per-file **Finish & Close** archives that thread and retains its rich parent. The batch
+  summary offers **Refresh All**, **Save All**, and **Close All**; Close All closes successes but
+  never acknowledges failures. A failed item must be explicitly dismissed, while an uncertain
+  upload remains unresolved. The original upload and summary are deleted together only after all
+  successes are closed, all failures are dismissed, and no item remains active or uncertain.
+  Removing `CLEANUP_INBOX_TAG` (default `inbox`) closes the corresponding successful review and
+  applies the same batch cleanup rule.
 
 Slash commands available to users:
 
@@ -76,9 +76,11 @@ only to the private guild and grant the two configured channels:
 
 - View Channel
 - Send Messages
+- Send Messages in Threads
 - Read Message History
 - Attach Files
 - Embed Links
+- Create Public Threads
 - Manage Messages
 - Manage Threads
 
@@ -148,9 +150,11 @@ uploads, posts a bounded warning, and rechecks every five minutes; questions and
 usable. The daily warning bound survives restarts, and the recorded warning is removed when the
 tag becomes healthy.
 
-Uploads are durable in SQLite. A saved task UUID resumes polling after restart. An interrupted
-ambiguous upload POST is marked `reconciliation_required` and is never automatically repeated.
-Nightly cleanup follows the container timezone and never deletes active or reconciliation jobs.
+Uploads and their ordered per-file Discord artifacts are durable in SQLite. A saved task UUID
+resumes polling after restart and restores the matching success, failure, or uncertain review
+surface. An interrupted ambiguous upload POST is marked `reconciliation_required` and is never
+automatically repeated. Nightly cleanup and `/clean` follow the durable batch graph and never
+delete active or reconciliation artifacts.
 Paperless HTTP and task errors remain generic in Discord. Server logs include a bounded,
 control-character-safe, credential-redacted Paperless diagnostic plus operation and status code;
 they never include authorization headers.

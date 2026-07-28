@@ -19,29 +19,38 @@ from pydantic import SecretStr
 from paperless_assistant.config import Settings
 from paperless_assistant.discord_adapter import (
     AISuggestionsDateModal,
+    AISuggestionsTagModal,
     AISuggestionsTitleModal,
     AISuggestionsView,
     DiscordAssistant,
     DismissButton,
     _bounded_lines,
     _close_existing_items,
+    _ConfirmCloseAllView,
     _ConfirmCloseThreadView,
+    _ConfirmDismissFailedView,
     _ConfirmRefreshView,
+    _ConfirmSaveAllView,
     _ConfirmTaxonomyCreationView,
     _DateSelect,
     _document_embed,
+    _FailedUploadController,
+    _FailedUploadView,
     _FinishReviewButton,
     _is_delivery_request,
     _is_follow_up,
     _MetadataOverflowView,
     _MetadataPageSelect,
     _MetadataSelect,
+    _PendingUploadView,
     _RefreshReviewButton,
     _result_view,
     _ReviewActionsView,
     _ReviewThreadController,
     _ReviewThreadControlsView,
     _TitleEditView,
+    _UploadBatchController,
+    _UploadBatchControlsView,
 )
 from paperless_assistant.errors import (
     InvalidAttachmentError,
@@ -69,6 +78,10 @@ from paperless_assistant.models import (
     TaxonomyCapabilities,
     TaxonomyItem,
     TaxonomyKind,
+    UploadBatch,
+    UploadBatchSnapshot,
+    UploadItem,
+    UploadItemState,
 )
 from paperless_assistant.services import IngestionOutcome, IngestionService, QueryResponse
 
@@ -158,9 +171,20 @@ class FakeThread(discord.Thread):
     def __init__(self, parent_id: int, thread_id: int = 3500, name: str = "Thread") -> None:
         self.id = thread_id
         self.parent_id = parent_id
+        parent = FakeChannel(parent_id)
         self.name = name
         self.sent: list[FakeMessage] = []
-        self.guild = cast(discord.Guild, SimpleNamespace(id=100, filesize_limit=10 * 1024 * 1024))
+        self.guild = cast(
+            discord.Guild,
+            SimpleNamespace(
+                id=100,
+                filesize_limit=10 * 1024 * 1024,
+                get_channel=lambda identifier: parent if identifier == parent_id else None,
+            ),
+        )
+        self.archived = False
+        self.locked = False
+        self.added_users: list[Any] = []
 
     async def send(self, content: str | None = None, **kwargs: Any) -> Any:
         message = FakeMessage(
@@ -171,6 +195,16 @@ class FakeThread(discord.Thread):
         message.send_kwargs = kwargs
         self.sent.append(message)
         return message
+
+    async def edit(  # type: ignore[override]
+        self, *, archived: bool, locked: bool, reason: str
+    ) -> None:
+        assert reason
+        self.archived = archived
+        self.locked = locked
+
+    async def add_user(self, user: Any) -> None:
+        self.added_users.append(user)
 
 
 class FakeAttachment:
@@ -266,6 +300,103 @@ class FakeIngestion:
         self.last_stage_kwargs: dict[str, Any] = {}
         self.warning_marker: tuple[int, datetime] | None = None
         self.suggestions_error: Exception | None = None
+        self.upload_batch_record: UploadBatch | None = None
+        self.upload_items: dict[int, UploadItem] = {}
+        self.confirmed_cleanup: list[DiscordMessageTarget] = []
+        self.active_outcomes: tuple[IngestionOutcome, ...] = ()
+        self.active_items_for_restore: tuple[UploadItem, ...] = ()
+
+    async def create_upload_batch(
+        self,
+        batch: UploadBatch,
+        items: tuple[UploadItem, ...],
+    ) -> None:
+        self.upload_batch_record = batch
+        self.upload_items = {item.attachment_id: item for item in items}
+
+    async def update_upload_item(
+        self,
+        source_message_id: int,
+        attachment_id: int,
+        state: UploadItemState,
+        **kwargs: Any,
+    ) -> UploadBatchSnapshot:
+        assert self.upload_batch_record is not None
+        assert source_message_id == self.upload_batch_record.source_message_id
+        current = self.upload_items[attachment_id]
+        updates = {
+            key: value
+            for key, value in kwargs.items()
+            if value is not None and hasattr(current, key)
+        }
+        self.upload_items[attachment_id] = replace(current, state=state, **updates)
+        return UploadBatchSnapshot(
+            self.upload_batch_record,
+            tuple(sorted(self.upload_items.values(), key=lambda item: item.ordinal)),
+        )
+
+    async def resolve_upload_item(
+        self,
+        source_message_id: int,
+        attachment_id: int,
+        state: UploadItemState,
+    ) -> tuple[DiscordMessageTarget, ...]:
+        snapshot = await self.update_upload_item(
+            source_message_id,
+            attachment_id,
+            state,
+        )
+        return snapshot.cleanup_targets if snapshot.cleanup_ready else ()
+
+    async def confirm_upload_cleanup(
+        self,
+        targets: tuple[DiscordMessageTarget, ...],
+    ) -> None:
+        self.confirmed_cleanup.extend(targets)
+
+    async def terminal_upload_cleanup_targets(
+        self,
+    ) -> tuple[DiscordMessageTarget, ...]:
+        if self.upload_batch_record is None:
+            return ()
+        snapshot = UploadBatchSnapshot(
+            self.upload_batch_record,
+            tuple(sorted(self.upload_items.values(), key=lambda item: item.ordinal)),
+        )
+        if any(
+            item.state
+            in {
+                UploadItemState.PENDING,
+                UploadItemState.PROCESSING,
+                UploadItemState.RECONCILIATION_REQUIRED,
+            }
+            for item in snapshot.items
+        ):
+            return ()
+        return snapshot.cleanup_targets
+
+    async def upload_item_for_job(self, job_id: Any) -> UploadItem | None:
+        return next(
+            (item for item in self.upload_items.values() if item.job_id == job_id),
+            None,
+        )
+
+    async def upload_batch(self, source_message_id: int) -> UploadBatchSnapshot | None:
+        if (
+            self.upload_batch_record is None
+            or self.upload_batch_record.source_message_id != source_message_id
+        ):
+            return None
+        return UploadBatchSnapshot(
+            self.upload_batch_record,
+            tuple(sorted(self.upload_items.values(), key=lambda item: item.ordinal)),
+        )
+
+    async def active_upload_outcomes(self) -> tuple[IngestionOutcome, ...]:
+        return self.active_outcomes
+
+    async def active_upload_items(self) -> tuple[UploadItem, ...]:
+        return self.active_items_for_restore
 
     async def stage(self, **kwargs: Any) -> IngestionJob | None:
         self.last_stage_kwargs = kwargs
@@ -273,7 +404,7 @@ class FakeIngestion:
             raise self.stage_error
         if self.stage_duplicate:
             return None
-        return IngestionJob(
+        job = IngestionJob(
             id=uuid4(),
             discord_message_id=kwargs["discord_message_id"],
             discord_attachment_id=kwargs["discord_attachment_id"],
@@ -288,6 +419,14 @@ class FakeIngestion:
             caption=kwargs["caption"],
             guidance=MetadataGuidance((1,), None, None),
         )
+        if self.upload_batch_record is not None:
+            await self.update_upload_item(
+                kwargs["discord_message_id"],
+                kwargs["discord_attachment_id"],
+                UploadItemState.PENDING,
+                job_id=job.id,
+            )
+        return job
 
     async def submit(self, job: IngestionJob) -> IngestionOutcome:
         submitted = IngestionJob(
@@ -465,6 +604,14 @@ def _context(*documents: int, message_ids: tuple[int, ...] = ()) -> ReferenceCon
         tuple(DocumentId(item) for item in documents),
         datetime.now(tz=UTC) + timedelta(minutes=5),
         message_ids,
+    )
+
+
+def _latest_upload_summary(channel: FakeChannel) -> FakeMessage:
+    return next(
+        message
+        for message in reversed(channel.sent)
+        if isinstance(message.send_kwargs.get("view"), _UploadBatchControlsView)
     )
 
 
@@ -796,6 +943,49 @@ async def test_upload_guidance_missing_tag_and_partial_validation(
     assert "paused" in blocked.replies[0].content
 
     taxonomy.ingestion_ready = True
+    orphan_thread = FakeThread(channel.id)
+    orphan_thread.guild = cast(
+        discord.Guild,
+        SimpleNamespace(
+            id=100,
+            filesize_limit=10 * 1024 * 1024,
+            get_channel=lambda _: None,
+        ),
+    )
+    orphan = FakeMessage(
+        channel=cast(Any, orphan_thread),
+        attachments=[FakeAttachment(1, "orphan.pdf", b"%PDF-1.7")],
+    )
+    await assistant._uploads_message(cast(discord.Message, orphan))
+    assert "require access" in orphan.replies[0].content
+
+    bare_thread = SimpleNamespace(id=3001)
+    bare_parent = SimpleNamespace(
+        id=2001,
+        create_thread=AsyncMock(return_value=bare_thread),
+    )
+    bare_channel = SimpleNamespace(send=AsyncMock(return_value=bare_parent))
+    created_parent, created_thread = await assistant._create_upload_item_thread(
+        bare_channel,
+        ordinal=1,
+        total_items=1,
+        filename="bare.pdf",
+        parent_content="metadata",
+        uploader=SimpleNamespace(id=201),
+    )
+    assert cast(Any, created_parent) is bare_parent
+    assert cast(Any, created_thread) is bare_thread
+
+    missing_document = IngestionOutcome(_job(tmp_path, JobState.SUCCEEDED))
+    assert not await assistant._create_success_upload_review(
+        channel=channel,
+        message=cast(discord.Message, blocked),
+        outcome=missing_document,
+        ordinal=1,
+        total_items=1,
+        batch_controller=_UploadBatchController(201, 900),
+    )
+
     partial = FakeMessage(
         channel=channel,
         content="caption",
@@ -806,12 +996,19 @@ async def test_upload_guidance_missing_tag_and_partial_validation(
         ],
     )
     await assistant._uploads_message(cast(discord.Message, partial))
-    status = partial.thread.sent[0]
+    status = _latest_upload_summary(channel)
     combined = "\n".join(edit["content"] for edit in status.edits)
-    assert "too large" in combined
-    assert "staging quota" in combined
+    assert "too large" in combined.casefold()
+    assert "staging quota" in combined.casefold()
     assert "uploaded as" in combined
     assert not partial.deleted
+    assert len([message for message in channel.sent if hasattr(message, "thread")]) == 3
+    target = DiscordMessageTarget(channel.id, 42)
+    assistant.cleanup_messages = AsyncMock(return_value=())  # type: ignore[method-assign]
+    await assistant._cleanup_upload_targets((target,))
+    assistant.cleanup_messages = AsyncMock(return_value=(target,))  # type: ignore[method-assign]
+    await assistant._cleanup_upload_targets((target,))
+    assert ingestion.confirmed_cleanup[-1] == target
     await assistant.close()
 
 
@@ -837,10 +1034,16 @@ async def test_upload_success_duplicate_invalid_and_uncertain(
         attachments=[FakeAttachment(1, "one.pdf", b"%PDF-1.7")],
     )
     await assistant._uploads_message(cast(discord.Message, success))
-    assert success.deleted
-    assert ingestion.last_stage_kwargs["discord_status_message_id"] == success.thread.sent[0].id
+    status = _latest_upload_summary(channel)
+    assert not success.deleted
+    assert ingestion.last_stage_kwargs["discord_status_message_id"] == status.id
+    success_parent = next(
+        message
+        for message in reversed(channel.sent)
+        if hasattr(message, "thread") and "Paperless:" in message.content
+    )
     assert isinstance(
-        success.thread.sent[0].edits[-1]["view"],
+        success_parent.thread.sent[-1].send_kwargs["view"],
         _ReviewThreadControlsView,
     )
 
@@ -850,7 +1053,8 @@ async def test_upload_success_duplicate_invalid_and_uncertain(
         attachments=[FakeAttachment(2, "two.pdf", b"%PDF-1.7")],
     )
     await assistant._uploads_message(cast(discord.Message, duplicate))
-    assert duplicate.deleted
+    assert not duplicate.deleted
+    assert "already received" in _latest_upload_summary(channel).edits[-1]["content"]
 
     ingestion.stage_duplicate = False
     ingestion.stage_error = InvalidAttachmentError("bad signature")
@@ -859,7 +1063,7 @@ async def test_upload_success_duplicate_invalid_and_uncertain(
         attachments=[FakeAttachment(3, "three.pdf", b"bad")],
     )
     await assistant._uploads_message(cast(discord.Message, invalid))
-    assert "bad signature" in invalid.thread.sent[0].edits[-1]["content"]
+    assert "bad signature" in _latest_upload_summary(channel).edits[-1]["content"]
 
     ingestion.stage_error = None
     ingestion.submit_state = JobState.RECONCILIATION_REQUIRED
@@ -868,7 +1072,7 @@ async def test_upload_success_duplicate_invalid_and_uncertain(
         attachments=[FakeAttachment(4, "four.pdf", b"%PDF-1.7")],
     )
     await assistant._uploads_message(cast(discord.Message, uncertain))
-    assert "uncertain" in uncertain.thread.sent[0].edits[-1]["content"]
+    assert "uncertain" in _latest_upload_summary(channel).edits[-1]["content"]
     await assistant.close()
 
 
@@ -895,7 +1099,7 @@ async def test_upload_reports_link_and_ai_review_failures(
         attachments=[FakeAttachment(1, "one.pdf", b"%PDF-1.7")],
     )
     await assistant._uploads_message(cast(discord.Message, unlinked_stage))
-    assert "link your Paperless" in unlinked_stage.thread.sent[0].edits[-1]["content"]
+    assert "Link your Paperless" in _latest_upload_summary(channel).edits[-1]["content"]
 
     ingestion.stage_error = None
     for index, error in enumerate(
@@ -912,8 +1116,8 @@ async def test_upload_reports_link_and_ai_review_failures(
             attachments=[FakeAttachment(index, f"{index}.pdf", b"%PDF-1.7")],
         )
         await assistant._uploads_message(cast(discord.Message, message))
-        combined = "\n".join(edit["content"] for edit in message.thread.sent[0].edits)
-        assert "AI suggestions are unavailable" in combined
+        combined = "\n".join(edit["content"] for edit in _latest_upload_summary(channel).edits)
+        assert "AI review unavailable" in combined
 
     await assistant.close()
 
@@ -948,7 +1152,7 @@ async def test_upload_limits_download_failures_and_rejected_submission(
         ],
     )
     await assistant._uploads_message(cast(discord.Message, too_many))
-    assert "Only the first 1" in too_many.thread.sent[0].edits[-1]["content"]
+    assert "Only the first 1" in _latest_upload_summary(channel).edits[-1]["content"]
 
     actual_too_large = FakeMessage(
         channel=channel,
@@ -957,14 +1161,14 @@ async def test_upload_limits_download_failures_and_rejected_submission(
         ],
     )
     await assistant._uploads_message(cast(discord.Message, actual_too_large))
-    assert "downloaded file exceeds" in actual_too_large.thread.sent[0].edits[-1]["content"]
+    assert "downloaded file exceeds" in _latest_upload_summary(channel).edits[-1]["content"]
 
     failed_download = FakeMessage(
         channel=channel,
         attachments=[FakeAttachment(4, "failed.pdf", b"x", fail=True)],
     )
     await assistant._uploads_message(cast(discord.Message, failed_download))
-    assert "download failed" in failed_download.thread.sent[0].edits[-1]["content"]
+    assert "download failed" in _latest_upload_summary(channel).edits[-1]["content"]
 
     ingestion.submit_state = JobState.FAILED
     rejected = FakeMessage(
@@ -972,7 +1176,7 @@ async def test_upload_limits_download_failures_and_rejected_submission(
         attachments=[FakeAttachment(5, "rejected.pdf", b"%PDF")],
     )
     await assistant._uploads_message(cast(discord.Message, rejected))
-    assert "rejected" in rejected.thread.sent[0].edits[-1]["content"]
+    assert "rejected" in _latest_upload_summary(channel).edits[-1]["content"]
     await assistant.close()
 
 
@@ -1006,7 +1210,7 @@ async def test_upload_post_download_quota_and_poll_recovery_states(
         ],
     )
     await assistant._uploads_message(cast(discord.Message, quota))
-    assert "staging quota was exceeded" in quota.thread.sent[0].edits[-1]["content"]
+    assert "staging quota was exceeded" in _latest_upload_summary(channel).edits[-1]["content"]
 
     existing.unlink()
     cast(Any, ingestion).poll_until_notifiable = AsyncMock(side_effect=RuntimeError("synthetic"))
@@ -1015,7 +1219,7 @@ async def test_upload_post_download_quota_and_poll_recovery_states(
         attachments=[FakeAttachment(2, "unavailable.pdf", b"%PDF")],
     )
     await assistant._uploads_message(cast(discord.Message, unavailable))
-    assert "status unavailable" in unavailable.thread.sent[0].edits[-1]["content"]
+    assert "Status is unavailable" in _latest_upload_summary(channel).edits[-1]["content"]
 
     cast(Any, ingestion).poll_until_notifiable = AsyncMock(
         return_value=IngestionOutcome(
@@ -1028,7 +1232,7 @@ async def test_upload_post_download_quota_and_poll_recovery_states(
         attachments=[FakeAttachment(3, "pending.pdf", b"%PDF")],
     )
     await assistant._uploads_message(cast(discord.Message, timed_out))
-    assert "still processing" in timed_out.thread.sent[0].edits[-1]["content"]
+    assert "still processing" in _latest_upload_summary(channel).edits[-1]["content"]
     await assistant.close()
 
 
@@ -1069,8 +1273,9 @@ async def test_office_task_failure_includes_setup_guidance(
 
     await assistant._uploads_message(cast(discord.Message, message))
 
-    assert "Tika/Gotenberg" in message.thread.sent[0].edits[-1]["content"]
-    assert "macro detected" not in message.thread.sent[0].edits[-1]["content"]
+    status_content = _latest_upload_summary(message.channel).edits[-1]["content"]
+    assert "Tika/Gotenberg" in status_content
+    assert "macro detected" not in status_content
     await assistant.close()
 
 
@@ -1186,6 +1391,437 @@ async def test_warning_recovery_and_status_helpers(  # noqa: PLR0915
         201,
     )
     assert channel.sent[-1].content
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_per_file_recovery_rebuilds_saved_artifacts(  # noqa: PLR0915
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    ingestion = FakeIngestion()
+    assistant = _assistant(
+        settings,
+        FakeQuery(),
+        ingestion,
+        FakeDelivery(tmp_path),
+        FakeTaxonomy(),
+    )
+    channel = FakeChannel(settings.discord_uploads_channel_id)
+    monkeypatch.setattr(discord, "TextChannel", FakeChannel)
+    monkeypatch.setattr(assistant, "get_channel", lambda identifier: channel)
+    job = replace(
+        _job(tmp_path, JobState.SUCCEEDED),
+        discord_message_id=70,
+        discord_attachment_id=71,
+        principal_id=201,
+        original_filename="recovered.pdf",
+        paperless_document_id=DocumentId(44),
+    )
+    await ingestion.create_upload_batch(
+        UploadBatch(70, channel.id, 72, channel.id, 201, 1),
+        (
+            UploadItem(
+                70,
+                71,
+                1,
+                "recovered.pdf",
+                state=UploadItemState.PROCESSING,
+                job_id=job.id,
+            ),
+        ),
+    )
+    outcome = IngestionOutcome(
+        job,
+        Document(DocumentId(44), "Recovered", date(2026, 7, 28)),
+    )
+    await assistant._notify_recovery(outcome)
+    recovered_item = ingestion.upload_items[71]
+    assert recovered_item.state is UploadItemState.SUCCEEDED
+    assert recovered_item.parent_message_id is not None
+    parent = next(message for message in channel.sent if hasattr(message, "thread"))
+    assert "Recovered review ready" in parent.content
+    assert isinstance(
+        parent.thread.sent[-1].send_kwargs["view"],
+        _ReviewThreadControlsView,
+    )
+    review = await ingestion.get_suggestion_review(job)
+    assert review is not None
+    helper_thread = FakeThread(channel.id)
+    helper_view = await assistant._send_suggestions_ui(helper_thread, job, review)
+    assert isinstance(helper_view, AISuggestionsView)
+
+    existing_thread = FakeThread(channel.id, thread_id=74)
+    await ingestion.create_upload_batch(
+        UploadBatch(70, channel.id, 72, channel.id, 201, 1),
+        (
+            UploadItem(
+                70,
+                71,
+                1,
+                "recovered.pdf",
+                state=UploadItemState.PROCESSING,
+                job_id=job.id,
+                parent_message_id=73,
+                parent_channel_id=channel.id,
+                thread_id=74,
+            ),
+        ),
+    )
+    ingestion.suggestions_error = PaperlessUnavailableError("synthetic")
+    monkeypatch.setattr(
+        assistant,
+        "get_channel",
+        lambda identifier: existing_thread if identifier == 74 else channel,
+    )
+    await assistant._notify_recovery(outcome)
+    recovered_parent = next(item for item in channel.partial if item.id == 73)
+    assert "AI review unavailable" in recovered_parent.edits[-1]["content"]
+    ingestion.suggestions_error = None
+
+    failure_job = replace(
+        job,
+        id=uuid4(),
+        discord_message_id=80,
+        discord_attachment_id=81,
+        state=JobState.FAILED,
+        paperless_document_id=None,
+    )
+    stored_thread = FakeThread(channel.id, thread_id=84)
+    await ingestion.create_upload_batch(
+        UploadBatch(80, channel.id, 82, channel.id, 201, 1),
+        (
+            UploadItem(
+                80,
+                81,
+                1,
+                "failed.pdf",
+                state=UploadItemState.PROCESSING,
+                job_id=failure_job.id,
+                parent_message_id=83,
+                parent_channel_id=channel.id,
+                thread_id=84,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        assistant,
+        "get_channel",
+        lambda identifier: stored_thread if identifier == 84 else channel,
+    )
+    await assistant._notify_recovery(IngestionOutcome(failure_job))
+    assert ingestion.upload_items[81].state is UploadItemState.FAILED
+    assert isinstance(stored_thread.sent[-1].send_kwargs["view"], _FailedUploadView)
+
+    created_failure_job = replace(
+        failure_job,
+        id=uuid4(),
+        discord_message_id=85,
+        discord_attachment_id=86,
+    )
+    await ingestion.create_upload_batch(
+        UploadBatch(85, channel.id, 87, channel.id, 201, 1),
+        (
+            UploadItem(
+                85,
+                86,
+                1,
+                "created-failure.pdf",
+                state=UploadItemState.PROCESSING,
+                job_id=created_failure_job.id,
+            ),
+        ),
+    )
+    monkeypatch.setattr(assistant, "get_channel", lambda _: channel)
+    await assistant._notify_recovery(IngestionOutcome(created_failure_job))
+    assert ingestion.upload_items[86].thread_id is not None
+
+    uncertain_job = replace(
+        failure_job,
+        id=uuid4(),
+        discord_message_id=90,
+        discord_attachment_id=91,
+        state=JobState.RECONCILIATION_REQUIRED,
+    )
+    uncertain_thread = FakeThread(channel.id, thread_id=94)
+    await ingestion.create_upload_batch(
+        UploadBatch(90, channel.id, 92, channel.id, 201, 1),
+        (
+            UploadItem(
+                90,
+                91,
+                1,
+                "uncertain.pdf",
+                state=UploadItemState.PROCESSING,
+                job_id=uncertain_job.id,
+                parent_message_id=93,
+                parent_channel_id=channel.id,
+                thread_id=94,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        assistant,
+        "get_channel",
+        lambda identifier: uncertain_thread if identifier == 94 else channel,
+    )
+    await assistant._notify_recovery(IngestionOutcome(uncertain_job))
+    assert ingestion.upload_items[91].state is UploadItemState.RECONCILIATION_REQUIRED
+    assert isinstance(uncertain_thread.sent[-1].send_kwargs["view"], _PendingUploadView)
+
+    waiting_job = replace(
+        uncertain_job,
+        id=uuid4(),
+        discord_message_id=100,
+        discord_attachment_id=101,
+    )
+    await ingestion.create_upload_batch(
+        UploadBatch(100, channel.id, 102, channel.id, 201, 1),
+        (
+            UploadItem(
+                100,
+                101,
+                1,
+                "waiting.pdf",
+                state=UploadItemState.PROCESSING,
+                job_id=waiting_job.id,
+                parent_channel_id=channel.id,
+            ),
+        ),
+    )
+    monkeypatch.setattr(assistant, "get_channel", lambda _: None)
+    await assistant._notify_recovery(IngestionOutcome(waiting_job))
+    assert assistant._pending_recovery[-1].job.id == waiting_job.id
+    await assistant._notify_recovery(IngestionOutcome(waiting_job))
+    assert sum(item.job.id == waiting_job.id for item in assistant._pending_recovery) == 1
+
+    close_channel = FakeChannel(channel.id)
+    close_thread = FakeThread(channel.id, thread_id=120)
+    rich_session = AISuggestionsView(
+        job,
+        review,
+        cast(Any, ingestion),
+        settings,
+        ordinal=1,
+        total_items=2,
+    )
+    rich_controller = _ReviewThreadController(
+        201,
+        900,
+        source_message_id=110,
+        attachment_id=111,
+    )
+    rich_controller.add(rich_session)
+    rich_batch_controller = _UploadBatchController(201, 900)
+    rich_batch_controller.add(rich_controller)
+    assistant._upload_batch_controllers[110] = rich_batch_controller
+
+    mismatched_controller = _ReviewThreadController(
+        201,
+        900,
+        source_message_id=999,
+        attachment_id=999,
+    )
+    mismatch_batch_controller = _UploadBatchController(201, 900)
+    mismatch_batch_controller.add(mismatched_controller)
+    assistant._upload_batch_controllers[111] = mismatch_batch_controller
+    fetched_parent = FakeMessage(
+        channel=close_channel,
+        content="**Document 2/3 · fetched.pdf**\n**Status:** Review ready\n**Tags:** None",
+    )
+    fetch_error = discord.HTTPException(
+        cast(Any, SimpleNamespace(status=500, reason="synthetic")),
+        "synthetic",
+    )
+    close_channel.fetch_message = AsyncMock(  # type: ignore[attr-defined]
+        side_effect=(fetched_parent, fetch_error)
+    )
+    monkeypatch.setattr(
+        assistant,
+        "get_channel",
+        lambda identifier: close_thread if identifier == 120 else close_channel,
+    )
+    await assistant.close_upload_items(
+        (
+            UploadItem(
+                110,
+                111,
+                1,
+                "closed.pdf",
+                state=UploadItemState.CLOSED,
+                parent_message_id=119,
+                parent_channel_id=channel.id,
+                thread_id=120,
+            ),
+            UploadItem(110, 112, 2, "no-artifact.pdf", state=UploadItemState.CLOSED),
+            UploadItem(
+                111,
+                115,
+                2,
+                "fetched.pdf",
+                state=UploadItemState.CLOSED,
+                parent_message_id=121,
+                parent_channel_id=channel.id,
+            ),
+            UploadItem(
+                112,
+                116,
+                3,
+                "fetch-error.pdf",
+                state=UploadItemState.CLOSED,
+                parent_message_id=122,
+                parent_channel_id=channel.id,
+            ),
+        )
+    )
+    assert rich_controller.closed
+    assert "**Tags:**" in close_channel.partial[0].edits[-1]["content"]
+    assert "**Tags:** None" in close_channel.partial[1].edits[-1]["content"]
+    assert "fetch-error.pdf" in close_channel.partial[2].edits[-1]["content"]
+    assert close_thread.archived
+    assert close_thread.locked
+
+    no_fetch_channel = FakeChannel(777)
+    monkeypatch.setattr(assistant, "get_channel", lambda _: no_fetch_channel)
+    await assistant.close_upload_items(
+        (
+            UploadItem(
+                170,
+                171,
+                1,
+                "no-fetch.pdf",
+                state=UploadItemState.CLOSED,
+                parent_message_id=172,
+                parent_channel_id=777,
+            ),
+        )
+    )
+    assert "no-fetch.pdf" in no_fetch_channel.partial[-1].edits[-1]["content"]
+
+    failing_close_thread = FakeThread(channel.id, thread_id=130)
+    cast(Any, failing_close_thread).edit = AsyncMock(
+        side_effect=discord.HTTPException(
+            cast(Any, SimpleNamespace(status=403, reason="Forbidden")),
+            "synthetic",
+        )
+    )
+    monkeypatch.setattr(
+        assistant,
+        "get_channel",
+        lambda identifier: failing_close_thread if identifier == 130 else SimpleNamespace(),
+    )
+    await assistant.close_upload_items(
+        (
+            UploadItem(
+                110,
+                113,
+                3,
+                "wrong-channel.pdf",
+                state=UploadItemState.CLOSED,
+                parent_message_id=129,
+                parent_channel_id=999,
+                thread_id=999,
+            ),
+            UploadItem(
+                110,
+                114,
+                4,
+                "archive-error.pdf",
+                state=UploadItemState.CLOSED,
+                thread_id=130,
+            ),
+        )
+    )
+    await assistant._restore_batch_summary(
+        None,
+        _UploadBatchController(201, 900),
+    )
+    monkeypatch.setattr(assistant, "get_channel", lambda _: None)
+    snapshot = await ingestion.upload_batch(100)
+    await assistant._restore_batch_summary(
+        snapshot,
+        _UploadBatchController(201, 900),
+    )
+    pending_restore = UploadItem(140, 141, 1, "interrupted.pdf")
+    await ingestion.create_upload_batch(
+        UploadBatch(140, channel.id, 142, channel.id, 201, 1),
+        (pending_restore,),
+    )
+    ingestion.active_outcomes = ()
+    ingestion.active_items_for_restore = (pending_restore,)
+    assistant._restored_upload_items.clear()
+    monkeypatch.setattr(assistant, "get_channel", lambda _: channel)
+    await assistant._restore_active_upload_reviews()
+    assert ingestion.upload_items[141].state is UploadItemState.FAILED
+    restored_parent = next(
+        message
+        for message in reversed(channel.sent)
+        if hasattr(message, "thread") and "interrupted.pdf" in message.content
+    )
+    assert isinstance(
+        restored_parent.thread.sent[-1].send_kwargs["view"],
+        _FailedUploadView,
+    )
+    await assistant._restore_active_upload_reviews()
+    ingestion.active_items_for_restore = (
+        UploadItem(140, 143, 2, "success.pdf", state=UploadItemState.SUCCEEDED),
+    )
+    await assistant._restore_active_upload_reviews()
+    await assistant._restore_non_success_upload_item(
+        UploadItem(999, 1, 1, "missing.pdf", state=UploadItemState.FAILED)
+    )
+    processing_restore = UploadItem(
+        160,
+        161,
+        1,
+        "processing.pdf",
+        state=UploadItemState.PROCESSING,
+        job_id=uuid4(),
+        parent_message_id=162,
+        parent_channel_id=channel.id,
+        thread_id=163,
+    )
+    await ingestion.create_upload_batch(
+        UploadBatch(160, channel.id, 164, channel.id, 201, 1),
+        (processing_restore,),
+    )
+    processing_thread = FakeThread(channel.id, thread_id=163)
+    monkeypatch.setattr(
+        assistant,
+        "get_channel",
+        lambda identifier: processing_thread if identifier == 163 else channel,
+    )
+    await assistant._restore_non_success_upload_item(processing_restore)
+    assert isinstance(
+        processing_thread.sent[-1].send_kwargs["view"],
+        _PendingUploadView,
+    )
+
+    await ingestion.create_upload_batch(
+        UploadBatch(150, channel.id, 152, channel.id, 201, 1),
+        (UploadItem(150, 151, 1, "unavailable.pdf", state=UploadItemState.FAILED),),
+    )
+    monkeypatch.setattr(assistant, "get_channel", lambda _: None)
+    await assistant._restore_non_success_upload_item(ingestion.upload_items[151])
+
+    restore_loader = ingestion.active_upload_outcomes
+    cast(Any, ingestion).active_upload_outcomes = None
+    await assistant._restore_active_upload_reviews()
+    cast(Any, ingestion).active_upload_outcomes = restore_loader
+    item_restore_loader = ingestion.active_upload_items
+    cast(Any, ingestion).active_upload_items = None
+    await assistant._restore_active_upload_reviews()
+    cast(Any, ingestion).active_upload_items = item_restore_loader
+    ingestion.active_items_for_restore = ()
+    ingestion.active_outcomes = (outcome,)
+    assistant._restored_upload_jobs.clear()
+    assistant._notify_recovery = AsyncMock()  # type: ignore[method-assign]
+    await assistant._restore_active_upload_reviews()
+    assistant._restored_upload_jobs.add(outcome.job.id)
+    await assistant._restore_active_upload_reviews()
+    assistant._notify_recovery.assert_awaited_once_with(outcome)
     await assistant.close()
 
 
@@ -1439,10 +2075,11 @@ async def test_clean_command_callback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = settings_factory(data_dir=tmp_path)
+    ingestion = FakeIngestion()
     assistant = _assistant(
         settings,
         FakeQuery(),
-        FakeIngestion(),
+        ingestion,
         FakeDelivery(tmp_path),
         FakeTaxonomy(),
     )
@@ -1465,6 +2102,25 @@ async def test_clean_command_callback(
     interaction_wrong_channel.response.send_message.assert_awaited_with(
         "Clean command can only be used in assistant channels.", ephemeral=True
     )
+
+    await ingestion.create_upload_batch(
+        UploadBatch(500, settings.discord_uploads_channel_id, 600, 102, 201, 1),
+        (UploadItem(500, 1, 1, "done.pdf", state=UploadItemState.CLOSED),),
+    )
+    tracked = (
+        DiscordMessageTarget(102, 600),
+        DiscordMessageTarget(settings.discord_uploads_channel_id, 500),
+    )
+    assistant.cleanup_messages = AsyncMock(return_value=tracked)  # type: ignore[method-assign]
+    interaction_uploads = AsyncMock(
+        user=SimpleNamespace(id=201),
+        channel_id=settings.discord_uploads_channel_id,
+    )
+    await callback(cast(discord.Interaction, interaction_uploads), 10)
+    assistant.cleanup_messages.assert_awaited_once_with((), tracked)
+    assert ingestion.confirmed_cleanup == list(tracked)
+    assistant.cleanup_messages = AsyncMock(return_value=())  # type: ignore[method-assign]
+    await callback(cast(discord.Interaction, interaction_uploads), 10)
 
     interaction_non_text = AsyncMock()
     interaction_non_text.user = SimpleNamespace(id=201)
@@ -1537,7 +2193,10 @@ async def test_thread_routing_and_render_query_error_handling(
         attachments=[FakeAttachment(1, "doc.pdf", b"%PDF-1.7")],
     )
     await assistant.on_message(cast(discord.Message, u_thread_msg))
-    assert "uploaded as" in u_thread.sent[0].content
+    assert (
+        "uploaded as"
+        in _latest_upload_summary(cast(FakeChannel, u_thread.parent)).edits[-1]["content"]
+    )
 
     delivery.mode = "link"
     status_msg_link = FakeMessage(channel=cast(Any, q_thread), content="status")
@@ -1854,7 +2513,7 @@ async def test_unlinked_user_responses(
     )
     ingestion.submit = raise_unlinked  # type: ignore[method-assign]
     await assistant.on_message(cast(discord.Message, msg_unlinked_u))
-    assert "have not linked your Paperless account" in msg_unlinked_u.thread.sent[0].content
+    assert "linked Paperless account" in _latest_upload_summary(u_channel).edits[-1]["content"]
 
     interaction_button = AsyncMock()
     interaction_button.guild_id = settings.discord_guild_id
@@ -1945,7 +2604,9 @@ async def test_ai_review_layout_title_date_and_metadata_interactions(  # noqa: P
     assert "Pending changes" in view.actions_content()
     assert view.current_title == "Chat Conversation with Mary"
     assert view.date_placeholder() == "Date: 2026-07-28 (Paperless suggestion)"
-    assert view.metadata_placeholder(TaxonomyKind.CORRESPONDENT) == "Correspondent: Mary"
+    assert view.metadata_placeholder(TaxonomyKind.CORRESPONDENT) == (
+        "Correspondent - Pending - Mary"
+    )
     assert view.metadata_placeholder(TaxonomyKind.TAG) == "Tags: 1 selected"
 
     children = list(view.children)
@@ -2266,7 +2927,7 @@ async def test_ai_new_taxonomy_confirmation_is_configurable(
 
 
 @pytest.mark.asyncio
-async def test_ai_review_apply_errors_reload_and_disabled_fields(
+async def test_ai_review_apply_errors_reload_and_disabled_fields(  # noqa: PLR0915
     tmp_path: Path,
     settings_factory: Callable[..., Settings],
 ) -> None:
@@ -2288,6 +2949,29 @@ async def test_ai_review_apply_errors_reload_and_disabled_fields(
     disabled_thread = FakeThread(parent_id=102)
     await disabled.send(disabled_thread)
     assert not disabled_thread.sent
+    disabled_modal = AISuggestionsTagModal(disabled)
+    disabled_modal.tag_input._value = "blocked"
+    disabled_tag = AsyncMock(user=SimpleNamespace(id=201))
+    await disabled_modal.on_submit(disabled_tag)
+    assert "disabled" in disabled_tag.response.send_message.call_args.args[0]
+
+    title_only = AISuggestionsView(
+        job,
+        review,
+        cast(Any, ingestion),
+        settings_factory(
+            data_dir=tmp_path,
+            allow_edit_date=False,
+            allow_edit_correspondent=False,
+            allow_edit_document_type=False,
+            allow_edit_storage_path=False,
+            allow_edit_tags=False,
+        ),
+    )
+    assert "Add Tag" not in {
+        cast(discord.ui.Button[Any], child).label
+        for child in _ReviewActionsView(title_only).children
+    }
 
     partial = AISuggestionsView(
         job,
@@ -2367,6 +3051,101 @@ async def test_ai_review_apply_errors_reload_and_disabled_fields(
     assert applied.is_dirty
     applied.saved_selection = applied.selection
     assert applied.actions_content() == "**No pending changes**"
+
+
+@pytest.mark.asyncio
+async def test_custom_tag_modal_and_rich_parent_synchronization(  # noqa: PLR0915
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    job, review, ingestion = _ai_review_fixture(tmp_path)
+    parent = FakeMessage(channel=FakeChannel(102), content="initial")
+    view = AISuggestionsView(
+        job,
+        review,
+        cast(Any, ingestion),
+        settings_factory(data_dir=tmp_path),
+        ordinal=2,
+        total_items=3,
+        parent_message=cast(discord.Message, parent),
+        public_url="https://paperless.example.test/documents/7/details",
+    )
+    denied = AsyncMock(user=SimpleNamespace(id=999))
+    modal = AISuggestionsTagModal(view)
+    modal.tag_input._value = "Existing Tag"
+    await modal.on_submit(denied)
+    assert "Only the uploader" in denied.response.send_message.call_args.args[0]
+
+    blank = AsyncMock(user=SimpleNamespace(id=201))
+    modal.tag_input._value = "   "
+    await modal.on_submit(blank)
+    assert "non-empty" in blank.response.send_message.call_args.args[0]
+
+    duplicate_taxonomy = replace(
+        review.taxonomy,
+        tags=(
+            *review.taxonomy.tags,
+            TaxonomyItem(99, "existing tag"),
+        ),
+    )
+    view.review = replace(view.review, taxonomy=duplicate_taxonomy)
+    ambiguous = AsyncMock(user=SimpleNamespace(id=201))
+    modal.tag_input._value = "Existing Tag"
+    await modal.on_submit(ambiguous)
+    assert "More than one" in ambiguous.response.send_message.call_args.args[0]
+
+    view.review = review
+    existing = AsyncMock(user=SimpleNamespace(id=201))
+    modal.tag_input._value = " existing tag "
+    await modal.on_submit(existing)
+    assert view.selection.tag_ids == (2,)
+    assert "existing tag" in existing.followup.send.call_args.args[0].casefold()
+    assert parent.edits
+
+    created = AsyncMock(user=SimpleNamespace(id=201))
+    modal.tag_input._value = " Cafe\u0301 "
+    await modal.on_submit(created)
+    assert view.selection.new_tags == ("Café",)
+    modal.tag_input._value = "CAFÉ"
+    await modal.on_submit(AsyncMock(user=SimpleNamespace(id=201)))
+    assert view.selection.new_tags == ("Café",)
+    custom_option = next(
+        option
+        for option in view.options_for(TaxonomyKind.TAG)
+        if option.value.startswith("custom:")
+    )
+    view.update_selection(
+        TaxonomyKind.TAG,
+        ("id:2", custom_option.value),
+    )
+    assert view.selection.new_tags == ("Café",)
+    assert custom_option.value in view._selected_option_values(TaxonomyKind.TAG)
+
+    view.selection = replace(
+        view.selection,
+        new_correspondents=("A" * 220,),
+        new_document_types=("New Type",),
+        new_storage_paths=("New/Path",),
+    )
+    content = view.parent_content()
+    assert "Document 2/3" in content
+    assert "Current — Chat Log" in content
+    assert "Pending — New Type (new)" in content
+    assert "**Storage Path:**" in content
+    assert "**Tags:**" in content
+    assert len(content) <= 1900
+    assert view._taxonomy_value(None, TaxonomyKind.TAG) == "None"
+    view._applied = True
+    assert "**Status:** Saved" in view.parent_content()
+
+    add_tag_button = next(
+        child
+        for child in _ReviewActionsView(view).children
+        if cast(discord.ui.Button[Any], child).label == "Add Tag"
+    )
+    open_modal = AsyncMock(user=SimpleNamespace(id=201))
+    await cast(discord.ui.Button[Any], add_tag_button).callback(open_modal)
+    assert isinstance(open_modal.response.send_modal.call_args.args[0], AISuggestionsTagModal)
 
 
 @pytest.mark.asyncio
@@ -2472,3 +3251,280 @@ async def test_ai_review_thread_controls_are_persistent_and_guard_dirty_state(  
     failed_delete = AsyncMock(channel=failed_channel)
     await controller.finish(failed_delete)
     assert "Manage Threads" in failed_delete.followup.send.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_bound_review_batch_controls_and_failure_dismissal(  # noqa: PLR0915
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    job, review, ingestion = _ai_review_fixture(tmp_path)
+    await ingestion.create_upload_batch(
+        UploadBatch(1, 102, 50, 102, 201, 1),
+        (
+            UploadItem(
+                1,
+                2,
+                1,
+                "synthetic.pdf",
+                state=UploadItemState.SUCCEEDED,
+                job_id=job.id,
+                document_id=DocumentId(7),
+            ),
+        ),
+    )
+    parent = FakeMessage(channel=FakeChannel(102), content="rich parent")
+    thread = FakeThread(102)
+    session = AISuggestionsView(
+        job,
+        review,
+        cast(Any, ingestion),
+        settings,
+        parent_message=cast(discord.Message, parent),
+    )
+    session.saved_selection = session.selection
+    cleanup = AsyncMock()
+    bound = _ReviewThreadController(
+        201,
+        900,
+        ingestion=cast(Any, ingestion),
+        source_message_id=1,
+        attachment_id=2,
+        parent_message=cast(discord.Message, parent),
+        thread=thread,
+        cleanup_callback=cleanup,
+    )
+    bound.add(session)
+    finish_interaction = AsyncMock(user=SimpleNamespace(id=201), channel=thread)
+    await bound.request_finish(finish_interaction)
+    assert bound.closed
+    assert thread.archived
+    assert thread.locked
+    assert "Closed" in parent.edits[-1]["content"]
+    cleanup.assert_awaited_once_with(
+        (
+            DiscordMessageTarget(102, 50),
+            DiscordMessageTarget(102, 1),
+        )
+    )
+    await bound.finish(finish_interaction)
+    assert "already closed" in finish_interaction.followup.send.call_args.args[0]
+
+    no_edit_bound = _ReviewThreadController(
+        201,
+        900,
+        ingestion=cast(Any, ingestion),
+        source_message_id=1,
+        attachment_id=2,
+        thread=cast(discord.Thread, SimpleNamespace()),
+    )
+    await no_edit_bound.finish(AsyncMock(channel=SimpleNamespace()))
+    assert no_edit_bound.closed
+
+    failed_thread = FakeThread(102)
+    cast(Any, failed_thread).edit = AsyncMock(
+        side_effect=discord.HTTPException(
+            cast(Any, SimpleNamespace(status=403, reason="Forbidden")),
+            "synthetic",
+        )
+    )
+    failed_bound = _ReviewThreadController(
+        201,
+        900,
+        ingestion=cast(Any, ingestion),
+        source_message_id=1,
+        attachment_id=2,
+        thread=failed_thread,
+    )
+    archive_error = AsyncMock(channel=failed_thread)
+    await failed_bound.finish(archive_error)
+    assert "could not archive" in archive_error.followup.send.call_args.args[0]
+
+    first = AISuggestionsView(
+        replace(job, discord_attachment_id=3, original_filename="second.pdf"),
+        review,
+        cast(Any, ingestion),
+        settings,
+        ordinal=2,
+        total_items=2,
+    )
+    second = AISuggestionsView(
+        job,
+        review,
+        cast(Any, ingestion),
+        settings,
+        ordinal=1,
+        total_items=2,
+    )
+    second.selection = replace(second.selection, new_tags=("new-topic",))
+    first_controller = _ReviewThreadController(201, 900)
+    first_controller.add(first)
+    second_controller = _ReviewThreadController(201, 900)
+    second_controller.add(second)
+    batch = _UploadBatchController(201, 900)
+    batch.add(first_controller)
+    batch.add(second_controller)
+    assert tuple(item.ordinal for item in batch.sessions) == (1, 2)
+
+    denied = AsyncMock(user=SimpleNamespace(id=999))
+    assert not await batch.interaction_check(denied)
+    assert await batch.interaction_check(AsyncMock(user=SimpleNamespace(id=201)))
+    save_prompt = AsyncMock(user=SimpleNamespace(id=201))
+    await batch.request_save_all(save_prompt)
+    assert "Potential new" in save_prompt.response.send_message.call_args.args[0]
+    assert isinstance(
+        save_prompt.response.send_message.call_args.kwargs["view"],
+        _ConfirmSaveAllView,
+    )
+
+    async def save_success(interaction: Any, *, confirm_create: bool) -> None:
+        assert confirm_create
+        second._applied = True
+
+    async def save_failure(interaction: Any, *, confirm_create: bool) -> None:
+        assert not confirm_create
+
+    second.apply = save_success  # type: ignore[method-assign]
+    first.apply = save_failure  # type: ignore[method-assign]
+    save_interaction = AsyncMock(user=SimpleNamespace(id=201))
+    await batch.save_all(save_interaction)
+    assert "1 saved, 1 failed" in save_interaction.followup.send.call_args.args[0]
+
+    first.saved_selection = first.selection
+    second.saved_selection = second.selection
+    no_changes = AsyncMock(user=SimpleNamespace(id=201))
+    await batch.request_save_all(no_changes)
+    assert "no pending" in no_changes.response.send_message.call_args.args[0]
+
+    first.reload = AsyncMock(return_value="refresh failed")  # type: ignore[method-assign]
+    second.reload = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    refreshed = AsyncMock(user=SimpleNamespace(id=201))
+    await batch.refresh_all(refreshed)
+    assert "refresh failed" in refreshed.followup.send.call_args.args[0]
+    first.reload = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    await batch.refresh_all(AsyncMock(user=SimpleNamespace(id=201)))
+
+    clean_close_prompt = AsyncMock(user=SimpleNamespace(id=201))
+    await batch.request_close_all(clean_close_prompt)
+    assert "will be discarded" not in clean_close_prompt.response.send_message.call_args.args[0]
+    first.selection = replace(first.selection, title="Unsaved")
+    save_without_new = AsyncMock(user=SimpleNamespace(id=201))
+    await batch.request_save_all(save_without_new)
+    assert "Potential new" not in save_without_new.response.send_message.call_args.args[0]
+    close_prompt = AsyncMock(user=SimpleNamespace(id=201))
+    await batch.request_close_all(close_prompt)
+    assert "will be discarded" in close_prompt.response.send_message.call_args.args[0]
+    assert isinstance(
+        close_prompt.response.send_message.call_args.kwargs["view"],
+        _ConfirmCloseAllView,
+    )
+
+    async def close_first(interaction: Any) -> None:
+        first_controller.closed = True
+
+    async def close_second(interaction: Any) -> None:
+        second_controller.closed = True
+
+    first_controller.finish = close_first  # type: ignore[method-assign]
+    second_controller.finish = close_second  # type: ignore[method-assign]
+    close_interaction = AsyncMock(user=SimpleNamespace(id=201))
+    await batch.close_all(close_interaction)
+    assert "2 successful" in close_interaction.followup.send.call_args.args[0]
+    await batch.close_all(AsyncMock(user=SimpleNamespace(id=201)))
+    no_open = AsyncMock(user=SimpleNamespace(id=201))
+    await batch.request_close_all(no_open)
+    assert "no successful" in no_open.response.send_message.call_args.args[0]
+
+    controls = batch.build_view()
+    assert isinstance(controls, _UploadBatchControlsView)
+    assert await controls.interaction_check(AsyncMock(user=SimpleNamespace(id=201)))
+    batch.refresh_all = AsyncMock()  # type: ignore[method-assign]
+    batch.request_save_all = AsyncMock()  # type: ignore[method-assign]
+    batch.request_close_all = AsyncMock()  # type: ignore[method-assign]
+    for child in controls.children:
+        await cast(discord.ui.Button[Any], child).callback(AsyncMock(user=SimpleNamespace(id=201)))
+    batch.refresh_all.assert_awaited_once()
+    batch.request_save_all.assert_awaited_once()
+    batch.request_close_all.assert_awaited_once()
+
+    confirm_save = _ConfirmSaveAllView(batch)
+    confirm_close = _ConfirmCloseAllView(batch)
+    assert await confirm_save.interaction_check(AsyncMock(user=SimpleNamespace(id=201)))
+    assert await confirm_close.interaction_check(AsyncMock(user=SimpleNamespace(id=201)))
+    batch.save_all = AsyncMock()  # type: ignore[method-assign]
+    batch.close_all = AsyncMock()  # type: ignore[method-assign]
+    await confirm_save.confirm.callback(AsyncMock(user=SimpleNamespace(id=201)))
+    await confirm_close.confirm.callback(AsyncMock(user=SimpleNamespace(id=201)))
+    batch.save_all.assert_awaited_once()
+    batch.close_all.assert_awaited_once()
+
+    failure_ingestion = FakeIngestion()
+    await failure_ingestion.create_upload_batch(
+        UploadBatch(9, 102, 59, 102, 201, 1),
+        (UploadItem(9, 90, 1, "failed.pdf", state=UploadItemState.FAILED),),
+    )
+    failure_parent = FakeMessage(channel=FakeChannel(102), content="failed")
+    failure_thread = FakeThread(102)
+    failure_cleanup = AsyncMock()
+    failure = _FailedUploadController(
+        principal_id=201,
+        ingestion=cast(Any, failure_ingestion),
+        source_message_id=9,
+        attachment_id=90,
+        parent_message=cast(discord.Message, failure_parent),
+        thread=failure_thread,
+        cleanup_callback=failure_cleanup,
+    )
+    denied_failure = AsyncMock(user=SimpleNamespace(id=999))
+    assert not await failure.interaction_check(denied_failure)
+    assert await failure.interaction_check(AsyncMock(user=SimpleNamespace(id=201)))
+    dismiss_prompt = AsyncMock(user=SimpleNamespace(id=201))
+    await failure.request_dismiss(dismiss_prompt)
+    confirmation = dismiss_prompt.response.send_message.call_args.kwargs["view"]
+    assert isinstance(confirmation, _ConfirmDismissFailedView)
+    assert await confirmation.interaction_check(AsyncMock(user=SimpleNamespace(id=201)))
+    confirmed = AsyncMock(user=SimpleNamespace(id=201))
+    await confirmation.confirm.callback(confirmed)
+    assert failure.dismissed
+    assert failure_thread.archived
+    failure_cleanup.assert_awaited_once()
+    await failure.dismiss(confirmed)
+    assert "already dismissed" in confirmed.followup.send.call_args.args[0]
+
+    failure_view = _FailedUploadView(failure, 900)
+    assert await failure_view.interaction_check(AsyncMock(user=SimpleNamespace(id=201)))
+    failure.request_dismiss = AsyncMock()  # type: ignore[method-assign]
+    await failure_view.dismiss.callback(AsyncMock(user=SimpleNamespace(id=201)))
+    failure.request_dismiss.assert_awaited_once()
+
+    unresolved_ingestion = FakeIngestion()
+    await unresolved_ingestion.create_upload_batch(
+        UploadBatch(19, 102, 69, 102, 201, 2),
+        (
+            UploadItem(19, 190, 1, "failed.pdf", state=UploadItemState.FAILED),
+            UploadItem(19, 191, 2, "pending.pdf", state=UploadItemState.PENDING),
+        ),
+    )
+    no_target_failure = _FailedUploadController(
+        principal_id=201,
+        ingestion=cast(Any, unresolved_ingestion),
+        source_message_id=19,
+        attachment_id=190,
+        parent_message=cast(
+            discord.Message,
+            FakeMessage(channel=FakeChannel(102), content="failed"),
+        ),
+        thread=cast(discord.Thread, SimpleNamespace()),
+        cleanup_callback=AsyncMock(),
+    )
+    await no_target_failure.dismiss(AsyncMock(user=SimpleNamespace(id=201)))
+    assert no_target_failure.dismissed
+
+    pending = _PendingUploadView(201, 900)
+    assert not await pending.interaction_check(AsyncMock(user=SimpleNamespace(id=999)))
+    assert await pending.interaction_check(AsyncMock(user=SimpleNamespace(id=201)))
+    check_button = cast(discord.ui.Button[Any], pending.children[0])
+    checked = AsyncMock(user=SimpleNamespace(id=201))
+    await check_button.callback(checked)
+    assert "will not be resubmitted" in checked.response.send_message.call_args.args[0]

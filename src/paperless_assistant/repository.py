@@ -23,6 +23,10 @@ from paperless_assistant.models import (
     JobState,
     MetadataGuidance,
     ReferenceContext,
+    UploadBatch,
+    UploadBatchSnapshot,
+    UploadItem,
+    UploadItemState,
 )
 
 SCHEMA = """
@@ -69,6 +73,42 @@ CREATE TABLE IF NOT EXISTS ingestion_jobs (
 
 CREATE INDEX IF NOT EXISTS ingestion_jobs_state_idx ON ingestion_jobs(state);
 CREATE INDEX IF NOT EXISTS ingestion_jobs_updated_idx ON ingestion_jobs(updated_at);
+
+CREATE TABLE IF NOT EXISTS upload_batches (
+    source_message_id INTEGER PRIMARY KEY,
+    source_channel_id INTEGER NOT NULL,
+    summary_message_id INTEGER NOT NULL,
+    summary_channel_id INTEGER NOT NULL,
+    principal_id INTEGER NOT NULL,
+    total_items INTEGER NOT NULL,
+    source_cleaned INTEGER NOT NULL DEFAULT 0,
+    summary_cleaned INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS upload_items (
+    source_message_id INTEGER NOT NULL REFERENCES upload_batches(source_message_id)
+        ON DELETE CASCADE,
+    attachment_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    original_filename TEXT NOT NULL,
+    state TEXT NOT NULL,
+    job_id TEXT,
+    document_id INTEGER,
+    parent_message_id INTEGER,
+    parent_channel_id INTEGER,
+    thread_id INTEGER,
+    failure_reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (source_message_id, attachment_id),
+    UNIQUE (job_id),
+    UNIQUE (source_message_id, ordinal)
+);
+
+CREATE INDEX IF NOT EXISTS upload_items_state_idx ON upload_items(state);
+CREATE INDEX IF NOT EXISTS upload_items_document_idx ON upload_items(document_id);
 
 CREATE TABLE IF NOT EXISTS reference_context (
     principal_id INTEGER PRIMARY KEY,
@@ -349,6 +389,241 @@ class SQLiteRepository:
             row = cursor.fetchone()
         return self._job_from_row(row) if row is not None else None
 
+    async def create_upload_batch(self, batch: UploadBatch, items: tuple[UploadItem, ...]) -> None:
+        """Persist the complete attachment list before ingestion begins."""
+        if len(items) != batch.total_items:
+            raise ValueError("upload batch item count does not match total_items")
+        if {item.ordinal for item in items} != set(range(1, batch.total_items + 1)):
+            raise ValueError("upload item ordinals must be contiguous and one-based")
+        now = batch.created_at or _utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO upload_batches(
+                    source_message_id, source_channel_id, summary_message_id,
+                    summary_channel_id, principal_id, total_items,
+                    source_cleaned, summary_cleaned, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    batch.source_message_id,
+                    batch.source_channel_id,
+                    batch.summary_message_id,
+                    batch.summary_channel_id,
+                    batch.principal_id,
+                    batch.total_items,
+                    int(batch.source_cleaned),
+                    int(batch.summary_cleaned),
+                    _iso(now),
+                    _iso(batch.updated_at or now),
+                ),
+            )
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO upload_items(
+                    source_message_id, attachment_id, ordinal, original_filename,
+                    state, job_id, document_id, parent_message_id, parent_channel_id,
+                    thread_id, failure_reason, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        item.source_message_id,
+                        item.attachment_id,
+                        item.ordinal,
+                        item.original_filename,
+                        item.state.value,
+                        str(item.job_id) if item.job_id else None,
+                        int(item.document_id) if item.document_id else None,
+                        item.parent_message_id,
+                        item.parent_channel_id,
+                        item.thread_id,
+                        item.failure_reason,
+                        _iso(item.created_at or now),
+                        _iso(item.updated_at or now),
+                    )
+                    for item in items
+                ),
+            )
+            connection.commit()
+
+    @staticmethod
+    def _upload_batch_from_row(row: sqlite3.Row) -> UploadBatch:
+        return UploadBatch(
+            source_message_id=row["source_message_id"],
+            source_channel_id=row["source_channel_id"],
+            summary_message_id=row["summary_message_id"],
+            summary_channel_id=row["summary_channel_id"],
+            principal_id=row["principal_id"],
+            total_items=row["total_items"],
+            source_cleaned=bool(row["source_cleaned"]),
+            summary_cleaned=bool(row["summary_cleaned"]),
+            created_at=_parse_datetime(row["created_at"]),
+            updated_at=_parse_datetime(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _upload_item_from_row(row: sqlite3.Row) -> UploadItem:
+        return UploadItem(
+            source_message_id=row["source_message_id"],
+            attachment_id=row["attachment_id"],
+            ordinal=row["ordinal"],
+            original_filename=row["original_filename"],
+            state=UploadItemState(row["state"]),
+            job_id=UUID(row["job_id"]) if row["job_id"] else None,
+            document_id=DocumentId(row["document_id"]) if row["document_id"] is not None else None,
+            parent_message_id=row["parent_message_id"],
+            parent_channel_id=row["parent_channel_id"],
+            thread_id=row["thread_id"],
+            failure_reason=row["failure_reason"],
+            created_at=_parse_datetime(row["created_at"]),
+            updated_at=_parse_datetime(row["updated_at"]),
+        )
+
+    async def get_upload_batch(self, source_message_id: int) -> UploadBatchSnapshot | None:
+        """Load one durable batch and its items in original attachment order."""
+        with self._connection() as connection:
+            batch_row = connection.execute(
+                "SELECT * FROM upload_batches WHERE source_message_id = ?",
+                (source_message_id,),
+            ).fetchone()
+            if batch_row is None:
+                return None
+            item_rows = connection.execute(
+                """
+                SELECT * FROM upload_items
+                WHERE source_message_id = ?
+                ORDER BY ordinal
+                """,
+                (source_message_id,),
+            ).fetchall()
+        return UploadBatchSnapshot(
+            self._upload_batch_from_row(batch_row),
+            tuple(self._upload_item_from_row(row) for row in item_rows),
+        )
+
+    async def update_upload_item(  # noqa: PLR0913
+        self,
+        source_message_id: int,
+        attachment_id: int,
+        state: UploadItemState,
+        *,
+        job_id: UUID | None = None,
+        document_id: int | None = None,
+        parent_message_id: int | None = None,
+        parent_channel_id: int | None = None,
+        thread_id: int | None = None,
+        failure_reason: str | None = None,
+    ) -> UploadBatchSnapshot:
+        """Update one item and return the batch snapshot used for cleanup decisions."""
+        now = _iso(_utc_now())
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE upload_items
+                SET state = ?,
+                    job_id = COALESCE(?, job_id),
+                    document_id = COALESCE(?, document_id),
+                    parent_message_id = COALESCE(?, parent_message_id),
+                    parent_channel_id = COALESCE(?, parent_channel_id),
+                    thread_id = COALESCE(?, thread_id),
+                    failure_reason = COALESCE(?, failure_reason),
+                    updated_at = ?
+                WHERE source_message_id = ? AND attachment_id = ?
+                """,
+                (
+                    state.value,
+                    str(job_id) if job_id else None,
+                    document_id,
+                    parent_message_id,
+                    parent_channel_id,
+                    thread_id,
+                    failure_reason,
+                    now,
+                    source_message_id,
+                    attachment_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("upload item does not exist")
+            connection.execute(
+                "UPDATE upload_batches SET updated_at = ? WHERE source_message_id = ?",
+                (now, source_message_id),
+            )
+            connection.commit()
+        snapshot = await self.get_upload_batch(source_message_id)
+        if snapshot is None:
+            raise ValueError("upload batch disappeared")
+        return snapshot
+
+    async def upload_item_for_job(self, job_id: UUID) -> UploadItem | None:
+        """Load the batch item linked to one ingestion job."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM upload_items WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+        return self._upload_item_from_row(row) if row is not None else None
+
+    async def active_upload_items(self) -> tuple[UploadItem, ...]:
+        """Return non-resolved new-model items for recovery and inbox cleanup."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM upload_items
+                WHERE state NOT IN (?, ?)
+                ORDER BY created_at, source_message_id, ordinal
+                """,
+                (UploadItemState.CLOSED.value, UploadItemState.DISMISSED.value),
+            ).fetchall()
+        return tuple(self._upload_item_from_row(row) for row in rows)
+
+    async def terminal_upload_cleanup_targets(
+        self,
+    ) -> tuple[DiscordMessageTarget, ...]:
+        """Return shared artifacts only for batches with no uncertain or active item."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    b.source_message_id,
+                    b.source_channel_id,
+                    b.summary_message_id,
+                    b.summary_channel_id,
+                    b.source_cleaned,
+                    b.summary_cleaned,
+                    MAX(CASE WHEN i.state NOT IN (?, ?) THEN 1 ELSE 0 END) AS unresolved
+                FROM upload_batches AS b
+                JOIN upload_items AS i
+                  ON i.source_message_id = b.source_message_id
+                GROUP BY b.source_message_id
+                HAVING unresolved = 0
+                ORDER BY b.created_at, b.source_message_id
+                """,
+                (
+                    UploadItemState.CLOSED.value,
+                    UploadItemState.DISMISSED.value,
+                ),
+            ).fetchall()
+        targets: list[DiscordMessageTarget] = []
+        for row in rows:
+            if not row["summary_cleaned"]:
+                targets.append(
+                    DiscordMessageTarget(
+                        row["summary_channel_id"],
+                        row["summary_message_id"],
+                    )
+                )
+            if not row["source_cleaned"]:
+                targets.append(
+                    DiscordMessageTarget(
+                        row["source_channel_id"],
+                        row["source_message_id"],
+                    )
+                )
+        return tuple(targets)
+
     async def transition_job(
         self,
         job_id: UUID,
@@ -380,6 +655,30 @@ class SQLiteRepository:
                     expected.value,
                 ),
             )
+            if cursor.rowcount == 1:
+                upload_state = {
+                    JobState.STAGED: UploadItemState.PENDING,
+                    JobState.SUBMITTING: UploadItemState.PROCESSING,
+                    JobState.SUBMITTED: UploadItemState.PROCESSING,
+                    JobState.SUCCEEDED: UploadItemState.SUCCEEDED,
+                    JobState.FAILED: UploadItemState.FAILED,
+                    JobState.RECONCILIATION_REQUIRED: (UploadItemState.RECONCILIATION_REQUIRED),
+                }[target]
+                connection.execute(
+                    """
+                    UPDATE upload_items
+                    SET state = ?,
+                        document_id = COALESCE(?, document_id),
+                        updated_at = ?
+                    WHERE job_id = ?
+                    """,
+                    (
+                        upload_state.value,
+                        document_id,
+                        _iso(_utc_now()),
+                        str(job_id),
+                    ),
+                )
             connection.commit()
             return cursor.rowcount == 1
 
@@ -510,6 +809,10 @@ class SQLiteRepository:
                     MAX(CASE WHEN state = ? THEN 1 ELSE 0 END) AS has_failed,
                     MAX(updated_at) AS newest_update
                 FROM ingestion_jobs
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM upload_items
+                    WHERE upload_items.job_id = ingestion_jobs.id
+                )
                 GROUP BY
                     discord_message_id,
                     discord_status_message_id,
@@ -553,6 +856,50 @@ class SQLiteRepository:
                             row["discord_status_message_id"],
                         )
                     )
+            batch_cursor = connection.execute(
+                """
+                SELECT
+                    b.source_message_id,
+                    b.source_channel_id,
+                    b.summary_message_id,
+                    b.summary_channel_id,
+                    b.source_cleaned,
+                    b.summary_cleaned,
+                    MAX(CASE WHEN i.state NOT IN (?, ?) THEN 1 ELSE 0 END) AS unresolved,
+                    MAX(CASE WHEN i.state = ? THEN 1 ELSE 0 END) AS has_failed,
+                    MAX(i.updated_at) AS newest_update
+                FROM upload_batches AS b
+                JOIN upload_items AS i
+                  ON i.source_message_id = b.source_message_id
+                GROUP BY b.source_message_id
+                """,
+                (
+                    UploadItemState.CLOSED.value,
+                    UploadItemState.DISMISSED.value,
+                    UploadItemState.DISMISSED.value,
+                ),
+            )
+            for row in batch_cursor.fetchall():
+                eligible = row["unresolved"] == 0 and (
+                    (row["has_failed"] == 0 and row["newest_update"] < succeeded_before)
+                    or (row["has_failed"] == 1 and row["newest_update"] < failed_before)
+                )
+                if not eligible:
+                    continue
+                if not row["summary_cleaned"]:
+                    upload_targets.append(
+                        DiscordMessageTarget(
+                            row["summary_channel_id"],
+                            row["summary_message_id"],
+                        )
+                    )
+                if not row["source_cleaned"]:
+                    upload_targets.append(
+                        DiscordMessageTarget(
+                            row["source_channel_id"],
+                            row["source_message_id"],
+                        )
+                    )
         return context_targets, tuple(dict.fromkeys(upload_targets))
 
     async def confirm_message_cleanup(self, targets: tuple[DiscordMessageTarget, ...]) -> None:
@@ -581,6 +928,22 @@ class SQLiteRepository:
                     WHERE discord_status_channel_id = ? AND discord_status_message_id = ?
                     """,
                     (target.channel_id, target.message_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE upload_batches
+                    SET source_cleaned = 1, updated_at = ?
+                    WHERE source_channel_id = ? AND source_message_id = ?
+                    """,
+                    (_iso(_utc_now()), target.channel_id, target.message_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE upload_batches
+                    SET summary_cleaned = 1, updated_at = ?
+                    WHERE summary_channel_id = ? AND summary_message_id = ?
+                    """,
+                    (_iso(_utc_now()), target.channel_id, target.message_id),
                 )
             connection.commit()
 
@@ -616,6 +979,10 @@ class SQLiteRepository:
                 FROM ingestion_jobs
                 WHERE state = ?
                   AND paperless_document_id IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM upload_items
+                      WHERE upload_items.job_id = ingestion_jobs.id
+                  )
                   AND (
                     discord_message_cleaned = 0
                     OR (
@@ -731,6 +1098,26 @@ class SQLiteRepository:
                     succeeded_before,
                     JobState.FAILED.value,
                     failed_before,
+                ),
+            )
+            connection.execute(
+                """
+                DELETE FROM upload_batches
+                WHERE source_cleaned = 1
+                  AND summary_cleaned = 1
+                  AND updated_at < ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM upload_items
+                      WHERE upload_items.source_message_id =
+                            upload_batches.source_message_id
+                        AND state IN (?, ?, ?)
+                  )
+                """,
+                (
+                    failed_before,
+                    UploadItemState.PENDING.value,
+                    UploadItemState.PROCESSING.value,
+                    UploadItemState.RECONCILIATION_REQUIRED.value,
                 ),
             )
             connection.commit()

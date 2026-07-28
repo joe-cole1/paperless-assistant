@@ -27,6 +27,10 @@ from paperless_assistant.models import (
     TaxonomyCapabilities,
     TaxonomyItem,
     TaxonomyKind,
+    UploadBatch,
+    UploadBatchSnapshot,
+    UploadItem,
+    UploadItemState,
 )
 
 
@@ -152,6 +156,36 @@ class IngestionRepository(Protocol):
     async def create_job(self, job: IngestionJob) -> bool: ...
 
     async def get_job(self, job_id: UUID) -> IngestionJob | None: ...
+
+    async def create_upload_batch(
+        self, batch: UploadBatch, items: tuple[UploadItem, ...]
+    ) -> None: ...
+
+    async def get_upload_batch(self, source_message_id: int) -> UploadBatchSnapshot | None: ...
+
+    async def update_upload_item(  # noqa: PLR0913
+        self,
+        source_message_id: int,
+        attachment_id: int,
+        state: UploadItemState,
+        *,
+        job_id: UUID | None = None,
+        document_id: int | None = None,
+        parent_message_id: int | None = None,
+        parent_channel_id: int | None = None,
+        thread_id: int | None = None,
+        failure_reason: str | None = None,
+    ) -> UploadBatchSnapshot: ...
+
+    async def upload_item_for_job(self, job_id: UUID) -> UploadItem | None: ...
+
+    async def active_upload_items(
+        self,
+    ) -> tuple[UploadItem, ...]: ...
+
+    async def terminal_upload_cleanup_targets(
+        self,
+    ) -> tuple[DiscordMessageTarget, ...]: ...
 
     async def transition_job(
         self,

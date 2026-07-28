@@ -15,7 +15,11 @@ import pytest
 from paperless_assistant import app as app_module
 from paperless_assistant.app import Runtime, create_app, main
 from paperless_assistant.config import Settings
-from paperless_assistant.models import DiscordMessageTarget
+from paperless_assistant.models import (
+    DiscordMessageTarget,
+    UploadItem,
+    UploadItemState,
+)
 
 
 @pytest.mark.asyncio
@@ -255,6 +259,17 @@ async def test_runtime_inbox_tag_cleanup_loop(
     cast(Any, runtime.ingestion).check_inbox_tag_removals = AsyncMock(
         side_effect=[(), (upload_target,), Exception("synthetic"), asyncio.CancelledError]
     )
+    closed_item = UploadItem(
+        1,
+        2,
+        1,
+        "closed.pdf",
+        state=UploadItemState.CLOSED,
+    )
+    cast(Any, runtime.ingestion).check_inbox_upload_closures = AsyncMock(
+        side_effect=[((closed_item,), ()), ((), ())]
+    )
+    cast(Any, runtime.discord).close_upload_items = AsyncMock()
     cast(Any, runtime.discord).cleanup_messages = AsyncMock(return_value=(upload_target,))
     cast(Any, runtime.repository).confirm_message_cleanup = AsyncMock()
 
@@ -273,6 +288,7 @@ async def test_runtime_inbox_tag_cleanup_loop(
         await runtime._inbox_tag_cleanup_loop()
 
     cast(Any, runtime.discord).cleanup_messages.assert_awaited_once_with((), (upload_target,))
+    cast(Any, runtime.discord).close_upload_items.assert_awaited_once_with((closed_item,))
     cast(Any, runtime.repository).confirm_message_cleanup.assert_awaited_once_with((upload_target,))
     await runtime.paperless.close()
     await runtime.discord.close()

@@ -39,6 +39,10 @@ from paperless_assistant.models import (
     Taxonomy,
     TaxonomyItem,
     TaxonomyKind,
+    UploadBatch,
+    UploadBatchSnapshot,
+    UploadItem,
+    UploadItemState,
 )
 from paperless_assistant.paperless import (
     PAPERLESS_CHAT_ERROR,
@@ -264,6 +268,108 @@ class IngestionService:
         self._taxonomy = taxonomy
         self._credentials = credentials
 
+    async def create_upload_batch(self, batch: UploadBatch, items: tuple[UploadItem, ...]) -> None:
+        """Persist every attachment before validation or network I/O."""
+        await self._repository.create_upload_batch(batch, items)
+
+    async def upload_batch(self, source_message_id: int) -> UploadBatchSnapshot | None:
+        """Return one durable batch for rendering or cleanup."""
+        return await self._repository.get_upload_batch(source_message_id)
+
+    async def upload_item_for_job(self, job_id: UUID) -> UploadItem | None:
+        """Return the Discord review item associated with an ingestion job."""
+        return await self._repository.upload_item_for_job(job_id)
+
+    async def update_upload_item(  # noqa: PLR0913
+        self,
+        source_message_id: int,
+        attachment_id: int,
+        state: UploadItemState,
+        *,
+        job_id: UUID | None = None,
+        document_id: int | None = None,
+        parent_message_id: int | None = None,
+        parent_channel_id: int | None = None,
+        thread_id: int | None = None,
+        failure_reason: str | None = None,
+    ) -> UploadBatchSnapshot:
+        """Persist one review transition and return its batch cleanup decision."""
+        return await self._repository.update_upload_item(
+            source_message_id,
+            attachment_id,
+            state,
+            job_id=job_id,
+            document_id=document_id,
+            parent_message_id=parent_message_id,
+            parent_channel_id=parent_channel_id,
+            thread_id=thread_id,
+            failure_reason=failure_reason,
+        )
+
+    async def resolve_upload_item(
+        self,
+        source_message_id: int,
+        attachment_id: int,
+        state: UploadItemState,
+    ) -> tuple[DiscordMessageTarget, ...]:
+        """Close or dismiss an item and expose shared cleanup only when all resolve."""
+        if state not in {UploadItemState.CLOSED, UploadItemState.DISMISSED}:
+            raise ValueError("resolved upload item must be closed or dismissed")
+        snapshot = await self.update_upload_item(
+            source_message_id,
+            attachment_id,
+            state,
+        )
+        return snapshot.cleanup_targets if snapshot.cleanup_ready else ()
+
+    async def confirm_upload_cleanup(self, targets: tuple[DiscordMessageTarget, ...]) -> None:
+        """Confirm exact shared artifacts only after Discord deleted or lacked them."""
+        await self._repository.confirm_message_cleanup(targets)
+
+    async def terminal_upload_cleanup_targets(
+        self,
+    ) -> tuple[DiscordMessageTarget, ...]:
+        """Return explicitly resolved batch targets without touching rich parents."""
+        return await self._repository.terminal_upload_cleanup_targets()
+
+    async def active_upload_outcomes(self) -> tuple[IngestionOutcome, ...]:
+        """Rebuild terminal outcomes whose per-file controls must survive restart."""
+        outcomes: list[IngestionOutcome] = []
+        for item in await self._repository.active_upload_items():
+            if item.job_id is None:
+                continue
+            job = await self._repository.get_job(item.job_id)
+            if job is None:
+                continue
+            if job.state is JobState.SUCCEEDED:
+                if job.paperless_document_id is None:
+                    continue
+                user_token = (
+                    await self._credentials.get_user_token(job.principal_id)
+                    if self._credentials is not None
+                    else None
+                )
+                if self._credentials is not None and user_token is None:
+                    continue
+                try:
+                    document = await self._gateway.get_document(
+                        int(job.paperless_document_id),
+                        token=user_token,
+                    )
+                except PaperlessUnavailableError:
+                    continue
+                outcomes.append(IngestionOutcome(job, document))
+            elif job.state in {
+                JobState.FAILED,
+                JobState.RECONCILIATION_REQUIRED,
+            }:
+                outcomes.append(IngestionOutcome(job))
+        return tuple(outcomes)
+
+    async def active_upload_items(self) -> tuple[UploadItem, ...]:
+        """Expose unresolved durable artifacts for Discord control restoration."""
+        return await self._repository.active_upload_items()
+
     async def stage(  # noqa: PLR0913
         self,
         *,
@@ -304,6 +410,13 @@ class IngestionService:
         )
         if not await self._repository.create_job(job):
             return None
+        if await self._repository.get_upload_batch(discord_message_id) is not None:
+            await self._repository.update_upload_item(
+                discord_message_id,
+                discord_attachment_id,
+                UploadItemState.PENDING,
+                job_id=job.id,
+            )
         await self._record(job, "staged")
         return job
 
@@ -519,6 +632,49 @@ class IngestionService:
             if doc_tag_ids is None or inbox_tag.id not in doc_tag_ids:
                 removed_targets.extend(targets)
         return tuple(dict.fromkeys(removed_targets))
+
+    async def check_inbox_upload_closures(
+        self,
+    ) -> tuple[tuple[UploadItem, ...], tuple[DiscordMessageTarget, ...]]:
+        """Close new-model items whose Paperless inbox tag was removed."""
+        if not self._settings.cleanup_inbox_tag_enabled:
+            return (), ()
+        active_items = tuple(
+            item
+            for item in await self._repository.active_upload_items()
+            if item.state is UploadItemState.SUCCEEDED and item.document_id is not None
+        )
+        taxonomy = self._taxonomy.snapshot
+        if not active_items or taxonomy is None:
+            return (), ()
+        inbox_tag_name = self._settings.cleanup_inbox_tag.casefold()
+        inbox_tag = next(
+            (tag for tag in taxonomy.tags if tag.name.casefold() == inbox_tag_name),
+            None,
+        )
+        if inbox_tag is None:
+            return (), ()
+        document_ids = tuple(int(item.document_id) for item in active_items if item.document_id)
+        try:
+            tags_by_document = await self._gateway.get_documents_tag_ids(document_ids)
+        except PaperlessUnavailableError:
+            return (), ()
+        closed: list[UploadItem] = []
+        cleanup_targets: list[DiscordMessageTarget] = []
+        for item in active_items:
+            document_id = int(item.document_id) if item.document_id is not None else 0
+            doc_tag_ids = tags_by_document[document_id]
+            if doc_tag_ids is not None and inbox_tag.id in doc_tag_ids:
+                continue
+            snapshot = await self._repository.update_upload_item(
+                item.source_message_id,
+                item.attachment_id,
+                UploadItemState.CLOSED,
+            )
+            closed.append(replace(item, state=UploadItemState.CLOSED))
+            if snapshot.cleanup_ready:
+                cleanup_targets.extend(snapshot.cleanup_targets)
+        return tuple(closed), tuple(dict.fromkeys(cleanup_targets))
 
     async def _record(self, job: IngestionJob, outcome: str) -> None:
         await self._audit.record(

@@ -1,6 +1,6 @@
 # Paperless Assistant architecture
 
-Status: Discord-first MVP with configurable AI review
+Status: Discord-first MVP with durable per-file AI review
 Last updated: 2026-07-28
 
 ## 1. Purpose
@@ -18,6 +18,8 @@ outbound Discord worker, Paperless adapter, application services, and durable lo
 Issues #44 and #70 complete selective review, confirmed taxonomy creation, and cache validation.
 Issue #77 makes review-field exposure and the extra creation prompt deployment policy while
 preserving application-layer write enforcement.
+Issue #79 separates each attachment into a durable per-file review and makes shared batch cleanup
+depend on explicit resolution.
 
 ## 2. System context
 
@@ -56,9 +58,9 @@ container-local listener.
 
 ## 4. Ports and adapters
 
-- inbound Discord adapter: validates transport identity, auto-creates public threads on top-level
-  user messages, renders references and AI review controls, and enforces uploader ownership on
-  every metadata-write interaction;
+- inbound Discord adapter: validates transport identity, posts one bounded metadata parent and
+  public review thread per upload attachment, renders references and AI review controls, and
+  enforces uploader ownership on every metadata-write interaction;
 - application services: authorize users and enforce query, delivery, ingestion, suggestion
   freshness/tag merging, batch inbox polling, and confirmed cleanup policy;
 - Paperless gateway: the only component that performs Paperless HTTP calls, including the
@@ -99,11 +101,16 @@ Domain and application code do not import Discord or HTTP client implementations
   check, serialized apply, bounded controls, and preservation of existing tags. Unmatched taxonomy
   names require an exact-name race check and a fresh Paperless `add_*` permission check; deployment
   policy controls whether creation also requires a second prompt.
-- Upload review retains one owner-only control surface for **Open Paperless**, **Refresh**, and
-  **Finish & Close**. Refresh and close require an additional discard confirmation while any
-  review session differs from its last applied state.
+- Each successful upload item retains owner-only **Open Paperless**, **Refresh**, **Save**, and
+  **Finish & Close** behavior. The batch summary adds **Refresh All**, **Save All**, and **Close
+  All**; bulk operations remain serialized and use the same per-document authorization,
+  freshness, permission, audit, and verification checks.
+- A rich per-file parent contains bounded metadata but no OCR or document content. Closing archives
+  and locks its thread without deleting that channel-history record.
 - Cleanup is fail-closed: Paperless batch failures do not delete Discord messages, and database
   evidence is purged only after Discord confirms deletion or absence at the exact channel/message.
+- Shared upload source and summary messages become cleanup-eligible only when every success is
+  closed, every terminal failure is manually dismissed, and no active or uncertain item remains.
 - Unsafe POST requests are never retried after an ambiguous result.
 - Container remains non-root, read-only, capability-free, and `no-new-privileges`.
 
@@ -117,7 +124,8 @@ placed in source, image layers, tests, documentation examples, issues, or pull r
 
 ## 8. Persistence and recovery target
 
-SQLite WAL storage holds ingestion jobs, Discord event idempotency, short-lived
+SQLite WAL storage holds ingestion jobs, a durable upload-batch graph with ordered item,
+parent/thread, state, and shared-cleanup identifiers, Discord event idempotency, short-lived
 document-reference context, exact cleanup channel/message targets and confirmations, the
 missing-tag warning ID/timestamp, encrypted per-user tokens, and privacy-minimized audit. Staged
 files use job UUID names and restrictive permissions.
@@ -132,6 +140,11 @@ staged -> submitting -> submitted -> succeeded | failed
 A saved Paperless task UUID resumes polling after restart. A crash in the ambiguous upload window
 never automatically resubmits. Identical content in different Discord messages remains allowed;
 only repeated processing of the same Discord event/job is suppressed.
+
+Each upload item additionally progresses through pending/processing to succeeded, failed, or
+reconciliation-required. A success becomes closed through per-file or batch close, and a failure
+becomes dismissed only through explicit acknowledgement. Those terminal item states drive exact
+shared-artifact cleanup and recovery of per-file controls.
 
 ## 9. Availability
 
@@ -165,6 +178,7 @@ SQLite job/audit state is included according to operator policy.
 - ADR 0009: fail-closed AI metadata review, diagnostics, cleanup, credentials, and CI writeback.
 - ADR 0010: complete selective AI review, confirmed taxonomy creation, and cache validation.
 - ADR 0011: configurable review fields, persistent thread controls, and creation-prompt policy.
+- ADR 0012: durable per-file review artifacts and explicit batch-resolution cleanup.
 
 Issue #10 is the canonical Discord MVP. Issue #20 corrects its default storage deployment. Issue
 #65 is the July 2026 hardening and AI-suggestions correction. Issues #44 and #70 complete its
