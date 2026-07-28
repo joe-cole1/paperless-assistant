@@ -7,6 +7,10 @@ cd "${project_dir}"
 created_env=0
 if [[ ! -f .env ]]; then
   cp .env.example .env
+  smoke_encryption_key="$(
+    python3 -c 'import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())'
+  )"
+  sed -i "s|^ENCRYPTION_KEY=.*|ENCRYPTION_KEY=${smoke_encryption_key}|" .env
   created_env=1
 fi
 

@@ -35,6 +35,7 @@ from paperless_assistant.errors import (
 from paperless_assistant.models import (
     AISuggestions,
     DeliveryPlan,
+    DiscordMessageTarget,
     Document,
     DocumentId,
     DocumentUpdate,
@@ -253,6 +254,8 @@ class FakeIngestion:
             discord_message_id=kwargs["discord_message_id"],
             discord_attachment_id=kwargs["discord_attachment_id"],
             discord_status_message_id=kwargs["discord_status_message_id"],
+            discord_message_channel_id=kwargs["discord_message_channel_id"],
+            discord_status_channel_id=kwargs["discord_status_channel_id"],
             principal_id=kwargs["principal_id"],
             staged_path=kwargs["staged_path"],
             original_filename=kwargs["original_filename"],
@@ -268,6 +271,8 @@ class FakeIngestion:
             discord_message_id=job.discord_message_id,
             discord_attachment_id=job.discord_attachment_id,
             discord_status_message_id=job.discord_status_message_id,
+            discord_message_channel_id=job.discord_message_channel_id,
+            discord_status_channel_id=job.discord_status_channel_id,
             principal_id=job.principal_id,
             staged_path=job.staged_path,
             original_filename=job.original_filename,
@@ -288,6 +293,8 @@ class FakeIngestion:
             discord_message_id=job.discord_message_id,
             discord_attachment_id=job.discord_attachment_id,
             discord_status_message_id=job.discord_status_message_id,
+            discord_message_channel_id=job.discord_message_channel_id,
+            discord_status_channel_id=job.discord_status_channel_id,
             principal_id=job.principal_id,
             staged_path=job.staged_path,
             original_filename=job.original_filename,
@@ -328,10 +335,33 @@ class FakeIngestion:
             AISuggestions(title="Fake Title", correspondent_id=1, document_type_id=1, tag_ids=(2,)),
         )
 
-    async def apply_suggestions(self, job: IngestionJob, updates: DocumentUpdate) -> None:
+    async def reload_suggestions_for_job(
+        self, job: IngestionJob
+    ) -> tuple[Document, AISuggestions] | None:
+        suggestions = await self.get_suggestions_for_job(job)
+        if suggestions is None:
+            return None
+        return (
+            Document(
+                DocumentId(job.paperless_document_id or 44),
+                "Reloaded",
+                date(2024, 1, 1),
+                modified=datetime(2026, 7, 29, tzinfo=UTC),
+            ),
+            suggestions,
+        )
+
+    async def apply_suggestions(
+        self,
+        job: IngestionJob,
+        updates: DocumentUpdate,
+        *,
+        expected_modified: datetime | None,
+    ) -> None:
+        del expected_modified
         self.applied_updates = updates
 
-    async def check_inbox_tag_removals(self) -> tuple[tuple[int, int], ...]:
+    async def check_inbox_tag_removals(self) -> tuple[DiscordMessageTarget, ...]:
         return ()
 
 
@@ -931,7 +961,7 @@ async def test_office_task_failure_includes_setup_guidance(
         guidance=MetadataGuidance(),
         state=JobState.FAILED,
     )
-    ingestion.poll_outcome = IngestionOutcome(failed_job, task_message="macro detected")
+    ingestion.poll_outcome = IngestionOutcome(failed_job)
     assistant = _assistant(
         settings,
         FakeQuery(),
@@ -947,7 +977,7 @@ async def test_office_task_failure_includes_setup_guidance(
     await assistant._uploads_message(cast(discord.Message, message))
 
     assert "Tika/Gotenberg" in message.thread.sent[0].edits[-1]["content"]
-    assert "macro detected" in message.thread.sent[0].edits[-1]["content"]
+    assert "macro detected" not in message.thread.sent[0].edits[-1]["content"]
     await assistant.close()
 
 
@@ -987,8 +1017,8 @@ async def test_warning_recovery_and_status_helpers(
         guidance=MetadataGuidance(),
         state=JobState.FAILED,
     )
-    await assistant._notify_recovery(IngestionOutcome(job, task_message="bad pdf"))
-    assert "failed: bad pdf" in channel.sent[-1].content
+    await assistant._notify_recovery(IngestionOutcome(job))
+    assert channel.sent[-1].content.endswith("processing failed.")
 
     cast(Any, assistant).get_channel = lambda _: None
     await assistant._notify_recovery(IngestionOutcome(job))
@@ -1014,7 +1044,12 @@ async def test_warning_recovery_and_status_helpers(
     await assistant._notify_recovery(IngestionOutcome(succeeded))
     assert channel.partial[-1].deleted
 
-    await assistant.cleanup_messages((10, 11), (12,))
+    targets = tuple(
+        DiscordMessageTarget(channel_id=channel.id, message_id=message_id)
+        for message_id in (10, 11, 12)
+    )
+    confirmed = await assistant.cleanup_messages(targets[:2], targets[2:])
+    assert confirmed == targets
     assert [message.id for message in channel.partial[-3:]] == [10, 11, 12]
     assert all(message.deleted for message in channel.partial[-3:])
 
@@ -1151,14 +1186,16 @@ async def test_recovery_warning_and_cleanup_edge_paths(
     await assistant._notify_recovery(
         IngestionOutcome(
             _job(tmp_path, JobState.FAILED, office_dependent=True),
-            task_message="file corrupted",
         )
     )
     assert "Tika/Gotenberg" in channel.sent[-1].content
-    assert "file corrupted" in channel.sent[-1].content
+    assert "file corrupted" not in channel.sent[-1].content
 
     cast(Any, assistant).get_channel = lambda _: None
-    await assistant.cleanup_messages((1,), (2,))
+    await assistant.cleanup_messages(
+        (DiscordMessageTarget(settings.discord_questions_channel_id, 1),),
+        (DiscordMessageTarget(settings.discord_uploads_channel_id, 2),),
+    )
     await assistant._warn_missing_tag()
 
     ingestion.warning_marker = None
@@ -1415,7 +1452,7 @@ async def test_auth_link_and_unlink_commands(
 ) -> None:
     settings = settings_factory(data_dir=tmp_path)
     settings.staging_dir.mkdir(parents=True, exist_ok=True)
-    settings.discord_allowed_user_ids = frozenset()
+    settings.discord_allowed_user_ids = frozenset({9999})
 
     class FakeCredentials:
         def __init__(self) -> None:
@@ -1489,7 +1526,7 @@ async def test_auth_status_command(
     settings_factory: Callable[..., Settings],
 ) -> None:
     settings = settings_factory(data_dir=tmp_path)
-    settings.discord_allowed_user_ids = frozenset()
+    settings.discord_allowed_user_ids = frozenset({9999})
 
     class FakeCredentials:
         def __init__(self) -> None:
@@ -1653,7 +1690,7 @@ async def test_unlinked_user_responses(
 
 
 @pytest.mark.asyncio
-async def test_ai_suggestions_view_interactions(  # noqa: PLR0915
+async def test_ai_suggestions_view_interactions(
     tmp_path: Path,
     settings_factory: Callable[..., Settings],
 ) -> None:
@@ -1679,12 +1716,12 @@ async def test_ai_suggestions_view_interactions(  # noqa: PLR0915
     ingestion = FakeIngestion()
     ingestion.apply_suggestions = AsyncMock()  # type: ignore[method-assign]
 
-    view = AISuggestionsView(job, document, suggestions, cast(Any, ingestion), frozenset({201}))
+    view = AISuggestionsView(job, document, suggestions, cast(Any, ingestion), 900)
 
-    # Unauthorized approve
+    # Cross-user interactions are rejected before Discord dispatches a button callback.
     unauth_interaction = AsyncMock(user=SimpleNamespace(id=999))
-    await view.approve_button.callback(unauth_interaction)
-    assert "Unauthorized" in unauth_interaction.response.send_message.call_args[0][0]
+    assert not await view.interaction_check(unauth_interaction)
+    assert "Only the user who uploaded" in unauth_interaction.response.send_message.call_args[0][0]
 
     # Authorized approve
     auth_interaction = AsyncMock(user=SimpleNamespace(id=201))
@@ -1695,9 +1732,9 @@ async def test_ai_suggestions_view_interactions(  # noqa: PLR0915
     ingestion.apply_suggestions.assert_called_once()
     assert auth_interaction.message.edit.call_args[1]["embed"].title == "✅ Applied to Synthetic"
 
-    # Edit modal unauthorized
-    await view.edit_button.callback(unauth_interaction)
-    assert unauth_interaction.response.send_message.call_count == 2
+    already_applied = AsyncMock(user=SimpleNamespace(id=201), message=None)
+    await view.approve_button.callback(already_applied)
+    assert "already applied" in already_applied.followup.send.call_args[0][0]
 
     # Edit modal authorized
     edit_interaction = AsyncMock(user=SimpleNamespace(id=201))
@@ -1707,7 +1744,7 @@ async def test_ai_suggestions_view_interactions(  # noqa: PLR0915
 
     # Submit modal
     modal.title_input._value = "User Edited Title"
-    modal_submit_interaction = AsyncMock()
+    modal_submit_interaction = AsyncMock(user=SimpleNamespace(id=201))
     modal_submit_interaction.message = SimpleNamespace(
         embeds=[discord.Embed().add_field(name="Suggested Title", value="Suggested")],
     )
@@ -1725,32 +1762,22 @@ async def test_ai_suggestions_view_interactions(  # noqa: PLR0915
     await view.cancel_button.callback(cancel_interaction)
     cancel_interaction.message.delete.assert_called_once()
 
-    # Coverage: approve_button with no message
-    auth_interaction_no_msg = AsyncMock(user=SimpleNamespace(id=201), message=None)
-    await view.approve_button.callback(auth_interaction_no_msg)
-
-    # Coverage: approve_button raises Exception
+    # Unexpected application failures stay generic.
+    error_view = AISuggestionsView(job, document, suggestions, cast(Any, ingestion), 900)
     ingestion.apply_suggestions.side_effect = Exception("Test Error")
     auth_interaction_err = AsyncMock(
         user=SimpleNamespace(id=201), message=SimpleNamespace(embeds=[discord.Embed()])
     )
-    await view.approve_button.callback(auth_interaction_err)
-    assert "Test Error" in auth_interaction_err.followup.send.call_args[0][0]
+    await error_view.approve_button.callback(auth_interaction_err)
+    assert "Test Error" not in auth_interaction_err.followup.send.call_args[0][0]
 
     # Coverage: modal_submit with no message
-    modal_submit_interaction_no_msg = AsyncMock(message=None)
+    modal_submit_interaction_no_msg = AsyncMock(
+        user=SimpleNamespace(id=201),
+        message=None,
+    )
     await modal.on_submit(modal_submit_interaction_no_msg)
     modal_submit_interaction_no_msg.response.defer.assert_called_once()
-
-    # Cancel unauthorized
-    unauth_cancel = AsyncMock(user=SimpleNamespace(id=999))
-    await view.cancel_button.callback(unauth_cancel)
-    assert unauth_cancel.response.send_message.call_count == 1
-
-    # Refresh unauthorized
-    unauth_refresh = AsyncMock(user=SimpleNamespace(id=999))
-    await view.refresh_button.callback(unauth_refresh)
-    assert unauth_refresh.response.send_message.call_count == 1
 
     # Refresh authorized
     auth_refresh = AsyncMock(user=SimpleNamespace(id=201))

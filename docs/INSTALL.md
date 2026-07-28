@@ -12,16 +12,18 @@ outbound to Discord, calls Paperless through its API, and binds health monitorin
 
 Before creating the bot:
 
-1. Sign in to Paperless as the administrator whose token the trusted MVP will use.
-2. Confirm native document chat works in the Paperless web interface. Ask a question that should
-   find a known synthetic or non-sensitive test document.
+1. Sign in to Paperless 3.0.4 as an administrator.
+2. Confirm AI suggestions work in Paperless itself: open a synthetic or non-sensitive test
+   document, select **Suggest**, request AI-assisted suggestions, and verify that an LLM-generated
+   title or metadata proposal appears. Classic classifier suggestions alone are not sufficient.
 3. Create exactly one Paperless tag named `Discord`.
    - The name is configurable, but it must be unique when compared case-insensitively.
    - Do not create both `Discord` and `discord`.
 4. Open the user menu, select **My Profile**, and generate or regenerate the API token with the
    circular-arrow control.
-5. Put the token directly into a password manager. Do not paste it into Discord, an issue, a shell
-   command, or a chat transcript.
+5. Put the token directly into a password manager. Do not paste it into an issue, shell command,
+   log, screenshot, or chat transcript. The assistant's ephemeral `/auth link` command is the one
+   supported Discord entry point.
 6. Record two Paperless addresses:
    - an internal address reachable from the assistant container;
    - the HTTPS address your household uses in a browser.
@@ -35,6 +37,30 @@ already has working Tika and Gotenberg services.
 
 Paperless documents the profile token workflow and API authentication in its
 [REST API guide](https://docs.paperless-ngx.com/api/).
+
+### Required Paperless 3.0.4 AI configuration
+
+AI suggestions are opt-in, synchronous LLM requests in Paperless 3.0.4. Configure them in
+**Settings → Application Configuration** or with Paperless environment variables. Database
+application settings take precedence over environment values.
+
+At minimum Paperless needs:
+
+```dotenv
+PAPERLESS_AI_ENABLED=true
+PAPERLESS_AI_LLM_BACKEND=ollama
+PAPERLESS_AI_LLM_ENDPOINT=http://ollama:11434
+PAPERLESS_AI_LLM_MODEL=llama3.1
+PAPERLESS_AI_LLM_REQUEST_TIMEOUT=120
+```
+
+For an OpenAI-compatible provider, use `PAPERLESS_AI_LLM_BACKEND=openai-like` and configure the
+provider's model, `PAPERLESS_AI_LLM_API_KEY`, and endpoint as required. A hosted provider receives
+document content and may charge for requests; assess that privacy and cost before enabling it.
+
+`PAPERLESS_AI_LLM_EMBEDDING_BACKEND` is optional for suggestions. When configured, Paperless's LLM
+index can add similar-document context; it is required for collection chat, not for the
+per-document AI suggestion request used after an upload.
 
 ## 2. Create the private Discord channels
 
@@ -120,9 +146,10 @@ In Discord:
 2. Right-click the server and select **Copy Server ID**.
 3. Right-click `paperless-questions` and copy its channel ID.
 4. Right-click `paperless-uploads` and copy its channel ID.
-5. (Optional) Right-click specific allowed household members and copy their user IDs.
+5. Right-click every allowed household member and copy their immutable user ID.
 
-If `DISCORD_ALLOWED_USER_IDS` is omitted or left empty (`[]`), any Discord user in the private channel can link their Paperless account via `/auth link`. Alternatively, restrict bot interactions to specific users with a JSON array:
+`DISCORD_ALLOWED_USER_IDS` is mandatory and must not be empty. Restrict bot interactions to the
+specific users with a JSON array:
 
 ```dotenv
 DISCORD_ALLOWED_USER_IDS=[111111111111111111,222222222222222222]
@@ -187,15 +214,17 @@ DISCORD_TOKEN=replace-with-discord-bot-token
 DISCORD_GUILD_ID=123456789012345678
 DISCORD_QUESTIONS_CHANNEL_ID=123456789012345679
 DISCORD_UPLOADS_CHANNEL_ID=123456789012345680
-DISCORD_ALLOWED_USER_IDS=[]
+DISCORD_ALLOWED_USER_IDS=[111111111111111111,222222222222222222]
 
-ENCRYPTION_KEY=replace-with-secret-passphrase-or-32-byte-base64-key
+ENCRYPTION_KEY=replace-with-generated-fernet-key
 
 PAPERLESS_INTERNAL_URL=http://paperless-webserver:8000
 PAPERLESS_PUBLIC_URL=https://paperless.example.invalid
 PAPERLESS_TOKEN=replace-with-paperless-admin-token
 PAPERLESS_SOURCE_TAG=Discord
 PAPERLESS_OFFICE_UPLOADS_ENABLED=false
+PAPERLESS_AI_SUGGESTIONS_TIMEOUT_SECONDS=150
+SUGGESTION_REVIEW_TIMEOUT_SECONDS=900
 
 CLEANUP_INBOX_TAG=inbox
 CLEANUP_INBOX_TAG_ENABLED=true
@@ -206,14 +235,29 @@ CLEANUP_UPLOAD_DELAY_MINUTES=0
 
 Important details:
 
-- `ENCRYPTION_KEY` encrypts user Paperless API tokens stored in the local SQLite database.
+- `ENCRYPTION_KEY` must be a newly generated URL-safe base64 Fernet key. Generate it once in a
+  private terminal, store it in the password manager, and paste only the result into `.env`:
+
+  ```console
+  openssl rand -base64 32 | tr '+/' '-_'
+  ```
+
+  Existing tokens encrypted with the previous passphrase-derived scheme cannot be decrypted after
+  this hardening change. Keep the database for job/audit continuity, set the new key, and have each
+  user run `/auth link` again.
 - `PAPERLESS_TOKEN` in `.env` is required for system background tasks (tag taxonomy polling and inbox tag cleanup).
 - Each channel member links their personal Paperless account by typing `/auth link <token>` ephemerally in Discord once the bot is running.
+- The linked Paperless user must be able to view and change the uploaded document; Paperless's AI
+  suggestion endpoint enforces its owner-aware `change_document` permission.
 - `PAPERLESS_INTERNAL_URL` must work from inside this container, not merely from the Docker host.
 - `PAPERLESS_PUBLIC_URL` must be the HTTPS browser URL your users open.
 - Do not add `Token ` before `PAPERLESS_TOKEN`; supply only the token value.
 - Keep Office uploads `false` for the first startup.
 - `CLEANUP_INBOX_TAG` configures the Paperless tag monitored for automatic Discord message removal once removed in Paperless.
+- `PAPERLESS_AI_SUGGESTIONS_TIMEOUT_SECONDS` must be greater than Paperless's
+  `PAPERLESS_AI_LLM_REQUEST_TIMEOUT`; the defaults are 150 and 120 seconds respectively.
+- `SUGGESTION_REVIEW_TIMEOUT_SECONDS` bounds how long the uploader-only Apply/Edit/Reload controls
+  remain active.
 - `CLEANUP_QUESTION_DELAY_MINUTES` and `CLEANUP_UPLOAD_DELAY_MINUTES` optionally set auto-deletion timers (0 = default daily 03:00 purge).
 - `DISCORD_MAX_ATTACHMENT_BYTES` controls incoming uploads only. Outgoing files use Discord's
   effective runtime limit automatically.
@@ -296,8 +340,9 @@ Review startup logs:
 docker compose logs --tail=100 paperless-assistant
 ```
 
-The logs must not contain tokens, questions, answers, filenames, captions, document titles, OCR, or
-taxonomy values.
+The logs must not contain authorization headers or credentials. Paperless failure diagnostics are
+bounded, escaped, and credential-redacted but may contain upstream validation detail, so restrict
+server-log access to operators.
 
 ## 10. Manual acceptance test
 
@@ -347,9 +392,16 @@ does not add another AI or try to make the result exhaustive.
    - unambiguous exact taxonomy names were applied;
    - Paperless chose the title and performed its normal classification;
    - each successful document has one note beginning `Discord upload guidance:`.
-6. Confirm the original Discord upload message is removed only after every file succeeds or
+6. For each successful document, confirm Discord shows **Paperless AI suggestions** with any
+   proposed title, correspondent, document type, storage path, date, matched tags, and unmatched
+   names.
+7. As a different allowlisted user, try an AI control and confirm it is rejected. As the uploader,
+   edit and apply the proposal, then verify Paperless metadata changed while its existing tags
+   remained present. Change the document in Paperless before applying another proposal and confirm
+   the stale review is rejected instead of overwriting the newer edit.
+8. Confirm the original Discord upload message is removed only after every file succeeds or
    resolves as a Paperless duplicate.
-7. Upload the same synthetic file again in a separate Discord message. Confirm the assistant sends
+9. Upload the same synthetic file again in a separate Discord message. Confirm the assistant sends
    it again and Paperless owns duplicate handling.
 
 ### Failure and recovery
@@ -427,10 +479,23 @@ Only after the normal tests pass and Paperless Tika/Gotenberg are known to work:
 - Confirm every attachment in the batch actually succeeded or resolved as a duplicate.
 - Failed, timed-out, active, and reconciliation-required batches are deliberately retained.
 
+### AI suggestions are unavailable after upload
+
+- In Paperless 3.0.4, verify the document detail page's AI **Suggest** action works for the same
+  linked user. Classic suggestions do not prove the LLM endpoint is healthy.
+- Confirm `PAPERLESS_AI_ENABLED`, backend, model, endpoint, and API key in Paperless. Remember that
+  Application Configuration database values override environment values.
+- Keep the assistant's `PAPERLESS_AI_SUGGESTIONS_TIMEOUT_SECONDS` above Paperless's
+  `PAPERLESS_AI_LLM_REQUEST_TIMEOUT`.
+- Inspect the assistant server log for `paperless_request_failed`; Discord intentionally shows a
+  generic error.
+- Embeddings are optional for per-document suggestions. Diagnose the embedding/index service only
+  when RAG grounding or collection chat is also required.
+
 ### Questions return only basic results
 
 - Test native chat in the Paperless web interface.
-- Confirm Paperless's Gemini-backed AI configuration and embeddings are healthy.
+- Confirm Paperless's configured LLM and embeddings are healthy.
 - Basic full-text search is the intentional fallback when native chat fails or returns no content.
 
 ### A file is too large for Discord

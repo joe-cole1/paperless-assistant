@@ -22,6 +22,7 @@ def settings_factory(tmp_path: Path) -> Callable[..., Settings]:
             "discord_questions_channel_id": 101,
             "discord_uploads_channel_id": 102,
             "discord_allowed_user_ids": frozenset({201, 202}),
+            "encryption_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             "paperless_internal_url": "http://paperless.test",
             "paperless_public_url": "https://paperless.example.test",
             "paperless_token": "synthetic-paperless-token",
