@@ -15,6 +15,7 @@ import pytest
 from paperless_assistant import app as app_module
 from paperless_assistant.app import Runtime, create_app, main
 from paperless_assistant.config import Settings
+from paperless_assistant.models import DiscordMessageTarget
 
 
 @pytest.mark.asyncio
@@ -137,8 +138,15 @@ async def test_runtime_cleanup_loop_runs_daily_maintenance(
             return cls(2026, 7, 26, 12, tzinfo=UTC)
 
     runtime = Runtime(settings_factory(cleanup_hour_local=cleanup_hour))
-    cast(Any, runtime.repository).cleanup_message_ids = AsyncMock(return_value=((10,), (20,)))
-    cast(Any, runtime.discord).cleanup_messages = AsyncMock()
+    question_target = DiscordMessageTarget(channel_id=1, message_id=10)
+    upload_target = DiscordMessageTarget(channel_id=2, message_id=20)
+    cast(Any, runtime.repository).cleanup_message_ids = AsyncMock(
+        return_value=((question_target,), (upload_target,))
+    )
+    cast(Any, runtime.discord).cleanup_messages = AsyncMock(
+        return_value=(question_target, upload_target)
+    )
+    cast(Any, runtime.repository).confirm_message_cleanup = AsyncMock()
     cast(Any, runtime.repository).purge = AsyncMock()
     cast(Any, runtime)._purge_delivery_spool = MagicMock()
     cast(Any, runtime)._purge_orphan_staging = AsyncMock()
@@ -150,7 +158,12 @@ async def test_runtime_cleanup_loop_runs_daily_maintenance(
         await runtime._cleanup_loop()
 
     assert sleep.await_args_list[0].args == (expected_sleep,)
-    cast(Any, runtime.discord).cleanup_messages.assert_awaited_once_with((10,), (20,))
+    cast(Any, runtime.discord).cleanup_messages.assert_awaited_once_with(
+        (question_target,), (upload_target,)
+    )
+    cast(Any, runtime.repository).confirm_message_cleanup.assert_awaited_once_with(
+        (question_target, upload_target)
+    )
     cast(Any, runtime.repository).purge.assert_awaited_once()
     await runtime.paperless.close()
     await runtime.discord.close()
@@ -238,10 +251,12 @@ async def test_runtime_inbox_tag_cleanup_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = Runtime(settings_factory(cleanup_inbox_tag_poll_interval_seconds=30))
+    upload_target = DiscordMessageTarget(channel_id=2, message_id=100)
     cast(Any, runtime.ingestion).check_inbox_tag_removals = AsyncMock(
-        side_effect=[(), (100,), Exception("synthetic"), asyncio.CancelledError]
+        side_effect=[(), (upload_target,), Exception("synthetic"), asyncio.CancelledError]
     )
-    cast(Any, runtime.discord).cleanup_messages = AsyncMock()
+    cast(Any, runtime.discord).cleanup_messages = AsyncMock(return_value=(upload_target,))
+    cast(Any, runtime.repository).confirm_message_cleanup = AsyncMock()
 
     calls = 0
 
@@ -257,6 +272,7 @@ async def test_runtime_inbox_tag_cleanup_loop(
     with pytest.raises(asyncio.CancelledError):
         await runtime._inbox_tag_cleanup_loop()
 
-    cast(Any, runtime.discord).cleanup_messages.assert_awaited_once_with((), (100,))
+    cast(Any, runtime.discord).cleanup_messages.assert_awaited_once_with((), (upload_target,))
+    cast(Any, runtime.repository).confirm_message_cleanup.assert_awaited_once_with((upload_target,))
     await runtime.paperless.close()
     await runtime.discord.close()

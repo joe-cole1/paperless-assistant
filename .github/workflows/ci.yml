@@ -6,20 +6,98 @@ on:
     branches: [main]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  format:
+    name: Prepare trusted Ruff formatting patch
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out pull request source without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.11.31
+          enable-cache: false
+      - name: Apply Ruff fixes without running project code
+        run: |
+          uv tool run --from ruff==0.16.0 ruff check --fix --exit-zero .
+          uv tool run --from ruff==0.16.0 ruff format .
+      - name: Validate and create formatting-only patch
+        env:
+          FORMAT_PATCH: ${{ runner.temp }}/ruff-format.patch
+        run: |
+          git diff --check
+          invalid_paths="$(
+            git diff --name-only |
+              while IFS= read -r path; do
+                case "${path}" in
+                  *.py|*.pyi) ;;
+                  *) printf '%s\n' "${path}" ;;
+                esac
+              done
+          )"
+          if [[ -n "${invalid_paths}" ]]; then
+            echo "::error::Ruff unexpectedly changed non-Python paths."
+            printf '%s\n' "${invalid_paths}"
+            exit 1
+          fi
+          git diff --no-ext-diff --src-prefix=a/ --dst-prefix=b/ -- '*.py' '*.pyi' \
+            > "${FORMAT_PATCH}"
+      - name: Upload immutable formatting patch
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ruff-format-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ruff-format.patch
+          if-no-files-found: error
+          retention-days: 1
+      - name: Require contributors to format fork pull requests
+        if: github.event.pull_request.head.repo.full_name != github.repository
+        env:
+          FORMAT_PATCH: ${{ runner.temp }}/ruff-format.patch
+        run: |
+          if [[ -s "${FORMAT_PATCH}" ]]; then
+            echo "::error::This fork needs Ruff formatting; run ./scripts/quality_checks.sh locally."
+            exit 1
+          fi
+
   quality:
     name: Python quality and security
+    needs: [format]
+    if: >-
+      always() &&
+      (github.event_name == 'push' || needs.format.result == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download formatting patch
+        if: github.event_name == 'pull_request'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ruff-format-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/format
+      - name: Apply formatting patch for validation
+        if: github.event_name == 'pull_request'
+        env:
+          FORMAT_PATCH: ${{ runner.temp }}/format/ruff-format.patch
+        run: |
+          if [[ -s "${FORMAT_PATCH}" ]]; then
+            git apply --check "${FORMAT_PATCH}"
+            git apply "${FORMAT_PATCH}"
+          fi
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
@@ -28,18 +106,95 @@ jobs:
           cache-dependency-glob: uv.lock
       - name: Run the local quality gate
         run: ./scripts/quality_checks.sh
-      - name: Auto-commit formatted code
-        uses: stefanzweifel/git-auto-commit-action@v5
-        if: always()
-        with:
-          commit_message: "style: auto-format code"
 
   container:
     name: Container build and smoke test
+    needs: [format]
+    if: >-
+      always() &&
+      (github.event_name == 'push' || needs.format.result == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download formatting patch
+        if: github.event_name == 'pull_request'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ruff-format-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/format
+      - name: Apply formatting patch for container validation
+        if: github.event_name == 'pull_request'
+        env:
+          FORMAT_PATCH: ${{ runner.temp }}/format/ruff-format.patch
+        run: |
+          if [[ -s "${FORMAT_PATCH}" ]]; then
+            git apply --check "${FORMAT_PATCH}"
+            git apply "${FORMAT_PATCH}"
+          fi
       - name: Build and smoke-test Compose stack
         run: ./scripts/container_smoke_test.sh
+
+  format-writeback:
+    name: Commit validated formatting
+    needs: [format, quality, container]
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      needs.format.result == 'success' &&
+      needs.quality.result == 'success' &&
+      needs.container.result == 'success'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out exact pull request head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - name: Download validated formatting patch
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ruff-format-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/format
+      - name: Validate, commit, and push formatting only
+        env:
+          FORMAT_PATCH: ${{ runner.temp }}/format/ruff-format.patch
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          if [[ ! -s "${FORMAT_PATCH}" ]]; then
+            echo "No formatting changes to commit."
+            exit 0
+          fi
+          if [[ "$(wc -c < "${FORMAT_PATCH}")" -gt 1048576 ]]; then
+            echo "::error::Formatting patch exceeds the 1 MiB safety limit."
+            exit 1
+          fi
+          git apply --check "${FORMAT_PATCH}"
+          git apply "${FORMAT_PATCH}"
+          invalid_paths="$(
+            git diff --name-only |
+              while IFS= read -r path; do
+                case "${path}" in
+                  *.py|*.pyi) ;;
+                  *) printf '%s\n' "${path}" ;;
+                esac
+              done
+          )"
+          if [[ -n "${invalid_paths}" ]]; then
+            echo "::error::Refusing a formatting patch with non-Python paths."
+            printf '%s\n' "${invalid_paths}"
+            exit 1
+          fi
+          git diff --check
+          git config core.hooksPath /dev/null
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- '*.py' '*.pyi'
+          git commit -m "style: auto-format code"
+          git push origin "HEAD:${PR_HEAD_REF}"

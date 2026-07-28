@@ -6,6 +6,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Literal, Self
 
+from cryptography.fernet import Fernet
 from pydantic import AnyHttpUrl, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -40,10 +41,7 @@ class Settings(BaseSettings):
     discord_questions_channel_id: int = Field(gt=0)
     discord_uploads_channel_id: int = Field(gt=0)
     discord_allowed_user_ids: frozenset[int] = Field(default_factory=frozenset)
-    encryption_key: SecretStr = Field(
-        default=SecretStr("development-encryption-key-must-be-provided-in-production"),
-        min_length=1,
-    )
+    encryption_key: SecretStr = Field(min_length=1)
     discord_max_attachments: int = Field(default=10, ge=1, le=10)
     discord_max_attachment_bytes: int = Field(default=25 * MIB, ge=1)
 
@@ -63,6 +61,7 @@ class Settings(BaseSettings):
     paperless_write_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     paperless_pool_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
     paperless_chat_timeout_seconds: float = Field(default=120.0, gt=0, le=600)
+    paperless_ai_suggestions_timeout_seconds: float = Field(default=150.0, ge=121, le=600)
     paperless_native_task_notification_timeout_seconds: int = Field(
         default=15 * 60, ge=30, le=24 * 60 * 60
     )
@@ -78,6 +77,7 @@ class Settings(BaseSettings):
     question_user_rate_limit: int = Field(default=10, ge=1, le=100)
     question_user_rate_window_seconds: int = Field(default=300, ge=10, le=3600)
     reference_context_ttl_seconds: int = Field(default=15 * 60, ge=60, le=24 * 60 * 60)
+    suggestion_review_timeout_seconds: int = Field(default=15 * 60, ge=60, le=24 * 60 * 60)
 
     cleanup_hour_local: int = Field(default=3, ge=0, le=23)
     cleanup_inbox_tag: str = Field(default="inbox", min_length=1, max_length=100)
@@ -118,9 +118,23 @@ class Settings(BaseSettings):
     @field_validator("discord_allowed_user_ids")
     @classmethod
     def validate_user_ids(cls, value: frozenset[int]) -> frozenset[int]:
-        """Require immutable positive Discord snowflakes when non-empty."""
+        """Require an explicit, non-empty set of positive Discord snowflakes."""
+        if not value:
+            raise ValueError("must contain at least one authorized Discord user ID")
         if any(identifier <= 0 for identifier in value):
             raise ValueError("must contain only positive Discord user IDs")
+        return value
+
+    @field_validator("encryption_key")
+    @classmethod
+    def validate_encryption_key(cls, value: SecretStr) -> SecretStr:
+        """Require a generated Fernet key instead of a guessable passphrase."""
+        try:
+            Fernet(value.get_secret_value().encode("ascii"))
+        except (UnicodeEncodeError, ValueError) as error:
+            raise ValueError(
+                "must be a URL-safe base64 Fernet key; generate one with Fernet.generate_key()"
+            ) from error
         return value
 
     @field_validator("data_dir")

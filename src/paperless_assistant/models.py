@@ -27,6 +27,7 @@ class Taxonomy:
     tags: tuple[TaxonomyItem, ...]
     correspondents: tuple[TaxonomyItem, ...]
     document_types: tuple[TaxonomyItem, ...]
+    storage_paths: tuple[TaxonomyItem, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,12 +41,18 @@ class MetadataGuidance:
 
 @dataclass(frozen=True, slots=True)
 class AISuggestions:
-    """Native AI suggested metadata for an existing document."""
+    """Native Paperless LLM suggestions, including names not yet in its taxonomy."""
 
     title: str | None = None
     correspondent_id: int | None = None
     document_type_id: int | None = None
+    storage_path_id: int | None = None
     tag_ids: tuple[int, ...] = field(default_factory=tuple)
+    dates: tuple[date, ...] = field(default_factory=tuple)
+    suggested_correspondents: tuple[str, ...] = field(default_factory=tuple)
+    suggested_document_types: tuple[str, ...] = field(default_factory=tuple)
+    suggested_storage_paths: tuple[str, ...] = field(default_factory=tuple)
+    suggested_tags: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +62,8 @@ class DocumentUpdate:
     title: str | None = None
     correspondent_id: int | None = None
     document_type_id: int | None = None
+    storage_path_id: int | None = None
+    created: date | None = None
     tag_ids: tuple[int, ...] | None = None
 
 
@@ -67,6 +76,17 @@ class Document:
     created: date | None
     original_filename: str | None = None
     archived_filename: str | None = None
+    modified: datetime | None = None
+    tag_ids: tuple[int, ...] = field(default_factory=tuple)
+    storage_path_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordMessageTarget:
+    """One exact Discord channel/message pair eligible for policy cleanup."""
+
+    channel_id: int
+    message_id: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +159,8 @@ class IngestionJob:
     caption: str
     guidance: MetadataGuidance
     discord_status_message_id: int | None = None
+    discord_message_channel_id: int | None = None
+    discord_status_channel_id: int | None = None
     state: JobState = JobState.STAGED
     paperless_task_id: UUID | None = None
     paperless_document_id: DocumentId | None = None

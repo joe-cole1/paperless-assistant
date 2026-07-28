@@ -43,5 +43,9 @@ class UnlinkedUserError(AssistantError):
     """The Discord user has not linked their Paperless account yet."""
 
 
+class StaleSuggestionError(AssistantError):
+    """The document changed after the suggestion review was rendered."""
+
+
 class InvalidTokenError(AssistantError):
     """The provided Paperless API token was rejected by Paperless."""
