@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import Mapping
@@ -278,51 +279,57 @@ class HttpPaperlessGateway:
         self, document_id: int, *, token: SecretStr | None = None
     ) -> AISuggestions:
         """Fetch native Paperless AI metadata suggestions for a document."""
-        try:
-            response = await self._client.get(
-                f"api/documents/{document_id}/suggestions/", headers=self._headers(token)
-            )
-        except httpx.HTTPError as error:
-            raise PaperlessUnavailableError("Paperless suggestions unavailable") from error
-        self._raise_status(response)
-        try:
-            payload = response.json()
-            title_suggestions = payload.get("title", [])
-            title = (
-                title_suggestions[0]
-                if isinstance(title_suggestions, list) and title_suggestions
-                else None
-            )
+        async def _fetch(endpoint: str) -> dict[str, Any] | None:
+            try:
+                response = await self._client.get(
+                    f"api/documents/{document_id}/{endpoint}/", headers=self._headers(token)
+                )
+                if response.status_code == 200:
+                    payload = response.json()
+                    return payload if isinstance(payload, dict) else None
+            except (httpx.HTTPError, ValueError):
+                pass
+            return None
 
-            corr_suggestions = payload.get("correspondents", [])
-            corr = (
-                corr_suggestions[0]
-                if isinstance(corr_suggestions, list) and corr_suggestions
-                else None
-            )
+        ai_payload, ml_payload = await asyncio.gather(
+            _fetch("ai_suggestions"), _fetch("suggestions")
+        )
 
-            dtype_suggestions = payload.get("document_types", [])
-            dtype = (
-                dtype_suggestions[0]
-                if isinstance(dtype_suggestions, list) and dtype_suggestions
-                else None
-            )
+        if ai_payload is None and ml_payload is None:
+            raise PaperlessUnavailableError("Paperless suggestions unavailable")
 
-            tag_suggestions = payload.get("tags", [])
-            tags = (
-                tuple(t for t in tag_suggestions if isinstance(t, int))
-                if isinstance(tag_suggestions, list)
-                else ()
-            )
+        ai_payload = ai_payload or {}
+        ml_payload = ml_payload or {}
 
-            return AISuggestions(
-                title=title if isinstance(title, str) else None,
-                correspondent_id=corr if isinstance(corr, int) else None,
-                document_type_id=dtype if isinstance(dtype, int) else None,
-                tag_ids=tags,
-            )
-        except (ValueError, TypeError, AttributeError) as error:
-            raise PaperlessUnavailableError("malformed suggestions response") from error
+        def _get_first(key: str) -> Any | None:
+            val = ai_payload.get(key, [])
+            if isinstance(val, list) and val:
+                return val[0]
+            val = ml_payload.get(key, [])
+            if isinstance(val, list) and val:
+                return val[0]
+            return None
+
+        title = _get_first("title")
+        corr = _get_first("correspondents")
+        dtype = _get_first("document_types")
+
+        ai_tags = ai_payload.get("tags", [])
+        ml_tags = ml_payload.get("tags", [])
+        tags_list = (
+            ai_tags
+            if isinstance(ai_tags, list) and ai_tags
+            else (ml_tags if isinstance(ml_tags, list) else [])
+        )
+        tags = tuple(t for t in tags_list if isinstance(t, int))
+
+        return AISuggestions(
+            title=title if isinstance(title, str) else None,
+            correspondent_id=corr if isinstance(corr, int) else None,
+            document_type_id=dtype if isinstance(dtype, int) else None,
+            tag_ids=tags,
+        )
+
 
     async def update_document(
         self, document_id: int, updates: DocumentUpdate, *, token: SecretStr | None = None
