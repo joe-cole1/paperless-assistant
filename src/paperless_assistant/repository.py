@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
 import sqlite3
 from collections.abc import AsyncIterator, Iterator
@@ -19,6 +17,7 @@ from pydantic import SecretStr
 from paperless_assistant.models import (
     ALLOWED_JOB_TRANSITIONS,
     AuditEvent,
+    DiscordMessageTarget,
     DocumentId,
     IngestionJob,
     JobState,
@@ -49,6 +48,10 @@ CREATE TABLE IF NOT EXISTS ingestion_jobs (
     discord_message_id INTEGER NOT NULL,
     discord_attachment_id INTEGER NOT NULL,
     discord_status_message_id INTEGER,
+    discord_message_channel_id INTEGER,
+    discord_status_channel_id INTEGER,
+    discord_message_cleaned INTEGER NOT NULL DEFAULT 0,
+    discord_status_message_cleaned INTEGER NOT NULL DEFAULT 0,
     principal_id INTEGER NOT NULL,
     staged_path TEXT NOT NULL,
     original_filename TEXT NOT NULL,
@@ -76,6 +79,7 @@ CREATE TABLE IF NOT EXISTS reference_context (
 
 CREATE TABLE IF NOT EXISTS question_messages (
     discord_message_id INTEGER PRIMARY KEY,
+    channel_id INTEGER,
     created_at TEXT NOT NULL
 );
 
@@ -118,9 +122,7 @@ def _parse_datetime(value: str) -> datetime:
 
 
 def _fernet_from_secret(secret: SecretStr) -> Fernet:
-    key_bytes = secret.get_secret_value().encode("utf-8")
-    derived = base64.urlsafe_b64encode(hashlib.sha256(key_bytes).digest())
-    return Fernet(derived)
+    return Fernet(secret.get_secret_value().encode("ascii"))
 
 
 class SQLiteRepository:
@@ -207,6 +209,20 @@ class SQLiteRepository:
                 connection.execute(
                     "ALTER TABLE ingestion_jobs ADD COLUMN discord_status_message_id INTEGER"
                 )
+            for name, definition in (
+                ("discord_message_channel_id", "INTEGER"),
+                ("discord_status_channel_id", "INTEGER"),
+                ("discord_message_cleaned", "INTEGER NOT NULL DEFAULT 0"),
+                ("discord_status_message_cleaned", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE ingestion_jobs ADD COLUMN {name} {definition}")
+            question_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(question_messages)").fetchall()
+            }
+            if "channel_id" not in question_columns:
+                connection.execute("ALTER TABLE question_messages ADD COLUMN channel_id INTEGER")
             connection.commit()
         self._database_path.chmod(0o600)
 
@@ -265,17 +281,20 @@ class SQLiteRepository:
                 """
                 INSERT OR IGNORE INTO ingestion_jobs(
                     id, discord_message_id, discord_attachment_id,
-                    discord_status_message_id, principal_id, staged_path,
+                    discord_status_message_id, discord_message_channel_id,
+                    discord_status_channel_id, principal_id, staged_path,
                     original_filename, media_type, office_dependent, caption,
                     guidance_json, state, paperless_task_id,
                     paperless_document_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(job.id),
                     job.discord_message_id,
                     job.discord_attachment_id,
                     job.discord_status_message_id,
+                    job.discord_message_channel_id,
+                    job.discord_status_channel_id,
                     job.principal_id,
                     str(job.staged_path),
                     job.original_filename,
@@ -301,6 +320,8 @@ class SQLiteRepository:
             discord_message_id=row["discord_message_id"],
             discord_attachment_id=row["discord_attachment_id"],
             discord_status_message_id=row["discord_status_message_id"],
+            discord_message_channel_id=row["discord_message_channel_id"],
+            discord_status_channel_id=row["discord_status_channel_id"],
             principal_id=row["principal_id"],
             staged_path=Path(row["staged_path"]),
             original_filename=row["original_filename"],
@@ -403,10 +424,15 @@ class SQLiteRepository:
             created_at = _iso(_utc_now())
             connection.executemany(
                 """
-                INSERT OR IGNORE INTO question_messages(discord_message_id, created_at)
-                VALUES (?, ?)
+                INSERT INTO question_messages(discord_message_id, channel_id, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(discord_message_id) DO UPDATE SET
+                    channel_id=excluded.channel_id
                 """,
-                ((message_id, created_at) for message_id in context.source_message_ids),
+                (
+                    (message_id, context.principal_id, created_at)
+                    for message_id in context.source_message_ids
+                ),
             )
             connection.commit()
 
@@ -455,28 +481,42 @@ class SQLiteRepository:
 
     async def cleanup_message_ids(
         self, *, context_before: str, succeeded_before: str, failed_before: str
-    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        """Return old question result IDs and resolved upload source IDs."""
+    ) -> tuple[tuple[DiscordMessageTarget, ...], tuple[DiscordMessageTarget, ...]]:
+        """Return exact old question and resolved-upload Discord targets."""
         with self._connection() as connection:
             context_cursor = connection.execute(
                 """
-                SELECT discord_message_id FROM question_messages
+                SELECT channel_id, discord_message_id FROM question_messages
                 WHERE created_at < ?
-                ORDER BY created_at, discord_message_id
+                  AND channel_id IS NOT NULL
+                ORDER BY created_at, channel_id, discord_message_id
                 """,
                 (context_before,),
             )
-            context_ids = tuple(row["discord_message_id"] for row in context_cursor.fetchall())
+            context_targets = tuple(
+                DiscordMessageTarget(row["channel_id"], row["discord_message_id"])
+                for row in context_cursor.fetchall()
+            )
             upload_cursor = connection.execute(
                 """
                 SELECT
                     discord_message_id,
                     discord_status_message_id,
+                    discord_message_channel_id,
+                    discord_status_channel_id,
+                    discord_message_cleaned,
+                    discord_status_message_cleaned,
                     MAX(CASE WHEN state NOT IN (?, ?) THEN 1 ELSE 0 END) AS unresolved,
                     MAX(CASE WHEN state = ? THEN 1 ELSE 0 END) AS has_failed,
                     MAX(updated_at) AS newest_update
                 FROM ingestion_jobs
-                GROUP BY discord_message_id, discord_status_message_id
+                GROUP BY
+                    discord_message_id,
+                    discord_status_message_id,
+                    discord_message_channel_id,
+                    discord_status_channel_id,
+                    discord_message_cleaned,
+                    discord_status_message_cleaned
                 """,
                 (
                     JobState.SUCCEEDED.value,
@@ -484,23 +524,65 @@ class SQLiteRepository:
                     JobState.FAILED.value,
                 ),
             )
-            upload_ids = tuple(
-                dict.fromkeys(
-                    identifier
-                    for row in upload_cursor.fetchall()
-                    if row["unresolved"] == 0
-                    and (
-                        (row["has_failed"] == 0 and row["newest_update"] < succeeded_before)
-                        or (row["has_failed"] == 1 and row["newest_update"] < failed_before)
-                    )
-                    for identifier in (
-                        row["discord_message_id"],
-                        row["discord_status_message_id"],
-                    )
-                    if identifier is not None
+            upload_targets: list[DiscordMessageTarget] = []
+            for row in upload_cursor.fetchall():
+                eligible = row["unresolved"] == 0 and (
+                    (row["has_failed"] == 0 and row["newest_update"] < succeeded_before)
+                    or (row["has_failed"] == 1 and row["newest_update"] < failed_before)
                 )
-            )
-        return context_ids, upload_ids
+                if not eligible:
+                    continue
+                if (
+                    not row["discord_message_cleaned"]
+                    and row["discord_message_channel_id"] is not None
+                ):
+                    upload_targets.append(
+                        DiscordMessageTarget(
+                            row["discord_message_channel_id"],
+                            row["discord_message_id"],
+                        )
+                    )
+                if (
+                    not row["discord_status_message_cleaned"]
+                    and row["discord_status_channel_id"] is not None
+                    and row["discord_status_message_id"] is not None
+                ):
+                    upload_targets.append(
+                        DiscordMessageTarget(
+                            row["discord_status_channel_id"],
+                            row["discord_status_message_id"],
+                        )
+                    )
+        return context_targets, tuple(dict.fromkeys(upload_targets))
+
+    async def confirm_message_cleanup(self, targets: tuple[DiscordMessageTarget, ...]) -> None:
+        """Forget cleanup evidence only after Discord confirms deletion or absence."""
+        with self._connection() as connection:
+            for target in targets:
+                connection.execute(
+                    """
+                    DELETE FROM question_messages
+                    WHERE channel_id = ? AND discord_message_id = ?
+                    """,
+                    (target.channel_id, target.message_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE ingestion_jobs
+                    SET discord_message_cleaned = 1
+                    WHERE discord_message_channel_id = ? AND discord_message_id = ?
+                    """,
+                    (target.channel_id, target.message_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE ingestion_jobs
+                    SET discord_status_message_cleaned = 1
+                    WHERE discord_status_channel_id = ? AND discord_status_message_id = ?
+                    """,
+                    (target.channel_id, target.message_id),
+                )
+            connection.commit()
 
     async def message_job_states(self, discord_message_id: int) -> tuple[JobState, ...]:
         """Return durable attachment states for recovery-time source cleanup."""
@@ -516,32 +598,57 @@ class SQLiteRepository:
             rows = cursor.fetchall()
         return tuple(JobState(row["state"]) for row in rows)
 
-    async def active_succeeded_uploads(self) -> tuple[tuple[tuple[int, ...], int], ...]:
-        """Return tuple of ((message_id, ...), paperless_document_id)
-        for active succeeded uploads.
-        """
+    async def active_succeeded_uploads(
+        self,
+    ) -> tuple[tuple[tuple[DiscordMessageTarget, ...], int], ...]:
+        """Return exact active Discord targets grouped by succeeded document."""
         with self._connection() as connection:
             cursor = connection.execute(
                 """
-                SELECT discord_status_message_id, discord_message_id, paperless_document_id
+                SELECT
+                    discord_status_message_id,
+                    discord_message_id,
+                    discord_message_channel_id,
+                    discord_status_channel_id,
+                    discord_message_cleaned,
+                    discord_status_message_cleaned,
+                    paperless_document_id
                 FROM ingestion_jobs
                 WHERE state = ?
                   AND paperless_document_id IS NOT NULL
-                  AND (discord_status_message_id IS NOT NULL OR discord_message_id IS NOT NULL)
+                  AND (
+                    discord_message_cleaned = 0
+                    OR (
+                        discord_status_message_id IS NOT NULL
+                        AND discord_status_message_cleaned = 0
+                    )
+                  )
                 """,
                 (JobState.SUCCEEDED.value,),
             )
             rows = cursor.fetchall()
-        results: list[tuple[tuple[int, ...], int]] = []
+        results: list[tuple[tuple[DiscordMessageTarget, ...], int]] = []
         for row in rows:
-            msg_ids = tuple(
-                dict.fromkeys(
-                    int(val)
-                    for val in (row["discord_status_message_id"], row["discord_message_id"])
-                    if val is not None
+            targets: list[DiscordMessageTarget] = []
+            if not row["discord_message_cleaned"] and row["discord_message_channel_id"] is not None:
+                targets.append(
+                    DiscordMessageTarget(
+                        row["discord_message_channel_id"],
+                        row["discord_message_id"],
+                    )
                 )
-            )
-            results.append((msg_ids, int(row["paperless_document_id"])))
+            if (
+                not row["discord_status_message_cleaned"]
+                and row["discord_status_channel_id"] is not None
+                and row["discord_status_message_id"] is not None
+            ):
+                targets.append(
+                    DiscordMessageTarget(
+                        row["discord_status_channel_id"],
+                        row["discord_status_message_id"],
+                    )
+                )
+            results.append((tuple(dict.fromkeys(targets)), int(row["paperless_document_id"])))
         return tuple(results)
 
     async def protected_staged_paths(self) -> frozenset[Path]:
@@ -581,33 +688,47 @@ class SQLiteRepository:
             connection.execute("DELETE FROM warning_state WHERE singleton = 1")
             connection.commit()
 
-    async def actions(self) -> AsyncIterator[str]:
-        """Yield action names for privacy-focused contract tests."""
+    def _action_names(self) -> tuple[str, ...]:
         with self._connection() as connection:
             cursor = connection.execute("SELECT action FROM audit_events ORDER BY id")
             rows = cursor.fetchall()
-        for row in rows:
-            yield row["action"]
+        return tuple(row["action"] for row in rows)
 
-    async def purge(self, *, context_before: str, audit_before: str, failed_before: str) -> None:
-        """Purge expired context/audit and resolved transient job data."""
+    async def actions(self) -> AsyncIterator[str]:
+        """Yield action names for privacy-focused contract tests."""
+        for action in self._action_names():
+            yield action
+
+    async def purge(
+        self,
+        *,
+        expired_before: str,
+        audit_before: str,
+        succeeded_before: str,
+        failed_before: str,
+    ) -> None:
+        """Purge expired state only after Discord cleanup evidence is confirmed."""
         with self._connection() as connection:
             connection.execute(
-                "DELETE FROM reference_context WHERE expires_at < ?", (context_before,)
-            )
-            connection.execute(
-                "DELETE FROM question_messages WHERE created_at < ?", (context_before,)
+                "DELETE FROM reference_context WHERE expires_at < ?", (expired_before,)
             )
             connection.execute("DELETE FROM audit_events WHERE occurred_at < ?", (audit_before,))
             connection.execute(
                 """
                 DELETE FROM ingestion_jobs
-                WHERE (state = ? AND updated_at < ?)
-                   OR (state = ? AND updated_at < ?)
+                WHERE discord_message_cleaned = 1
+                  AND (
+                    discord_status_message_id IS NULL
+                    OR discord_status_message_cleaned = 1
+                  )
+                  AND (
+                    (state = ? AND updated_at < ?)
+                    OR (state = ? AND updated_at < ?)
+                  )
                 """,
                 (
                     JobState.SUCCEEDED.value,
-                    context_before,
+                    succeeded_before,
                     JobState.FAILED.value,
                     failed_before,
                 ),

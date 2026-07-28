@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from datetime import date
 from pathlib import Path
+from typing import Any, cast
 from uuid import uuid4
 
 import httpx
@@ -85,9 +87,33 @@ async def test_get_document_tag_ids(settings_factory: Callable[..., Settings]) -
 
     gateway = _gateway(settings_factory, handler)
     assert await gateway.get_document_tag_ids(100) == (1, 2, 5)
-    assert await gateway.get_document_tag_ids(101) == ()
-    assert await gateway.get_document_tag_ids(404) == ()
-    assert await gateway.get_document_tag_ids(500) == ()
+    with pytest.raises(PaperlessUnavailableError, match="malformed"):
+        await gateway.get_document_tag_ids(101)
+    assert await gateway.get_document_tag_ids(404) is None
+    with pytest.raises(PaperlessUnavailableError, match="failed"):
+        await gateway.get_document_tag_ids(500)
+
+
+@pytest.mark.asyncio
+async def test_get_documents_tag_ids_batches_and_distinguishes_missing(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/documents/"
+        assert request.url.params["id__in"] == "100,101,404"
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"id": 100, "tags": [1, 2]},
+                    {"id": 101, "tags": []},
+                ]
+            },
+        )
+
+    result = await _gateway(settings_factory, handler).get_documents_tag_ids((100, 101, 404, 100))
+
+    assert result == {100: (1, 2), 101: (), 404: None}
 
 
 @pytest.mark.asyncio
@@ -169,7 +195,8 @@ async def test_taxonomy_pagination(settings_factory: Callable[..., Settings]) ->
     assert [item.name for item in taxonomy.tags] == ["Discord", "Travel"]
     assert taxonomy.correspondents[0].name == "Synthetic"
     assert taxonomy.document_types[0].name == "Synthetic"
-    assert len(calls) == 4
+    assert taxonomy.storage_paths[0].name == "Synthetic"
+    assert len(calls) == 5
 
 
 @pytest.mark.asyncio
@@ -267,13 +294,26 @@ async def test_task_failure_and_legacy_shapes(
 async def test_sanitized_error_boundaries(
     tmp_path: Path,
     settings_factory: Callable[..., Settings],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     source = tmp_path / "source"
     source.write_bytes(b"%PDF-1.7")
 
-    auth = _gateway(settings_factory, lambda _: httpx.Response(401))
+    auth = _gateway(
+        settings_factory,
+        lambda _: httpx.Response(
+            401,
+            text='{"detail":"bad\\nrequest Token mustnotlog123","token":"mustnotlog123"}',
+        ),
+    )
     with pytest.raises(PaperlessAuthenticationError):
         await auth.get_document(1)
+    record = next(item for item in caplog.records if item.message == "paperless_request_failed")
+    assert cast(Any, record).paperless_error == (
+        '{"detail":"bad\\nrequest Token [REDACTED]","token":[REDACTED]}'
+    )
+    assert cast(Any, record).operation == "GET /api/documents/{id}/"
+    assert "mustnotlog123" not in caplog.text
 
     malformed = _gateway(settings_factory, lambda _: httpx.Response(200, text="not json"))
     with pytest.raises(PaperlessUnavailableError):
@@ -328,7 +368,7 @@ async def test_read_endpoints_fail_closed(
         await network.add_note(7, "synthetic")
 
     server_error = _gateway(settings_factory, lambda _: httpx.Response(500))
-    with pytest.raises(PaperlessUnavailableError, match="HTTP 500"):
+    with pytest.raises(PaperlessUnavailableError, match="request failed"):
         await server_error.search_documents("synthetic")
 
 
@@ -462,27 +502,24 @@ async def test_validate_token_and_custom_token_headers(
 async def test_get_ai_suggestions(settings_factory: Callable[..., Settings]) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/documents/7/ai_suggestions/":
+            assert request.extensions["timeout"]["read"] == 150.0
             return httpx.Response(
                 200,
                 json={
-                    "title": ["Suggested Title", "Other"],
+                    "title": "Suggested Title",
                     "correspondents": [1],
                     "document_types": [],
+                    "storage_paths": [5],
                     "tags": [2, 3],
+                    "dates": ["2026-07-28", "not-a-date"],
+                    "suggested_correspondents": ["New Person"],
+                    "suggested_document_types": ["New Type"],
+                    "suggested_storage_paths": ["New/Path"],
+                    "suggested_tags": ["New Tag"],
                 },
             )
-        if request.url.path == "/api/documents/7/suggestions/":
-            return httpx.Response(404)
         if request.url.path == "/api/documents/8/ai_suggestions/":
-            return httpx.Response(404)
-        if request.url.path == "/api/documents/8/suggestions/":
-            return httpx.Response(
-                200,
-                json={
-                    "title": ["Fallback Title"],
-                    "tags": [4],
-                },
-            )
+            return httpx.Response(400, json={"ai": ["AI is required for this feature"]})
         if "10" in request.url.path:
             raise httpx.ConnectError("connection refused")
         return httpx.Response(404)
@@ -492,14 +529,14 @@ async def test_get_ai_suggestions(settings_factory: Callable[..., Settings]) -> 
     assert suggestions.title == "Suggested Title"
     assert suggestions.correspondent_id == 1
     assert suggestions.document_type_id is None
+    assert suggestions.storage_path_id == 5
     assert suggestions.tag_ids == (2, 3)
+    assert suggestions.dates == (date(2026, 7, 28),)
+    assert suggestions.suggested_tags == ("New Tag",)
+    assert suggestions.suggested_correspondents == ("New Person",)
 
-    suggestions_fallback = await gateway.get_ai_suggestions(8)
-    assert suggestions_fallback.title == "Fallback Title"
-    assert suggestions_fallback.tag_ids == (4,)
-
-    with pytest.raises(PaperlessUnavailableError, match="unavailable"):
-        await gateway.get_ai_suggestions(9)
+    with pytest.raises(PaperlessUnavailableError, match="request failed"):
+        await gateway.get_ai_suggestions(8)
 
     with pytest.raises(PaperlessUnavailableError, match="unavailable"):
         await gateway.get_ai_suggestions(10)
@@ -524,11 +561,25 @@ async def test_update_document(settings_factory: Callable[..., Settings]) -> Non
     await gateway.update_document(7, DocumentUpdate())
     assert not patch_payload
 
-    updates = DocumentUpdate(title="New", tag_ids=(4, 5), correspondent_id=1, document_type_id=2)
+    updates = DocumentUpdate(
+        title="New",
+        tag_ids=(4, 5),
+        correspondent_id=1,
+        document_type_id=2,
+        storage_path_id=3,
+        created=date(2026, 7, 28),
+    )
     await gateway.update_document(7, updates)
-    assert patch_payload == {"title": "New", "tags": [4, 5], "correspondent": 1, "document_type": 2}
+    assert patch_payload == {
+        "title": "New",
+        "tags": [4, 5],
+        "correspondent": 1,
+        "document_type": 2,
+        "storage_path": 3,
+        "created": "2026-07-28",
+    }
 
-    with pytest.raises(PaperlessUnavailableError, match="404"):
+    with pytest.raises(PaperlessUnavailableError, match="request failed"):
         await gateway.update_document(8, updates)
 
     with pytest.raises(PaperlessUnavailableError, match="unavailable"):

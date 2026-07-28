@@ -160,15 +160,20 @@ class Runtime:
                 else 0.0
             )
             succeeded_before = (now - timedelta(hours=succeeded_hours)).isoformat()
-            question_ids, upload_ids = await self.repository.cleanup_message_ids(
+            question_targets, upload_targets = await self.repository.cleanup_message_ids(
                 context_before=context_before,
                 succeeded_before=succeeded_before,
                 failed_before=failed_before,
             )
-            await self.discord.cleanup_messages(question_ids, upload_ids)
+            confirmed = await self.discord.cleanup_messages(
+                question_targets,
+                upload_targets,
+            )
+            await self.repository.confirm_message_cleanup(confirmed)
             await self.repository.purge(
-                context_before=context_before,
+                expired_before=now.isoformat(),
                 audit_before=(now - timedelta(days=self.settings.audit_retention_days)).isoformat(),
+                succeeded_before=succeeded_before,
                 failed_before=failed_before,
             )
             self._purge_delivery_spool(now.timestamp() - 3600)
@@ -181,9 +186,10 @@ class Runtime:
             if not self.settings.cleanup_inbox_tag_enabled:
                 continue
             try:
-                upload_message_ids = await self.ingestion.check_inbox_tag_removals()
-                if upload_message_ids:
-                    await self.discord.cleanup_messages((), upload_message_ids)
+                upload_targets = await self.ingestion.check_inbox_tag_removals()
+                if upload_targets:
+                    confirmed = await self.discord.cleanup_messages((), upload_targets)
+                    await self.repository.confirm_message_cleanup(confirmed)
             except Exception as error:
                 logger.warning(
                     "inbox_tag_cleanup_failed",

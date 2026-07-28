@@ -21,8 +21,7 @@ def test_safe_defaults(settings_factory: Callable[..., Settings]) -> None:
     assert settings.port == 8000
     assert settings.discord_allowed_user_ids == frozenset({201, 202})
     assert (
-        settings.encryption_key.get_secret_value()
-        == "development-encryption-key-must-be-provided-in-production"
+        settings.encryption_key.get_secret_value() == "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
     )
     assert settings.discord_max_attachment_bytes == 25 * MIB
     assert settings.ingestion_max_staged_bytes == 100 * MIB
@@ -51,7 +50,9 @@ def test_required_secrets_and_ids_have_no_defaults() -> None:
         ("log_level", "verbose"),
         ("host", "https://localhost"),
         ("app_env", " production "),
+        ("discord_allowed_user_ids", frozenset()),
         ("discord_allowed_user_ids", frozenset({0})),
+        ("encryption_key", "guessable-passphrase"),
         ("data_dir", "relative"),
         ("paperless_public_url", "http://paperless.example.test"),
         ("paperless_source_tag", " Discord "),

@@ -1,18 +1,20 @@
 # Paperless Assistant architecture
 
-Status: Discord-first MVP implemented by issue #10
-Last updated: 2026-07-26
+Status: Discord-first MVP hardened by issue #65
+Last updated: 2026-07-28
 
 ## 1. Purpose
 
 Paperless Assistant provides a private household Discord experience over Paperless-ngx. Its target
 capabilities are native Paperless document chat, referenced document delivery, and immediate
-multi-file ingestion. Paperless owns OCR, classification, storage, search, and AI configuration.
+multi-file ingestion with uploader-reviewed Paperless AI metadata suggestions. Paperless owns OCR,
+classification, storage, search, LLM execution, and AI configuration.
 The assistant owns Discord authorization, workflow policy, reliability, privacy-minimized audit,
 and delivery decisions.
 
-Issue #9 established the private runtime after retiring Gemini Spark/MCP. Issue #10 adds the
-outbound Discord worker, Paperless adapter, application services, and durable local state.
+Issue #9 established the private runtime after retiring Gemini Spark/MCP. Issue #10 added the
+outbound Discord worker, Paperless adapter, application services, and durable local state. Issue
+#65 hardens authorization, credentials, diagnostics, cleanup, CI, and Paperless 3.0.4 AI review.
 
 ## 2. System context
 
@@ -51,10 +53,15 @@ container-local listener.
 
 ## 4. Ports and adapters
 
-- inbound Discord adapter: validates transport identity, auto-creates public threads on top-level user messages in `#questions` and `#uploads`, renders document references as rich Discord embeds, routes thread-scoped context follow-ups, handles the `/clean` slash command, and provides interactive `Dismiss` buttons;
-- application services: authorize users and enforce query, delivery, ingestion, inbox tag polling, and cleanup policy;
-- Paperless gateway: the only component that performs Paperless HTTP calls (including document tag checks for auto-cleanup);
-- ingestion and audit repositories: durable SQLite implementations tracking active upload notifications;
+- inbound Discord adapter: validates transport identity, auto-creates public threads on top-level
+  user messages, renders references and AI review controls, and enforces uploader ownership on
+  every metadata-write interaction;
+- application services: authorize users and enforce query, delivery, ingestion, suggestion
+  freshness/tag merging, batch inbox polling, and confirmed cleanup policy;
+- Paperless gateway: the only component that performs Paperless HTTP calls, including the
+  synchronous 3.0.4 AI suggestion trigger and bounded diagnostic logging;
+- ingestion and audit repositories: durable SQLite implementations tracking exact message/channel
+  cleanup targets and confirmation state;
 - delivery adapter: stages and sends Discord files or returns authenticated Paperless links.
 
 Domain and application code do not import Discord or HTTP client implementations.
@@ -63,8 +70,9 @@ Domain and application code do not import Discord or HTTP client implementations
 
 1. **Discord to assistant:** messages, attachments, IDs, and interactions are untrusted until the
    exact guild, channel, and immutable user ID are authorized.
-2. **Assistant to Paperless:** the Paperless token is a privileged credential. It never crosses
-   into Discord, logs, audit, URLs, or local filenames.
+2. **Assistant to Paperless:** each user token and the system token are privileged credentials.
+   Tokens are encrypted with a generated Fernet key and never cross into Discord, logs, audit,
+   URLs, or local filenames. Revocation fails queued work closed without a system-token fallback.
 3. **Paperless to its AI provider:** Paperless owns this configuration and data flow. The
    assistant invokes only Paperless's native APIs and holds no model-provider credential.
 4. **Writable state:** SQLite, staged uploads, and delivery spools are restricted, bounded, and
@@ -80,8 +88,13 @@ Domain and application code do not import Discord or HTTP client implementations
 - No MCP, OAuth/JWT/JWKS, Spark, or Pangolin dependency.
 - No taxonomy creation, document delete, unrestricted metadata update, or user administration
   operation in application code.
-- No questions, answers, captions, notes, OCR, document bytes, titles, filenames, taxonomy values,
-  tokens, headers, or raw external responses in logs or audit.
+- No tokens, authorization headers, document bytes, or audit payloads containing user content.
+  Discord receives only generic Paperless failures. Restricted server logs may contain a bounded,
+  JSON-escaped, credential-redacted Paperless error body for operator diagnosis.
+- AI metadata writes require the original uploader, a fresh document-state check, serialized apply,
+  bounded controls, and preservation of existing tags. Unmatched taxonomy names are never created.
+- Cleanup is fail-closed: Paperless batch failures do not delete Discord messages, and database
+  evidence is purged only after Discord confirms deletion or absence at the exact channel/message.
 - Unsafe POST requests are never retried after an ambiguous result.
 - Container remains non-root, read-only, capability-free, and `no-new-privileges`.
 
@@ -96,8 +109,9 @@ placed in source, image layers, tests, documentation examples, issues, or pull r
 ## 8. Persistence and recovery target
 
 SQLite WAL storage holds ingestion jobs, Discord event idempotency, short-lived
-document-reference context, cleanup-only message IDs, the missing-tag warning ID/timestamp, and
-privacy-minimized audit. Staged files use job UUID names and restrictive permissions.
+document-reference context, exact cleanup channel/message targets and confirmations, the
+missing-tag warning ID/timestamp, encrypted per-user tokens, and privacy-minimized audit. Staged
+files use job UUID names and restrictive permissions.
 
 The target state machine is:
 
@@ -139,8 +153,10 @@ SQLite job/audit state is included according to operator policy.
 - ADR 0006: Discord is the primary runtime.
 - ADR 0007: native Paperless chat and immediate durable ingestion.
 - ADR 0008: a Docker-managed volume is the zero-setup persistence default.
+- ADR 0009: fail-closed AI metadata review, diagnostics, cleanup, credentials, and CI writeback.
 
 Issue #10 is the canonical Discord MVP. Issue #20 corrects its default storage deployment. Issue
-#8 is the future least-privilege and Paperless permissions hardening phase. A future inbound
+#65 is the July 2026 hardening and AI-suggestions correction. Issue #8 remains the broader
+least-privilege Paperless permissions phase. A future inbound
 interface, custom AI layer, public share-link capability, or additional user population requires
 a separate issue and security review.

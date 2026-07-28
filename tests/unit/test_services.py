@@ -17,11 +17,13 @@ from paperless_assistant.errors import (
     ConfigurationUnavailableError,
     PaperlessUnavailableError,
     RateLimitedError,
+    StaleSuggestionError,
     UnlinkedUserError,
 )
 from paperless_assistant.models import (
     AISuggestions,
     ChatResult,
+    DiscordMessageTarget,
     Document,
     DocumentId,
     DocumentUpdate,
@@ -53,7 +55,13 @@ class FakeGateway:
         self.chat_error = False
         self.search = (Document(DocumentId(8), "Search result", date(2024, 1, 1)),)
         self.documents = {
-            7: Document(DocumentId(7), "Native result", date(2024, 2, 2)),
+            7: Document(
+                DocumentId(7),
+                "Native result",
+                date(2024, 2, 2),
+                modified=datetime(2026, 7, 28, tzinfo=UTC),
+                tag_ids=(1, 9),
+            ),
             8: self.search[0],
             44: Document(DocumentId(44), "Consumed", date(2024, 3, 3)),
         }
@@ -65,14 +73,20 @@ class FakeGateway:
         self.task_id = self.task.task_id
         self.task_error = False
         self.suggestions_error = False
-        self.suggestions_result = AISuggestions("Suggested", 1, None, (2,))
+        self.suggestions_result = AISuggestions(
+            title="Suggested",
+            correspondent_id=1,
+            tag_ids=(2,),
+        )
         self.updates_applied: DocumentUpdate | None = None
         self.note_error = False
         self.notes: list[str] = []
         self.download_sizes = {"original": 4, "archived": 3}
         self.download_error_archived = False
         self.last_question: tuple[str, int | None] | None = None
-        self.doc_tags: dict[int, tuple[int, ...]] = {}
+        self.doc_tags: dict[int, tuple[int, ...] | None] = {}
+        self.batch_tags_error = False
+        self.batch_tag_calls: list[tuple[int, ...]] = []
 
     async def validate_token(self, token: object) -> bool:
         return True
@@ -89,8 +103,19 @@ class FakeGateway:
 
     async def get_document_tag_ids(
         self, document_id: int, *, token: object = None
-    ) -> tuple[int, ...]:
+    ) -> tuple[int, ...] | None:
         return self.doc_tags.get(document_id, (1,))
+
+    async def get_documents_tag_ids(
+        self,
+        document_ids: tuple[int, ...],
+        *,
+        token: object = None,
+    ) -> dict[int, tuple[int, ...] | None]:
+        self.batch_tag_calls.append(document_ids)
+        if self.batch_tags_error:
+            raise PaperlessUnavailableError("synthetic batch failure")
+        return {identifier: self.doc_tags.get(identifier, (1,)) for identifier in document_ids}
 
     async def chat(
         self, question: str, document_id: int | None = None, *, token: object = None
@@ -315,6 +340,7 @@ async def test_ingestion_success_note_and_duplicate_event(
 async def test_ingestion_failures_and_recovery(
     tmp_path: Path,
     settings_factory: Callable[..., Settings],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     settings = settings_factory(data_dir=tmp_path / "data")
     settings.staging_dir.mkdir(parents=True)
@@ -354,7 +380,11 @@ async def test_ingestion_failures_and_recovery(
     gateway.task = PaperlessTask(gateway.task_id, TaskState.FAILURE, message="duplicate in trash")
     outcome = await ingestion.poll_once(submitted.job)
     assert outcome.job.state == JobState.FAILED
-    assert outcome.task_message == "duplicate in trash"
+    assert "paperless_task_failed" in caplog.messages
+    diagnostic = next(
+        record for record in caplog.records if record.message == "paperless_task_failed"
+    )
+    assert diagnostic.__dict__["paperless_error"] == "duplicate in trash"
 
     interrupted = await make_job(4)
     await repository.transition_job(interrupted.id, JobState.STAGED, JobState.SUBMITTING)
@@ -548,7 +578,7 @@ async def test_check_inbox_tag_removals(
     settings.staging_dir.mkdir(parents=True)
     gateway = FakeGateway()
     gateway.taxonomy = Taxonomy((TaxonomyItem(1, "Discord"), TaxonomyItem(2, "inbox")), (), ())
-    repository, _, ingestion = await _services(settings, gateway)
+    repository, taxonomy, ingestion = await _services(settings, gateway)
     assert await ingestion.check_inbox_tag_removals() == ()
 
     path = settings.staging_dir / "doc"
@@ -557,6 +587,8 @@ async def test_check_inbox_tag_removals(
         discord_message_id=10,
         discord_attachment_id=10,
         discord_status_message_id=50,
+        discord_message_channel_id=102,
+        discord_status_channel_id=500,
         principal_id=201,
         staged_path=path,
         original_filename="synthetic.pdf",
@@ -571,13 +603,24 @@ async def test_check_inbox_tag_removals(
     assert await ingestion.check_inbox_tag_removals() == ()
 
     gateway.doc_tags[44] = (1,)  # inbox tag (2) removed!
-    assert await ingestion.check_inbox_tag_removals() == (50, 10)
+    assert await ingestion.check_inbox_tag_removals() == (
+        DiscordMessageTarget(102, 10),
+        DiscordMessageTarget(500, 50),
+    )
+    assert gateway.batch_tag_calls == [(44,), (44,)]
+
+    gateway.batch_tags_error = True
+    assert await ingestion.check_inbox_tag_removals() == ()
+    gateway.batch_tags_error = False
 
     gateway.taxonomy_error = True
+    assert not await taxonomy.refresh()
     assert await ingestion.check_inbox_tag_removals() == ()
     gateway.taxonomy_error = False
+    assert await taxonomy.refresh()
 
     gateway.taxonomy = Taxonomy((TaxonomyItem(1, "Discord"),), (), ())
+    assert await taxonomy.refresh()
     assert await ingestion.check_inbox_tag_removals() == ()
 
     disabled_settings = settings_factory(
@@ -619,15 +662,22 @@ async def test_get_suggestions_for_job(
         guidance=MetadataGuidance((), None, None),
     )
 
-    s = await ingestion.get_suggestions_for_job(job, max_attempts=2, delay=0.0)
+    s = await ingestion.get_suggestions_for_job(job)
     assert s is not None
     assert s.title == "Suggested"
 
+    review = await ingestion.reload_suggestions_for_job(job)
+    assert review is not None
+    assert review[0] == gateway.documents[7]
+    assert review[1].title == "Suggested"
+
     gateway.suggestions_error = True
-    assert await ingestion.get_suggestions_for_job(job, max_attempts=2, delay=0.0) is None
+    with pytest.raises(PaperlessUnavailableError):
+        await ingestion.get_suggestions_for_job(job)
 
     job_no_doc = replace(job, paperless_document_id=None)
     assert await ingestion.get_suggestions_for_job(job_no_doc) is None
+    assert await ingestion.reload_suggestions_for_job(job_no_doc) is None
 
     class MissingCreds:
         async def get_user_token(self, user_id: int) -> str | None:
@@ -636,6 +686,8 @@ async def test_get_suggestions_for_job(
     ingestion._credentials = MissingCreds()  # type: ignore[assignment]
     with pytest.raises(UnlinkedUserError):
         await ingestion.get_suggestions_for_job(job)
+    with pytest.raises(UnlinkedUserError):
+        await ingestion.reload_suggestions_for_job(job)
 
 
 @pytest.mark.asyncio
@@ -670,10 +722,27 @@ async def test_apply_suggestions(
     )
 
     await repository.create_job(job)
-    updates = DocumentUpdate(title="New")
-    await ingestion.apply_suggestions(job, updates)
+    updates = DocumentUpdate(title="New", tag_ids=(2,))
+    expected_modified = gateway.documents[7].modified
+    await ingestion.apply_suggestions(
+        job,
+        updates,
+        expected_modified=expected_modified,
+    )
     assert gateway.updates_applied is not None
     assert gateway.updates_applied.title == "New"
+    assert gateway.updates_applied.tag_ids == (1, 9, 2)
+
+    gateway.documents[7] = replace(
+        gateway.documents[7],
+        modified=datetime(2026, 7, 29, tzinfo=UTC),
+    )
+    with pytest.raises(StaleSuggestionError):
+        await ingestion.apply_suggestions(
+            job,
+            updates,
+            expected_modified=expected_modified,
+        )
 
     # Coverage for unlinked user
     class MissingCreds:
@@ -682,8 +751,17 @@ async def test_apply_suggestions(
 
     ingestion._credentials = MissingCreds()  # type: ignore[assignment]
     with pytest.raises(UnlinkedUserError):
-        await ingestion.apply_suggestions(job, updates)
+        await ingestion.apply_suggestions(job, updates, expected_modified=None)
 
     # Coverage for no paperless_document_id
     job_no_doc = replace(job, paperless_document_id=None)
-    await ingestion.apply_suggestions(job_no_doc, updates)  # Should return silently
+    await ingestion.apply_suggestions(
+        job_no_doc,
+        updates,
+        expected_modified=None,
+    )
+
+    ingestion._credentials = FakeCreds()  # type: ignore[assignment]
+    gateway.documents[7] = replace(gateway.documents[7], modified=None)
+    with pytest.raises(StaleSuggestionError):
+        await ingestion.apply_suggestions(job, updates, expected_modified=None)

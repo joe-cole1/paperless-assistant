@@ -14,6 +14,7 @@ from paperless_assistant.models import (
     AISuggestions,
     AuditEvent,
     ChatResult,
+    DiscordMessageTarget,
     Document,
     DocumentUpdate,
     Download,
@@ -80,7 +81,14 @@ class PaperlessGateway(Protocol):
 
     async def get_document_tag_ids(
         self, document_id: int, *, token: SecretStr | None = None
-    ) -> tuple[int, ...]: ...
+    ) -> tuple[int, ...] | None: ...
+
+    async def get_documents_tag_ids(
+        self,
+        document_ids: tuple[int, ...],
+        *,
+        token: SecretStr | None = None,
+    ) -> dict[int, tuple[int, ...] | None]: ...
 
     def document_url(self, document_id: int) -> str: ...
 
@@ -130,11 +138,15 @@ class IngestionRepository(Protocol):
 
     async def cleanup_message_ids(
         self, *, context_before: str, succeeded_before: str, failed_before: str
-    ) -> tuple[tuple[int, ...], tuple[int, ...]]: ...
+    ) -> tuple[tuple[DiscordMessageTarget, ...], tuple[DiscordMessageTarget, ...]]: ...
+
+    async def confirm_message_cleanup(self, targets: tuple[DiscordMessageTarget, ...]) -> None: ...
 
     async def message_job_states(self, discord_message_id: int) -> tuple[JobState, ...]: ...
 
-    async def active_succeeded_uploads(self) -> tuple[tuple[tuple[int, ...], int], ...]: ...
+    async def active_succeeded_uploads(
+        self,
+    ) -> tuple[tuple[tuple[DiscordMessageTarget, ...], int], ...]: ...
 
     async def protected_staged_paths(self) -> frozenset[Path]: ...
 
@@ -145,7 +157,12 @@ class IngestionRepository(Protocol):
     async def clear_warning_state(self) -> None: ...
 
     async def purge(
-        self, *, context_before: str, audit_before: str, failed_before: str
+        self,
+        *,
+        expired_before: str,
+        audit_before: str,
+        succeeded_before: str,
+        failed_before: str,
     ) -> None: ...
 
 
