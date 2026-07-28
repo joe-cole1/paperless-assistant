@@ -11,6 +11,7 @@ import pytest
 
 from paperless_assistant.models import (
     AuditEvent,
+    DiscordMessageTarget,
     DocumentId,
     IngestionJob,
     JobState,
@@ -26,6 +27,8 @@ def _job(path: Path, *, message_id: int = 10, attachment_id: int = 20) -> Ingest
         discord_message_id=message_id,
         discord_attachment_id=attachment_id,
         discord_status_message_id=50,
+        discord_message_channel_id=102,
+        discord_status_channel_id=500,
         principal_id=30,
         staged_path=path,
         original_filename="synthetic.pdf",
@@ -115,7 +118,11 @@ async def test_job_idempotency_roundtrip_and_transitions(tmp_path: Path) -> None
     assert loaded.paperless_task_id == task_id
     assert loaded.paperless_document_id == DocumentId(42)
     assert loaded.state == JobState.SUCCEEDED
-    assert await repository.active_succeeded_uploads() == (((50, 10), 42),)
+    upload_targets = (
+        DiscordMessageTarget(102, 10),
+        DiscordMessageTarget(500, 50),
+    )
+    assert await repository.active_succeeded_uploads() == ((upload_targets, 42),)
     assert await repository.message_job_states(10) == (JobState.SUCCEEDED,)
     assert await repository.message_job_states(999) == ()
     future = (datetime.now(tz=UTC) + timedelta(days=1)).isoformat()
@@ -123,7 +130,7 @@ async def test_job_idempotency_roundtrip_and_transitions(tmp_path: Path) -> None
         context_before=future,
         succeeded_before=future,
         failed_before=future,
-    ) == ((), (10, 50))
+    ) == ((), upload_targets)
     failed_sibling = _job(tmp_path / "failed", attachment_id=21)
     assert await repository.create_job(failed_sibling)
     assert await repository.transition_job(failed_sibling.id, JobState.STAGED, JobState.FAILED)
@@ -137,7 +144,30 @@ async def test_job_idempotency_roundtrip_and_transitions(tmp_path: Path) -> None
         context_before=future,
         succeeded_before=future,
         failed_before=future,
-    ) == ((), (10, 50))
+    ) == ((), upload_targets)
+    await repository.purge(
+        expired_before=past,
+        audit_before=past,
+        succeeded_before=future,
+        failed_before=future,
+    )
+    assert await repository.get_job(job.id) is not None
+    await repository.confirm_message_cleanup((upload_targets[0],))
+    await repository.purge(
+        expired_before=past,
+        audit_before=past,
+        succeeded_before=future,
+        failed_before=future,
+    )
+    assert await repository.get_job(job.id) is not None
+    await repository.confirm_message_cleanup((upload_targets[1],))
+    await repository.purge(
+        expired_before=past,
+        audit_before=past,
+        succeeded_before=future,
+        failed_before=future,
+    )
+    assert await repository.get_job(job.id) is None
     with pytest.raises(ValueError, match="invalid job transition"):
         await repository.transition_job(job.id, JobState.SUCCEEDED, JobState.STAGED)
     assert await repository.get_job(uuid4()) is None
@@ -218,13 +248,24 @@ async def test_recovery_context_expiry_audit_and_purge(tmp_path: Path) -> None:
         assert forbidden not in serialized.casefold()
 
     old = (datetime.now(tz=UTC) + timedelta(days=1)).isoformat()
-    question_ids, upload_ids = await repository.cleanup_message_ids(
+    question_targets, upload_targets = await repository.cleanup_message_ids(
         context_before=old,
         succeeded_before=old,
         failed_before=old,
     )
-    assert set(question_ids) == {70, 80, 81, 82}
-    assert upload_ids == ()
-    await repository.purge(context_before=old, audit_before=old, failed_before=old)
+    assert set(question_targets) == {
+        DiscordMessageTarget(30, 70),
+        DiscordMessageTarget(30, 80),
+        DiscordMessageTarget(30, 82),
+        DiscordMessageTarget(31, 81),
+    }
+    assert upload_targets == ()
+    await repository.confirm_message_cleanup(question_targets)
+    await repository.purge(
+        expired_before=old,
+        audit_before=old,
+        succeeded_before=old,
+        failed_before=old,
+    )
     assert await repository.get_context(30) is None
     assert [action async for action in repository.actions()] == []

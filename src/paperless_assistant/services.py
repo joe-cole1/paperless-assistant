@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import shutil
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -17,6 +18,7 @@ from paperless_assistant.errors import (
     ConfigurationUnavailableError,
     PaperlessUnavailableError,
     RateLimitedError,
+    StaleSuggestionError,
     UnlinkedUserError,
 )
 from paperless_assistant.models import (
@@ -24,6 +26,7 @@ from paperless_assistant.models import (
     AuditEvent,
     ChatResult,
     DeliveryPlan,
+    DiscordMessageTarget,
     Document,
     DocumentId,
     DocumentUpdate,
@@ -35,7 +38,11 @@ from paperless_assistant.models import (
     Taxonomy,
     TaxonomyItem,
 )
-from paperless_assistant.paperless import PAPERLESS_CHAT_ERROR, PAPERLESS_NO_CONTENT
+from paperless_assistant.paperless import (
+    PAPERLESS_CHAT_ERROR,
+    PAPERLESS_NO_CONTENT,
+    sanitize_paperless_error,
+)
 from paperless_assistant.policy import find_required_tag, resolve_taxonomy, validate_attachment
 from paperless_assistant.ports import (
     AuditRepository,
@@ -47,6 +54,9 @@ from paperless_assistant.ports import (
 
 def _now() -> datetime:
     return datetime.now(tz=UTC)
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,7 +201,6 @@ class IngestionOutcome:
     document: Document | None = None
     note_failed: bool = False
     notification_timed_out: bool = False
-    task_message: str | None = None
 
 
 class TaxonomyCache:
@@ -263,8 +272,14 @@ class IngestionService:
         original_filename: str,
         caption: str,
         discord_status_message_id: int | None = None,
+        discord_message_channel_id: int | None = None,
+        discord_status_channel_id: int | None = None,
     ) -> IngestionJob | None:
         """Validate and persist one already-downloaded attachment idempotently."""
+        if self._credentials is not None:
+            user_token = await self._credentials.get_user_token(principal_id)
+            if user_token is None:
+                raise UnlinkedUserError("Paperless account is not linked")
         media_type, office_dependent = validate_attachment(
             staged_path,
             original_filename,
@@ -275,6 +290,8 @@ class IngestionService:
             discord_message_id=discord_message_id,
             discord_attachment_id=discord_attachment_id,
             discord_status_message_id=discord_status_message_id,
+            discord_message_channel_id=discord_message_channel_id,
+            discord_status_channel_id=discord_status_channel_id,
             principal_id=principal_id,
             staged_path=staged_path,
             original_filename=original_filename,
@@ -296,7 +313,10 @@ class IngestionService:
             else None
         )
         if self._credentials is not None and user_token is None:
-            raise UnlinkedUserError("Paperless account is not linked")
+            current = await self._repository.get_job(job.id)
+            if current is None:
+                raise UnlinkedUserError("Paperless account is not linked")
+            return await self._fail_unlinked_job(current)
         transitioned = await self._repository.transition_job(
             job.id, JobState.STAGED, JobState.SUBMITTING
         )
@@ -367,15 +387,28 @@ class IngestionService:
             if self._credentials is not None
             else None
         )
+        if self._credentials is not None and user_token is None:
+            return await self._fail_unlinked_job(job)
         task = await self._gateway.get_task(job.paperless_task_id, token=user_token)
         if task.state in {TaskState.PENDING, TaskState.STARTED, TaskState.UNKNOWN}:
             return IngestionOutcome(job)
         if task.state == TaskState.FAILURE or task.document_id is None:
+            if task.message:
+                diagnostic, truncated = sanitize_paperless_error(task.message)
+                logger.warning(
+                    "paperless_task_failed",
+                    extra={
+                        "operation": "GET /api/tasks/",
+                        "status_code": 200,
+                        "paperless_error": diagnostic,
+                        "truncated": truncated,
+                    },
+                )
             await self._repository.transition_job(job.id, JobState.SUBMITTED, JobState.FAILED)
             job.staged_path.unlink(missing_ok=True)
             current = await self._required_job(job.id)
             await self._record(current, "failed")
-            return IngestionOutcome(current, task_message=task.message)
+            return IngestionOutcome(current)
         note_failed = False
         if job.caption:
             try:
@@ -411,7 +444,10 @@ class IngestionService:
                 )
                 outcome = IngestionOutcome(await self._required_job(job.id))
             elif job.state == JobState.STAGED:
-                outcome = await self.submit(job)
+                try:
+                    outcome = await self.submit(job)
+                except UnlinkedUserError:
+                    outcome = await self._fail_unlinked_job(job)
             else:
                 try:
                     outcome = await self.poll_once(job)
@@ -443,8 +479,16 @@ class IngestionService:
             raise RuntimeError("ingestion job disappeared")
         return job
 
-    async def check_inbox_tag_removals(self) -> tuple[int, ...]:
-        """Return message IDs for active upload notifications
+    async def _fail_unlinked_job(self, job: IngestionJob) -> IngestionOutcome:
+        if job.state in {JobState.STAGED, JobState.SUBMITTED}:
+            await self._repository.transition_job(job.id, job.state, JobState.FAILED)
+        job.staged_path.unlink(missing_ok=True)
+        current = await self._required_job(job.id)
+        await self._record(current, "failed_unlinked")
+        return IngestionOutcome(current)
+
+    async def check_inbox_tag_removals(self) -> tuple[DiscordMessageTarget, ...]:
+        """Return exact Discord targets for active upload notifications
         whose inbox tag was removed in Paperless.
         """
         if not self._settings.cleanup_inbox_tag_enabled:
@@ -452,9 +496,8 @@ class IngestionService:
         active_uploads = await self._repository.active_succeeded_uploads()
         if not active_uploads:
             return ()
-        try:
-            taxonomy = await self._gateway.get_taxonomy()
-        except PaperlessUnavailableError:
+        taxonomy = self._taxonomy.snapshot
+        if taxonomy is None:
             return ()
         inbox_tag_name = self._settings.cleanup_inbox_tag.casefold()
         inbox_tag = next(
@@ -463,12 +506,17 @@ class IngestionService:
         )
         if inbox_tag is None:
             return ()
-        removed_message_ids: list[int] = []
-        for msg_ids, doc_id in active_uploads:
-            doc_tag_ids = await self._gateway.get_document_tag_ids(doc_id)
-            if inbox_tag.id not in doc_tag_ids:
-                removed_message_ids.extend(msg_ids)
-        return tuple(dict.fromkeys(removed_message_ids))
+        document_ids = tuple(doc_id for _, doc_id in active_uploads)
+        try:
+            tags_by_document = await self._gateway.get_documents_tag_ids(document_ids)
+        except PaperlessUnavailableError:
+            return ()
+        removed_targets: list[DiscordMessageTarget] = []
+        for targets, doc_id in active_uploads:
+            doc_tag_ids = tags_by_document[doc_id]
+            if doc_tag_ids is None or inbox_tag.id not in doc_tag_ids:
+                removed_targets.extend(targets)
+        return tuple(dict.fromkeys(removed_targets))
 
     async def _record(self, job: IngestionJob, outcome: str) -> None:
         await self._audit.record(
@@ -484,10 +532,8 @@ class IngestionService:
             )
         )
 
-    async def get_suggestions_for_job(
-        self, job: IngestionJob, *, max_attempts: int = 4, delay: float = 2.0
-    ) -> AISuggestions | None:
-        """Fetch AI suggestions for a completed job with smart settlement polling."""
+    async def get_suggestions_for_job(self, job: IngestionJob) -> AISuggestions | None:
+        """Trigger Paperless's synchronous native AI suggestion endpoint once."""
         if job.paperless_document_id is None:
             return None
         user_token = (
@@ -498,37 +544,36 @@ class IngestionService:
         if self._credentials is not None and user_token is None:
             raise UnlinkedUserError("Paperless account is not linked")
 
-        stem = Path(job.original_filename).stem
-        latest_suggestions: AISuggestions | None = None
+        return await self._gateway.get_ai_suggestions(
+            int(job.paperless_document_id), token=user_token
+        )
 
-        for attempt in range(max_attempts):
-            try:
-                suggestions = await self._gateway.get_ai_suggestions(
-                    int(job.paperless_document_id), token=user_token
-                )
-                latest_suggestions = suggestions
-                has_enriched_title = suggestions.title is not None and suggestions.title not in (
-                    stem,
-                    job.original_filename,
-                )
-                has_metadata = (
-                    suggestions.correspondent_id is not None
-                    or suggestions.document_type_id is not None
-                    or bool(suggestions.tag_ids)
-                )
-                if has_enriched_title or has_metadata:
-                    return suggestions
-            except PaperlessUnavailableError:
-                if attempt == max_attempts - 1:
-                    return None
+    async def reload_suggestions_for_job(
+        self, job: IngestionJob
+    ) -> tuple[Document, AISuggestions] | None:
+        """Reload the concurrency baseline and Paperless AI proposal together."""
+        if job.paperless_document_id is None:
+            return None
+        user_token = (
+            await self._credentials.get_user_token(job.principal_id)
+            if self._credentials is not None
+            else None
+        )
+        if self._credentials is not None and user_token is None:
+            raise UnlinkedUserError("Paperless account is not linked")
+        document_id = int(job.paperless_document_id)
+        document = await self._gateway.get_document(document_id, token=user_token)
+        suggestions = await self._gateway.get_ai_suggestions(document_id, token=user_token)
+        return document, suggestions
 
-            if attempt < max_attempts - 1 and delay > 0:
-                await asyncio.sleep(delay)
-
-        return latest_suggestions
-
-    async def apply_suggestions(self, job: IngestionJob, updates: DocumentUpdate) -> None:
-        """Apply user-approved suggestions to the document."""
+    async def apply_suggestions(
+        self,
+        job: IngestionJob,
+        updates: DocumentUpdate,
+        *,
+        expected_modified: datetime | None,
+    ) -> None:
+        """Re-read, merge, and apply uploader-approved suggestions once."""
         if job.paperless_document_id is None:
             return
         user_token = (
@@ -538,8 +583,21 @@ class IngestionService:
         )
         if self._credentials is not None and user_token is None:
             raise UnlinkedUserError("Paperless account is not linked")
+        current = await self._gateway.get_document(int(job.paperless_document_id), token=user_token)
+        if (
+            expected_modified is None
+            or current.modified is None
+            or current.modified != expected_modified
+        ):
+            raise StaleSuggestionError("document changed after suggestions were generated")
+        merged_updates = updates
+        if updates.tag_ids is not None:
+            merged_updates = replace(
+                updates,
+                tag_ids=tuple(dict.fromkeys((*current.tag_ids, *updates.tag_ids))),
+            )
         await self._gateway.update_document(
-            int(job.paperless_document_id), updates, token=user_token
+            int(job.paperless_document_id), merged_updates, token=user_token
         )
         await self._record(job, "suggestions_applied")
 

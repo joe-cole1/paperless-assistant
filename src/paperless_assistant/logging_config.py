@@ -20,7 +20,18 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "event": record.getMessage(),
         }
-        for field in ("service", "version", "environment", "runtime", "ready"):
+        for field in (
+            "service",
+            "version",
+            "environment",
+            "runtime",
+            "ready",
+            "operation",
+            "status_code",
+            "paperless_error",
+            "truncated",
+            "error_type",
+        ):
             if hasattr(record, field):
                 payload[field] = getattr(record, field)
         if record.exc_info and record.exc_info[0] is not None:
