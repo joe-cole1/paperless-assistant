@@ -931,7 +931,7 @@ async def test_office_task_failure_includes_setup_guidance(
         guidance=MetadataGuidance(),
         state=JobState.FAILED,
     )
-    ingestion.poll_outcome = IngestionOutcome(failed_job)
+    ingestion.poll_outcome = IngestionOutcome(failed_job, task_message="macro detected")
     assistant = _assistant(
         settings,
         FakeQuery(),
@@ -947,6 +947,7 @@ async def test_office_task_failure_includes_setup_guidance(
     await assistant._uploads_message(cast(discord.Message, message))
 
     assert "Tika/Gotenberg" in message.thread.sent[0].edits[-1]["content"]
+    assert "macro detected" in message.thread.sent[0].edits[-1]["content"]
     await assistant.close()
 
 
@@ -986,8 +987,8 @@ async def test_warning_recovery_and_status_helpers(
         guidance=MetadataGuidance(),
         state=JobState.FAILED,
     )
-    await assistant._notify_recovery(IngestionOutcome(job))
-    assert "failed" in channel.sent[-1].content
+    await assistant._notify_recovery(IngestionOutcome(job, task_message="bad pdf"))
+    assert "failed: bad pdf" in channel.sent[-1].content
 
     cast(Any, assistant).get_channel = lambda _: None
     await assistant._notify_recovery(IngestionOutcome(job))
@@ -1148,9 +1149,13 @@ async def test_recovery_warning_and_cleanup_edge_paths(
     )
     assert "uncertain" in channel.sent[-1].content
     await assistant._notify_recovery(
-        IngestionOutcome(_job(tmp_path, JobState.FAILED, office_dependent=True))
+        IngestionOutcome(
+            _job(tmp_path, JobState.FAILED, office_dependent=True),
+            task_message="file corrupted",
+        )
     )
     assert "Tika/Gotenberg" in channel.sent[-1].content
+    assert "file corrupted" in channel.sent[-1].content
 
     cast(Any, assistant).get_channel = lambda _: None
     await assistant.cleanup_messages((1,), (2,))

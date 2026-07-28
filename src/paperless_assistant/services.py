@@ -191,6 +191,7 @@ class IngestionOutcome:
     document: Document | None = None
     note_failed: bool = False
     notification_timed_out: bool = False
+    task_message: str | None = None
 
 
 class TaxonomyCache:
@@ -374,7 +375,7 @@ class IngestionService:
             job.staged_path.unlink(missing_ok=True)
             current = await self._required_job(job.id)
             await self._record(current, "failed")
-            return IngestionOutcome(current)
+            return IngestionOutcome(current, task_message=task.message)
         note_failed = False
         if job.caption:
             try:
