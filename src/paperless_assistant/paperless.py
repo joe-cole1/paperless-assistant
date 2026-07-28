@@ -279,6 +279,7 @@ class HttpPaperlessGateway:
         self, document_id: int, *, token: SecretStr | None = None
     ) -> AISuggestions:
         """Fetch native Paperless AI metadata suggestions for a document."""
+
         async def _fetch(endpoint: str) -> dict[str, Any] | None:
             try:
                 response = await self._client.get(
@@ -287,7 +288,7 @@ class HttpPaperlessGateway:
                 if response.status_code == 200:
                     payload = response.json()
                     return payload if isinstance(payload, dict) else None
-            except (httpx.HTTPError, ValueError):
+            except httpx.HTTPError, ValueError:
                 pass
             return None
 
@@ -329,7 +330,6 @@ class HttpPaperlessGateway:
             document_type_id=dtype if isinstance(dtype, int) else None,
             tag_ids=tags,
         )
-
 
     async def update_document(
         self, document_id: int, updates: DocumentUpdate, *, token: SecretStr | None = None
