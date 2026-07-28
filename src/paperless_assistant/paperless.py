@@ -19,7 +19,12 @@ from pydantic import SecretStr
 from paperless_assistant.config import Settings
 from paperless_assistant.errors import (
     AmbiguousSubmissionError,
+    PaperlessAIConfigurationError,
+    PaperlessAIDisabledError,
+    PaperlessAITimeoutError,
+    PaperlessAITransportError,
     PaperlessAuthenticationError,
+    PaperlessPermissionError,
     PaperlessUnavailableError,
 )
 from paperless_assistant.models import (
@@ -31,9 +36,12 @@ from paperless_assistant.models import (
     Download,
     MetadataGuidance,
     PaperlessTask,
+    SuggestedDate,
     TaskState,
     Taxonomy,
+    TaxonomyCapabilities,
     TaxonomyItem,
+    TaxonomyKind,
 )
 
 CHAT_METADATA_DELIMITER = "\n\n__PAPERLESS_CHAT_METADATA__"
@@ -103,7 +111,10 @@ def _document(payload: object) -> Document:
     original = payload.get("original_file_name")
     archived = payload.get("archived_file_name")
     raw_storage_path = payload.get("storage_path")
-    if raw_storage_path is not None and not isinstance(raw_storage_path, int):
+    raw_correspondent = payload.get("correspondent")
+    raw_document_type = payload.get("document_type")
+    scalar_taxonomy = (raw_correspondent, raw_document_type, raw_storage_path)
+    if any(value is not None and not isinstance(value, int) for value in scalar_taxonomy):
         raise PaperlessUnavailableError("malformed document response")
     return Document(
         id=DocumentId(identifier),
@@ -113,6 +124,8 @@ def _document(payload: object) -> Document:
         archived_filename=archived if isinstance(archived, str) else None,
         modified=_parse_datetime(payload.get("modified")),
         tag_ids=_integer_tuple(payload, "tags"),
+        correspondent_id=raw_correspondent,
+        document_type_id=raw_document_type,
         storage_path_id=raw_storage_path,
     )
 
@@ -209,9 +222,7 @@ class HttpPaperlessGateway:
             await self._client.aclose()
 
     @staticmethod
-    async def _raise_status(response: httpx.Response) -> None:
-        if not response.is_error:
-            return
+    async def _log_error_response(response: httpx.Response) -> None:
         try:
             raw = response.content
         except httpx.ResponseNotRead:
@@ -232,8 +243,16 @@ class HttpPaperlessGateway:
                 "truncated": truncated,
             },
         )
-        if response.status_code in {401, 403}:
+
+    @classmethod
+    async def _raise_status(cls, response: httpx.Response) -> None:
+        if not response.is_error:
+            return
+        await cls._log_error_response(response)
+        if response.status_code == 401:
             raise PaperlessAuthenticationError("Paperless authentication failed")
+        if response.status_code == 403:
+            raise PaperlessPermissionError("Paperless permission denied")
         raise PaperlessUnavailableError("Paperless request failed")
 
     async def chat(
@@ -345,6 +364,115 @@ class HttpPaperlessGateway:
             storage_paths=items(storage_paths),
         )
 
+    async def get_taxonomy_capabilities(
+        self, *, token: SecretStr | None = None
+    ) -> TaxonomyCapabilities:
+        """Read invoking-user taxonomy creation permissions from Paperless."""
+        try:
+            response = await self._client.get("api/ui_settings/", headers=self._headers(token))
+        except httpx.HTTPError as error:
+            raise PaperlessUnavailableError("Paperless capabilities unavailable") from error
+        await self._raise_status(response)
+        try:
+            payload = response.json()
+            permissions = payload["permissions"]
+        except (KeyError, TypeError, ValueError) as error:
+            raise PaperlessUnavailableError("malformed capabilities response") from error
+        if not isinstance(permissions, list) or not all(
+            isinstance(value, str) for value in permissions
+        ):
+            raise PaperlessUnavailableError("malformed capabilities response")
+        visible = frozenset(permissions)
+        return TaxonomyCapabilities(
+            add_tags="add_tag" in visible,
+            add_correspondents="add_correspondent" in visible,
+            add_document_types="add_documenttype" in visible,
+            add_storage_paths="add_storagepath" in visible,
+        )
+
+    @staticmethod
+    def _taxonomy_endpoint(kind: TaxonomyKind) -> str:
+        return {
+            TaxonomyKind.TAG: "api/tags/",
+            TaxonomyKind.CORRESPONDENT: "api/correspondents/",
+            TaxonomyKind.DOCUMENT_TYPE: "api/document_types/",
+            TaxonomyKind.STORAGE_PATH: "api/storage_paths/",
+        }[kind]
+
+    async def find_taxonomy_items(
+        self,
+        kind: TaxonomyKind,
+        name: str,
+        *,
+        token: SecretStr | None = None,
+    ) -> tuple[TaxonomyItem, ...]:
+        """Find all visible exact case-insensitive taxonomy-name matches."""
+        endpoint = self._taxonomy_endpoint(kind)
+        try:
+            response = await self._client.get(
+                endpoint,
+                params={"name__iexact": name, "page_size": 100},
+                headers=self._headers(token),
+            )
+        except httpx.HTTPError as error:
+            raise PaperlessUnavailableError("Paperless taxonomy lookup unavailable") from error
+        await self._raise_status(response)
+        try:
+            payload = response.json()
+            values = payload["results"]
+        except (KeyError, TypeError, ValueError) as error:
+            raise PaperlessUnavailableError("malformed taxonomy lookup response") from error
+        if not isinstance(values, list):
+            raise PaperlessUnavailableError("malformed taxonomy lookup response")
+        resolved: list[TaxonomyItem] = []
+        for value in values:
+            if not isinstance(value, Mapping):
+                raise PaperlessUnavailableError("malformed taxonomy lookup response")
+            identifier = value.get("id")
+            item_name = value.get("name")
+            if not isinstance(identifier, int) or not isinstance(item_name, str):
+                raise PaperlessUnavailableError("malformed taxonomy lookup response")
+            if item_name.casefold() == name.casefold():
+                resolved.append(TaxonomyItem(identifier, item_name))
+        return tuple(resolved)
+
+    async def create_taxonomy_item(
+        self,
+        kind: TaxonomyKind,
+        name: str,
+        *,
+        storage_path: str | None = None,
+        token: SecretStr | None = None,
+    ) -> TaxonomyItem:
+        """Create one separately confirmed taxonomy object with matching disabled."""
+        fields: dict[str, Any] = {"name": name}
+        if kind is TaxonomyKind.STORAGE_PATH:
+            if storage_path is None:
+                raise ValueError("storage_path is required")
+            fields["path"] = storage_path
+        else:
+            fields.update({"matching_algorithm": 0, "match": ""})
+        try:
+            response = await self._client.post(
+                self._taxonomy_endpoint(kind),
+                json=fields,
+                headers=self._headers(token),
+            )
+        except httpx.HTTPError as error:
+            raise PaperlessUnavailableError("Paperless taxonomy creation unavailable") from error
+        await self._raise_status(response)
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise PaperlessUnavailableError("malformed taxonomy creation response") from error
+        if not isinstance(payload, Mapping):
+            raise PaperlessUnavailableError("malformed taxonomy creation response")
+        identifier = payload.get("id")
+        item_name = payload.get("name")
+        if not isinstance(identifier, int) or not isinstance(item_name, str):
+            raise PaperlessUnavailableError("malformed taxonomy creation response")
+        return TaxonomyItem(identifier, item_name)
+
     async def get_document_tag_ids(
         self, document_id: int, *, token: SecretStr | None = None
     ) -> tuple[int, ...] | None:
@@ -412,8 +540,59 @@ class HttpPaperlessGateway:
                 headers=self._headers(token),
                 timeout=httpx.Timeout(self._settings.paperless_ai_suggestions_timeout_seconds),
             )
+        except httpx.TimeoutException as error:
+            logger.warning(
+                "paperless_ai_suggestions_failed",
+                extra={"reason": "assistant_timeout", "error_type": type(error).__name__},
+            )
+            raise PaperlessAITimeoutError("Paperless AI suggestions timed out") from error
         except httpx.HTTPError as error:
-            raise PaperlessUnavailableError("Paperless AI suggestions unavailable") from error
+            logger.warning(
+                "paperless_ai_suggestions_failed",
+                extra={"reason": "transport", "error_type": type(error).__name__},
+            )
+            raise PaperlessAITransportError(
+                "Paperless AI suggestions transport unavailable"
+            ) from error
+        if response.status_code == 400:
+            if b"AI is required for this feature" in response.content:
+                await self._log_error_response(response)
+                logger.warning(
+                    "paperless_ai_suggestions_failed",
+                    extra={"reason": "disabled", "status_code": response.status_code},
+                )
+                raise PaperlessAIDisabledError("Paperless AI is disabled")
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            if (
+                isinstance(payload, Mapping)
+                and isinstance(payload.get("ai"), list)
+                and payload["ai"]
+            ):
+                await self._log_error_response(response)
+                logger.warning(
+                    "paperless_ai_suggestions_failed",
+                    extra={"reason": "invalid_configuration", "status_code": response.status_code},
+                )
+                raise PaperlessAIConfigurationError("Paperless AI configuration is invalid")
+        if response.status_code == 503:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            if (
+                isinstance(payload, Mapping)
+                and isinstance(payload.get("ai"), list)
+                and payload["ai"]
+            ):
+                await self._log_error_response(response)
+                logger.warning(
+                    "paperless_ai_suggestions_failed",
+                    extra={"reason": "upstream_timeout", "status_code": response.status_code},
+                )
+                raise PaperlessAITimeoutError("Paperless AI backend timed out")
         await self._raise_status(response)
         try:
             payload = response.json()
@@ -425,19 +604,15 @@ class HttpPaperlessGateway:
         if title is not None and not isinstance(title, str):
             raise PaperlessUnavailableError("malformed AI suggestions response")
         dates = tuple(
-            parsed
+            SuggestedDate(raw=value, value=_parse_date(value))
             for value in _string_tuple(payload, "dates")
-            if (parsed := _parse_date(value)) is not None
         )
-        correspondents = _integer_tuple(payload, "correspondents")
-        document_types = _integer_tuple(payload, "document_types")
-        storage_paths = _integer_tuple(payload, "storage_paths")
 
         return AISuggestions(
             title=title or None,
-            correspondent_id=correspondents[0] if correspondents else None,
-            document_type_id=document_types[0] if document_types else None,
-            storage_path_id=storage_paths[0] if storage_paths else None,
+            correspondent_ids=_integer_tuple(payload, "correspondents"),
+            document_type_ids=_integer_tuple(payload, "document_types"),
+            storage_path_ids=_integer_tuple(payload, "storage_paths"),
             tag_ids=_integer_tuple(payload, "tags"),
             dates=dates,
             suggested_correspondents=_string_tuple(payload, "suggested_correspondents"),
@@ -473,6 +648,34 @@ class HttpPaperlessGateway:
             )
         except httpx.HTTPError as error:
             raise PaperlessUnavailableError("Paperless update unavailable") from error
+        await self._raise_status(response)
+
+    async def modify_document_tags(
+        self,
+        document_id: int,
+        *,
+        add_tag_ids: tuple[int, ...],
+        remove_tag_ids: tuple[int, ...] = (),
+        token: SecretStr | None = None,
+    ) -> None:
+        """Add or remove only explicitly selected tags through Paperless bulk edit."""
+        if not add_tag_ids and not remove_tag_ids:
+            return
+        try:
+            response = await self._client.post(
+                "api/documents/bulk_edit/",
+                json={
+                    "documents": [document_id],
+                    "method": "modify_tags",
+                    "parameters": {
+                        "add_tags": list(add_tag_ids),
+                        "remove_tags": list(remove_tag_ids),
+                    },
+                },
+                headers=self._headers(token),
+            )
+        except httpx.HTTPError as error:
+            raise PaperlessUnavailableError("Paperless tag update unavailable") from error
         await self._raise_status(response)
 
     async def submit_document(

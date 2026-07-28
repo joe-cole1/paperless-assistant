@@ -32,9 +32,13 @@ from paperless_assistant.models import (
     JobState,
     MetadataGuidance,
     PaperlessTask,
+    SuggestedDate,
+    SuggestionReview,
     TaskState,
     Taxonomy,
+    TaxonomyCapabilities,
     TaxonomyItem,
+    TaxonomyKind,
 )
 from paperless_assistant.repository import SQLiteRepository
 from paperless_assistant.services import (
@@ -75,10 +79,15 @@ class FakeGateway:
         self.suggestions_error = False
         self.suggestions_result = AISuggestions(
             title="Suggested",
-            correspondent_id=1,
+            correspondent_ids=(1,),
             tag_ids=(2,),
         )
         self.updates_applied: DocumentUpdate | None = None
+        self.skip_update = False
+        self.tag_changes: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+        self.capabilities = TaxonomyCapabilities(True, True, True, True)
+        self.taxonomy_matches: tuple[TaxonomyItem, ...] = ()
+        self.created_taxonomy: list[tuple[TaxonomyKind, str, str | None]] = []
         self.note_error = False
         self.notes: list[str] = []
         self.download_sizes = {"original": 4, "archived": 3}
@@ -100,6 +109,68 @@ class FakeGateway:
         self, document_id: int, updates: DocumentUpdate, *, token: object = None
     ) -> None:
         self.updates_applied = updates
+        if self.skip_update:
+            return
+        current = self.documents[document_id]
+        self.documents[document_id] = replace(
+            current,
+            title=updates.title if updates.title is not None else current.title,
+            created=updates.created if updates.created is not None else current.created,
+            correspondent_id=(
+                updates.correspondent_id
+                if updates.correspondent_id is not None
+                else current.correspondent_id
+            ),
+            document_type_id=(
+                updates.document_type_id
+                if updates.document_type_id is not None
+                else current.document_type_id
+            ),
+            storage_path_id=(
+                updates.storage_path_id
+                if updates.storage_path_id is not None
+                else current.storage_path_id
+            ),
+        )
+
+    async def modify_document_tags(
+        self,
+        document_id: int,
+        *,
+        add_tag_ids: tuple[int, ...],
+        remove_tag_ids: tuple[int, ...] = (),
+        token: object = None,
+    ) -> None:
+        self.tag_changes.append((add_tag_ids, remove_tag_ids))
+        current = self.documents[document_id]
+        retained = tuple(value for value in current.tag_ids if value not in remove_tag_ids)
+        self.documents[document_id] = replace(
+            current,
+            tag_ids=tuple(dict.fromkeys((*retained, *add_tag_ids))),
+        )
+
+    async def get_taxonomy_capabilities(self, *, token: object = None) -> TaxonomyCapabilities:
+        return self.capabilities
+
+    async def find_taxonomy_items(
+        self,
+        kind: TaxonomyKind,
+        name: str,
+        *,
+        token: object = None,
+    ) -> tuple[TaxonomyItem, ...]:
+        return self.taxonomy_matches
+
+    async def create_taxonomy_item(
+        self,
+        kind: TaxonomyKind,
+        name: str,
+        *,
+        storage_path: str | None = None,
+        token: object = None,
+    ) -> TaxonomyItem:
+        self.created_taxonomy.append((kind, name, storage_path))
+        return TaxonomyItem(100 + len(self.created_taxonomy), name)
 
     async def get_document_tag_ids(
         self, document_id: int, *, token: object = None
@@ -386,6 +457,10 @@ async def test_ingestion_failures_and_recovery(
     )
     assert diagnostic.__dict__["paperless_error"] == "duplicate in trash"
 
+    silent_failure = await ingestion.submit(await make_job(5))
+    gateway.task = PaperlessTask(gateway.task_id, TaskState.FAILURE)
+    assert (await ingestion.poll_once(silent_failure.job)).job.state == JobState.FAILED
+
     interrupted = await make_job(4)
     await repository.transition_job(interrupted.id, JobState.STAGED, JobState.SUBMITTING)
     notifications: list[JobState] = []
@@ -401,7 +476,7 @@ async def test_ingestion_failures_and_recovery(
 
 
 @pytest.mark.asyncio
-async def test_ingestion_invariants_polling_and_recovery_paths(
+async def test_ingestion_invariants_polling_and_recovery_paths(  # noqa: PLR0915
     tmp_path: Path,
     settings_factory: Callable[..., Settings],
     monkeypatch: pytest.MonkeyPatch,
@@ -487,6 +562,22 @@ async def test_ingestion_invariants_polling_and_recovery_paths(
     assert loaded_staged.state == JobState.SUBMITTED
     assert loaded_submitted is not None
     assert loaded_submitted.state == JobState.SUBMITTED
+
+    staged_unlinked = await stage(6)
+
+    class MissingCreds:
+        async def get_user_token(self, user_id: int) -> str | None:
+            return None
+
+    ingestion._credentials = MissingCreds()  # type: ignore[assignment]
+    original_submit = ingestion.submit
+    ingestion.submit = AsyncMock(side_effect=UnlinkedUserError("synthetic"))  # type: ignore[method-assign]
+    await ingestion.recover()
+    ingestion.submit = original_submit  # type: ignore[method-assign]
+    failed_unlinked = await repository.get_job(staged_unlinked.id)
+    assert failed_unlinked is not None
+    assert failed_unlinked.state == JobState.FAILED
+    assert (await ingestion._fail_unlinked_job(failed_unlinked)).job.state == JobState.FAILED
 
 
 @pytest.mark.asyncio
@@ -632,7 +723,7 @@ async def test_check_inbox_tag_removals(
 
 
 @pytest.mark.asyncio
-async def test_get_suggestions_for_job(
+async def test_get_suggestion_review(
     tmp_path: Path,
     settings_factory: Callable[..., Settings],
 ) -> None:
@@ -646,6 +737,19 @@ async def test_get_suggestions_for_job(
             return "token"
 
     ingestion._credentials = FakeCreds()  # type: ignore[assignment]
+    linked_path = settings.staging_dir / "linked.pdf"
+    linked_path.write_bytes(b"%PDF-1.7")
+    assert (
+        await ingestion.stage(
+            discord_message_id=90,
+            discord_attachment_id=91,
+            principal_id=201,
+            staged_path=linked_path,
+            original_filename="linked.pdf",
+            caption="",
+        )
+        is not None
+    )
 
     job = IngestionJob(
         id=uuid4(),
@@ -662,22 +766,19 @@ async def test_get_suggestions_for_job(
         guidance=MetadataGuidance((), None, None),
     )
 
-    s = await ingestion.get_suggestions_for_job(job)
-    assert s is not None
-    assert s.title == "Suggested"
-
-    review = await ingestion.reload_suggestions_for_job(job)
+    review = await ingestion.get_suggestion_review(job)
     assert review is not None
-    assert review[0] == gateway.documents[7]
-    assert review[1].title == "Suggested"
+    assert review.document == gateway.documents[7]
+    assert review.suggestions.title == "Suggested"
+    assert review.taxonomy == gateway.taxonomy
+    assert review.capabilities == gateway.capabilities
 
     gateway.suggestions_error = True
     with pytest.raises(PaperlessUnavailableError):
-        await ingestion.get_suggestions_for_job(job)
+        await ingestion.get_suggestion_review(job)
 
     job_no_doc = replace(job, paperless_document_id=None)
-    assert await ingestion.get_suggestions_for_job(job_no_doc) is None
-    assert await ingestion.reload_suggestions_for_job(job_no_doc) is None
+    assert await ingestion.get_suggestion_review(job_no_doc) is None
 
     class MissingCreds:
         async def get_user_token(self, user_id: int) -> str | None:
@@ -685,9 +786,184 @@ async def test_get_suggestions_for_job(
 
     ingestion._credentials = MissingCreds()  # type: ignore[assignment]
     with pytest.raises(UnlinkedUserError):
-        await ingestion.get_suggestions_for_job(job)
+        await ingestion.get_suggestion_review(job)
+
+
+@pytest.mark.asyncio
+async def test_suggestion_review_rejects_concurrent_change(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / "data")
+    gateway = FakeGateway()
+    _, _, ingestion = await _services(settings, gateway)
+    job = IngestionJob(
+        id=uuid4(),
+        discord_message_id=1,
+        discord_attachment_id=2,
+        principal_id=201,
+        staged_path=Path("synthetic.pdf"),
+        original_filename="synthetic.pdf",
+        caption="",
+        paperless_document_id=DocumentId(7),
+        media_type="application/pdf",
+        office_dependent=False,
+        guidance=MetadataGuidance(),
+    )
+    original_get_document = gateway.get_document
+    calls = 0
+
+    async def changing_document(document_id: int, *, token: object = None) -> Document:
+        nonlocal calls
+        calls += 1
+        document = await original_get_document(document_id, token=token)
+        return (
+            replace(document, modified=datetime(2026, 7, 29, tzinfo=UTC))
+            if calls == 2
+            else document
+        )
+
+    gateway.get_document = changing_document  # type: ignore[method-assign]
+    with pytest.raises(StaleSuggestionError):
+        await ingestion.get_suggestion_review(job)
+
+
+def test_initial_suggestion_selection_defaults() -> None:
+    document = Document(
+        DocumentId(7),
+        "Current",
+        date(2026, 7, 1),
+        modified=datetime(2026, 7, 28, tzinfo=UTC),
+    )
+    taxonomy = Taxonomy(
+        tags=(TaxonomyItem(2, "Existing Tag"),),
+        correspondents=(TaxonomyItem(3, "Existing Correspondent"),),
+        document_types=(TaxonomyItem(4, "Existing Type"),),
+        storage_paths=(TaxonomyItem(5, "Existing/Path"),),
+    )
+    review = SuggestionReview(
+        document,
+        AISuggestions(
+            title="AI Title",
+            correspondent_ids=(3,),
+            document_type_ids=(4, 40),
+            storage_path_ids=(5,),
+            tag_ids=(2,),
+            dates=(
+                SuggestedDate("2026-07-27", date(2026, 7, 27)),
+                SuggestedDate("invalid", None),
+            ),
+            suggested_tags=("New Tag",),
+        ),
+        taxonomy,
+        TaxonomyCapabilities(),
+    )
+
+    selection = IngestionService.initial_suggestion_selection(review)
+
+    assert selection.title == "AI Title"
+    assert selection.created == date(2026, 7, 27)
+    assert selection.correspondent_id == 3
+    assert selection.document_type_id is None
+    assert selection.storage_path_id == 5
+    assert selection.tag_ids == (2,)
+    assert selection.new_tags == ()
+    assert not review.capabilities.can_add(TaxonomyKind.TAG)
+    assert TaxonomyCapabilities(add_tags=True).can_add(TaxonomyKind.TAG)
+
+
+@pytest.mark.asyncio
+async def test_resolve_or_create_taxonomy_is_confirmed_and_idempotent(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / "data")
+    gateway = FakeGateway()
+    _, _, ingestion = await _services(settings, gateway)
+    job = IngestionJob(
+        id=uuid4(),
+        discord_message_id=1,
+        discord_attachment_id=2,
+        principal_id=201,
+        staged_path=Path("synthetic.pdf"),
+        original_filename="synthetic.pdf",
+        caption="",
+        paperless_document_id=DocumentId(7),
+        media_type="application/pdf",
+        office_dependent=False,
+        guidance=MetadataGuidance(),
+    )
+
+    gateway.taxonomy_matches = (TaxonomyItem(77, "Existing"),)
+    existing = await ingestion.resolve_or_create_taxonomy(
+        job,
+        TaxonomyKind.TAG,
+        "existing",
+        confirm_create=False,
+    )
+    assert existing.id == 77
+    assert gateway.created_taxonomy == []
+
+    gateway.taxonomy_matches = (TaxonomyItem(77, "Same"), TaxonomyItem(78, "same"))
+    with pytest.raises(PaperlessUnavailableError, match="ambiguous"):
+        await ingestion.resolve_or_create_taxonomy(
+            job,
+            TaxonomyKind.TAG,
+            "same",
+            confirm_create=True,
+        )
+
+    gateway.taxonomy_matches = ()
+    with pytest.raises(PaperlessUnavailableError, match="not confirmed"):
+        await ingestion.resolve_or_create_taxonomy(
+            job,
+            TaxonomyKind.TAG,
+            "New",
+            confirm_create=False,
+        )
+
+    gateway.capabilities = TaxonomyCapabilities()
+    with pytest.raises(PaperlessUnavailableError, match="not permitted"):
+        await ingestion.resolve_or_create_taxonomy(
+            job,
+            TaxonomyKind.TAG,
+            "New",
+            confirm_create=True,
+        )
+
+    gateway.capabilities = TaxonomyCapabilities(add_storage_paths=True)
+    created = await ingestion.resolve_or_create_taxonomy(
+        job,
+        TaxonomyKind.STORAGE_PATH,
+        "Personal",
+        confirm_create=True,
+        storage_path="Personal/{created_year}",
+    )
+    assert created.name == "Personal"
+    assert gateway.created_taxonomy == [
+        (TaxonomyKind.STORAGE_PATH, "Personal", "Personal/{created_year}")
+    ]
+
+    with pytest.raises(PaperlessUnavailableError, match="document"):
+        await ingestion.resolve_or_create_taxonomy(
+            replace(job, paperless_document_id=None),
+            TaxonomyKind.TAG,
+            "New",
+            confirm_create=True,
+        )
+
+    class MissingCreds:
+        async def get_user_token(self, user_id: int) -> str | None:
+            return None
+
+    ingestion._credentials = MissingCreds()  # type: ignore[assignment]
     with pytest.raises(UnlinkedUserError):
-        await ingestion.reload_suggestions_for_job(job)
+        await ingestion.resolve_or_create_taxonomy(
+            job,
+            TaxonomyKind.TAG,
+            "New",
+            confirm_create=True,
+        )
 
 
 @pytest.mark.asyncio
@@ -731,7 +1007,9 @@ async def test_apply_suggestions(
     )
     assert gateway.updates_applied is not None
     assert gateway.updates_applied.title == "New"
-    assert gateway.updates_applied.tag_ids == (1, 9, 2)
+    assert gateway.updates_applied.tag_ids is None
+    assert gateway.tag_changes == [((2,), ())]
+    assert gateway.documents[7].tag_ids == (1, 9, 2)
 
     gateway.documents[7] = replace(
         gateway.documents[7],
@@ -741,6 +1019,15 @@ async def test_apply_suggestions(
         await ingestion.apply_suggestions(
             job,
             updates,
+            expected_modified=expected_modified,
+        )
+
+    gateway.documents[7] = replace(gateway.documents[7], modified=expected_modified)
+    gateway.skip_update = True
+    with pytest.raises(PaperlessUnavailableError, match="did not confirm"):
+        await ingestion.apply_suggestions(
+            job,
+            DocumentUpdate(title="Not confirmed"),
             expected_modified=expected_modified,
         )
 

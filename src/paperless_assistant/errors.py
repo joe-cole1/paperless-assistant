@@ -19,6 +19,30 @@ class PaperlessAuthenticationError(PaperlessUnavailableError):
     """The configured Paperless credential was rejected."""
 
 
+class PaperlessPermissionError(PaperlessUnavailableError):
+    """The Paperless principal lacks permission for the requested operation."""
+
+
+class PaperlessAIUnavailableError(PaperlessUnavailableError):
+    """Base class for a diagnosable Paperless AI-suggestion failure."""
+
+
+class PaperlessAIDisabledError(PaperlessAIUnavailableError):
+    """Paperless has AI features disabled."""
+
+
+class PaperlessAIConfigurationError(PaperlessAIUnavailableError):
+    """Paperless rejected its configured AI backend or model settings."""
+
+
+class PaperlessAITimeoutError(PaperlessAIUnavailableError):
+    """The Paperless AI request exceeded a configured timeout."""
+
+
+class PaperlessAITransportError(PaperlessAIUnavailableError):
+    """The assistant could not complete transport to Paperless's AI endpoint."""
+
+
 class AmbiguousSubmissionError(AssistantError):
     """The upload response is unknown and must not be retried automatically."""
 

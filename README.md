@@ -23,8 +23,10 @@ Configure two private Discord text channels:
   status updates and Paperless processing progress are reported. After consumption, the bot asks
   Paperless 3.0.4 to run its LLM-backed suggestions and presents the proposed title,
   correspondent, document type, storage path, date, and tags for review. Only the uploader can
-  apply them. Applying rechecks the document, preserves existing tags, and patches its metadata;
-  unmatched names are displayed but never auto-created. Once the configured
+  apply them. Existing Paperless matches start selected while unmatched AI names start unchecked;
+  the uploader can change either list. Applying rechecks the document, preserves existing tags,
+  and patches only selected metadata. Selected unmatched names require a separate confirmation,
+  an exact-name check, and the linked user's Paperless creation permission. Once the configured
   `CLEANUP_INBOX_TAG` (default `inbox`) is removed from a document in Paperless, the bot
   automatically deletes the corresponding upload notification message and thread.
 
@@ -148,6 +150,11 @@ It does not silently fall back to the classic classifier endpoint
 `GET /api/documents/{id}/suggestions/`. Embeddings are optional for per-document suggestions; when
 configured, Paperless can use its LLM index to ground suggestions in similar documents.
 
+Paperless 3.0.4 caches the LLM response. **Reload Review** reads the supported endpoint again and
+may return that cached proposal; it does not promise another LLM call. A document metadata change
+invalidates Paperless's cache. The assistant does not make an artificial metadata change or use
+Paperless internals to force invalidation.
+
 ## Supported uploads
 
 Always enabled after signature validation:
@@ -175,6 +182,11 @@ the PR after all checks pass. Fork PRs remain read-only and receive a clear form
 
 Tests use only synthetic identities and documents. Never commit `.env`, tokens, private documents,
 OCR, questions, answers, captions, filenames, titles, or taxonomy values.
+
+The ship gate also starts an immutable Paperless-ngx 3.0.4 fixture and deterministic local
+OpenAI-compatible server. Run that focused check with
+`./scripts/paperless_ai_integration_test.sh`; it consumes only a generated synthetic PDF and
+removes its containers and volumes afterward.
 
 ## Releases
 

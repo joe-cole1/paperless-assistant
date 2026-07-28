@@ -30,6 +30,34 @@ class Taxonomy:
     storage_paths: tuple[TaxonomyItem, ...] = field(default_factory=tuple)
 
 
+class TaxonomyKind(StrEnum):
+    """Paperless taxonomy categories supported by AI review."""
+
+    TAG = "tag"
+    CORRESPONDENT = "correspondent"
+    DOCUMENT_TYPE = "document_type"
+    STORAGE_PATH = "storage_path"
+
+
+@dataclass(frozen=True, slots=True)
+class TaxonomyCapabilities:
+    """Creation permissions exposed by Paperless for the invoking user."""
+
+    add_tags: bool = False
+    add_correspondents: bool = False
+    add_document_types: bool = False
+    add_storage_paths: bool = False
+
+    def can_add(self, kind: TaxonomyKind) -> bool:
+        """Return whether Paperless allows this user to create ``kind``."""
+        return {
+            TaxonomyKind.TAG: self.add_tags,
+            TaxonomyKind.CORRESPONDENT: self.add_correspondents,
+            TaxonomyKind.DOCUMENT_TYPE: self.add_document_types,
+            TaxonomyKind.STORAGE_PATH: self.add_storage_paths,
+        }[kind]
+
+
 @dataclass(frozen=True, slots=True)
 class MetadataGuidance:
     """Unambiguous metadata selected from an upload caption."""
@@ -40,19 +68,53 @@ class MetadataGuidance:
 
 
 @dataclass(frozen=True, slots=True)
+class SuggestedDate:
+    """One raw Paperless date candidate and its validated value, when valid."""
+
+    raw: str
+    value: date | None
+
+
+@dataclass(frozen=True, slots=True)
 class AISuggestions:
     """Native Paperless LLM suggestions, including names not yet in its taxonomy."""
 
     title: str | None = None
-    correspondent_id: int | None = None
-    document_type_id: int | None = None
-    storage_path_id: int | None = None
+    correspondent_ids: tuple[int, ...] = field(default_factory=tuple)
+    document_type_ids: tuple[int, ...] = field(default_factory=tuple)
+    storage_path_ids: tuple[int, ...] = field(default_factory=tuple)
     tag_ids: tuple[int, ...] = field(default_factory=tuple)
-    dates: tuple[date, ...] = field(default_factory=tuple)
+    dates: tuple[SuggestedDate, ...] = field(default_factory=tuple)
     suggested_correspondents: tuple[str, ...] = field(default_factory=tuple)
     suggested_document_types: tuple[str, ...] = field(default_factory=tuple)
     suggested_storage_paths: tuple[str, ...] = field(default_factory=tuple)
     suggested_tags: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True, slots=True)
+class SuggestionSelection:
+    """Uploader-selected subset of one Paperless AI response."""
+
+    title: str | None = None
+    created: date | None = None
+    correspondent_id: int | None = None
+    document_type_id: int | None = None
+    storage_path_id: int | None = None
+    tag_ids: tuple[int, ...] = field(default_factory=tuple)
+    new_correspondents: tuple[str, ...] = field(default_factory=tuple)
+    new_document_types: tuple[str, ...] = field(default_factory=tuple)
+    new_storage_paths: tuple[str, ...] = field(default_factory=tuple)
+    new_tags: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True, slots=True)
+class SuggestionReview:
+    """User-scoped Paperless state required to render and apply one review."""
+
+    document: Document
+    suggestions: AISuggestions
+    taxonomy: Taxonomy
+    capabilities: TaxonomyCapabilities
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +140,8 @@ class Document:
     archived_filename: str | None = None
     modified: datetime | None = None
     tag_ids: tuple[int, ...] = field(default_factory=tuple)
+    correspondent_id: int | None = None
+    document_type_id: int | None = None
     storage_path_id: int | None = None
 
 

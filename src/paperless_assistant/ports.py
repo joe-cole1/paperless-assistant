@@ -24,6 +24,9 @@ from paperless_assistant.models import (
     PaperlessTask,
     ReferenceContext,
     Taxonomy,
+    TaxonomyCapabilities,
+    TaxonomyItem,
+    TaxonomyKind,
 )
 
 
@@ -45,6 +48,27 @@ class PaperlessGateway(Protocol):
     ) -> Document: ...
 
     async def get_taxonomy(self, *, token: SecretStr | None = None) -> Taxonomy: ...
+
+    async def get_taxonomy_capabilities(
+        self, *, token: SecretStr | None = None
+    ) -> TaxonomyCapabilities: ...
+
+    async def find_taxonomy_items(
+        self,
+        kind: TaxonomyKind,
+        name: str,
+        *,
+        token: SecretStr | None = None,
+    ) -> tuple[TaxonomyItem, ...]: ...
+
+    async def create_taxonomy_item(
+        self,
+        kind: TaxonomyKind,
+        name: str,
+        *,
+        storage_path: str | None = None,
+        token: SecretStr | None = None,
+    ) -> TaxonomyItem: ...
 
     async def submit_document(
         self,
@@ -68,6 +92,15 @@ class PaperlessGateway(Protocol):
 
     async def update_document(
         self, document_id: int, updates: DocumentUpdate, *, token: SecretStr | None = None
+    ) -> None: ...
+
+    async def modify_document_tags(
+        self,
+        document_id: int,
+        *,
+        add_tag_ids: tuple[int, ...],
+        remove_tag_ids: tuple[int, ...] = (),
+        token: SecretStr | None = None,
     ) -> None: ...
 
     async def download(

@@ -22,7 +22,6 @@ from paperless_assistant.errors import (
     UnlinkedUserError,
 )
 from paperless_assistant.models import (
-    AISuggestions,
     AuditEvent,
     ChatResult,
     DeliveryPlan,
@@ -34,9 +33,12 @@ from paperless_assistant.models import (
     JobState,
     MetadataGuidance,
     ReferenceContext,
+    SuggestionReview,
+    SuggestionSelection,
     TaskState,
     Taxonomy,
     TaxonomyItem,
+    TaxonomyKind,
 )
 from paperless_assistant.paperless import (
     PAPERLESS_CHAT_ERROR,
@@ -532,26 +534,8 @@ class IngestionService:
             )
         )
 
-    async def get_suggestions_for_job(self, job: IngestionJob) -> AISuggestions | None:
-        """Trigger Paperless's synchronous native AI suggestion endpoint once."""
-        if job.paperless_document_id is None:
-            return None
-        user_token = (
-            await self._credentials.get_user_token(job.principal_id)
-            if self._credentials is not None
-            else None
-        )
-        if self._credentials is not None and user_token is None:
-            raise UnlinkedUserError("Paperless account is not linked")
-
-        return await self._gateway.get_ai_suggestions(
-            int(job.paperless_document_id), token=user_token
-        )
-
-    async def reload_suggestions_for_job(
-        self, job: IngestionJob
-    ) -> tuple[Document, AISuggestions] | None:
-        """Reload the concurrency baseline and Paperless AI proposal together."""
+    async def get_suggestion_review(self, job: IngestionJob) -> SuggestionReview | None:
+        """Load one stable, user-scoped AI review without hiding cached responses."""
         if job.paperless_document_id is None:
             return None
         user_token = (
@@ -562,9 +546,16 @@ class IngestionService:
         if self._credentials is not None and user_token is None:
             raise UnlinkedUserError("Paperless account is not linked")
         document_id = int(job.paperless_document_id)
-        document = await self._gateway.get_document(document_id, token=user_token)
+        before = await self._gateway.get_document(document_id, token=user_token)
         suggestions = await self._gateway.get_ai_suggestions(document_id, token=user_token)
-        return document, suggestions
+        after, taxonomy, capabilities = await asyncio.gather(
+            self._gateway.get_document(document_id, token=user_token),
+            self._gateway.get_taxonomy(token=user_token),
+            self._gateway.get_taxonomy_capabilities(token=user_token),
+        )
+        if before.modified is None or after.modified is None or before.modified != after.modified:
+            raise StaleSuggestionError("document changed while suggestions were generated")
+        return SuggestionReview(after, suggestions, taxonomy, capabilities)
 
     async def apply_suggestions(
         self,
@@ -590,16 +581,113 @@ class IngestionService:
             or current.modified != expected_modified
         ):
             raise StaleSuggestionError("document changed after suggestions were generated")
-        merged_updates = updates
-        if updates.tag_ids is not None:
-            merged_updates = replace(
-                updates,
-                tag_ids=tuple(dict.fromkeys((*current.tag_ids, *updates.tag_ids))),
-            )
-        await self._gateway.update_document(
-            int(job.paperless_document_id), merged_updates, token=user_token
+        document_id = int(job.paperless_document_id)
+        scalar_updates = replace(updates, tag_ids=None)
+        await self._gateway.update_document(document_id, scalar_updates, token=user_token)
+        approved_tags = tuple(
+            tag_id
+            for tag_id in dict.fromkeys(updates.tag_ids or ())
+            if tag_id not in current.tag_ids
         )
+        await self._gateway.modify_document_tags(
+            document_id,
+            add_tag_ids=approved_tags,
+            token=user_token,
+        )
+        applied = await self._gateway.get_document(document_id, token=user_token)
+        scalar_matches = (
+            (updates.title is None or applied.title == updates.title)
+            and (updates.created is None or applied.created == updates.created)
+            and (
+                updates.correspondent_id is None
+                or applied.correspondent_id == updates.correspondent_id
+            )
+            and (
+                updates.document_type_id is None
+                or applied.document_type_id == updates.document_type_id
+            )
+            and (
+                updates.storage_path_id is None
+                or applied.storage_path_id == updates.storage_path_id
+            )
+        )
+        if not scalar_matches or not set(approved_tags).issubset(applied.tag_ids):
+            raise PaperlessUnavailableError("Paperless did not confirm suggestion updates")
         await self._record(job, "suggestions_applied")
+
+    async def resolve_or_create_taxonomy(
+        self,
+        job: IngestionJob,
+        kind: TaxonomyKind,
+        name: str,
+        *,
+        confirm_create: bool,
+        storage_path: str | None = None,
+    ) -> TaxonomyItem:
+        """Map an exact visible name or create it only after explicit confirmation."""
+        if job.paperless_document_id is None:
+            raise PaperlessUnavailableError("document is unavailable")
+        user_token = (
+            await self._credentials.get_user_token(job.principal_id)
+            if self._credentials is not None
+            else None
+        )
+        if self._credentials is not None and user_token is None:
+            raise UnlinkedUserError("Paperless account is not linked")
+        matches = await self._gateway.find_taxonomy_items(kind, name, token=user_token)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise PaperlessUnavailableError("taxonomy name is ambiguous")
+        if not confirm_create:
+            raise PaperlessUnavailableError("taxonomy creation is not confirmed")
+        capabilities = await self._gateway.get_taxonomy_capabilities(token=user_token)
+        if not capabilities.can_add(kind):
+            raise PaperlessUnavailableError("taxonomy creation is not permitted")
+        created = await self._gateway.create_taxonomy_item(
+            kind,
+            name,
+            storage_path=storage_path,
+            token=user_token,
+        )
+        await self._audit.record(
+            AuditEvent(
+                principal_id=job.principal_id,
+                action="taxonomy_create",
+                outcome=kind.value,
+                occurred_at=_now(),
+                correlation_id=uuid4(),
+                job_id=job.id,
+                task_id=job.paperless_task_id,
+                document_id=job.paperless_document_id,
+            )
+        )
+        return created
+
+    @staticmethod
+    def initial_suggestion_selection(review: SuggestionReview) -> SuggestionSelection:
+        """Select safe matched objects while leaving unmatched names opt-in."""
+        valid_dates = tuple(value.value for value in review.suggestions.dates if value.value)
+        return SuggestionSelection(
+            title=review.suggestions.title,
+            created=valid_dates[0] if len(valid_dates) == 1 else None,
+            correspondent_id=(
+                review.suggestions.correspondent_ids[0]
+                if len(review.suggestions.correspondent_ids) == 1
+                else None
+            ),
+            document_type_id=(
+                review.suggestions.document_type_ids[0]
+                if len(review.suggestions.document_type_ids) == 1
+                else None
+            ),
+            storage_path_id=(
+                review.suggestions.storage_path_ids[0]
+                if len(review.suggestions.storage_path_ids) == 1
+                else None
+            ),
+            tag_ids=review.suggestions.tag_ids,
+        )
 
 
 class DeliveryService:

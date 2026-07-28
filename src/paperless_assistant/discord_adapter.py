@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Callable, Coroutine, Sequence
 from contextlib import suppress
-from datetime import UTC, datetime, timedelta
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
+from difflib import SequenceMatcher
 from typing import Any
 from uuid import uuid4
 
@@ -30,7 +33,11 @@ from paperless_assistant.models import (
     IngestionJob,
     JobState,
     ReferenceContext,
+    SuggestionReview,
+    SuggestionSelection,
     Taxonomy,
+    TaxonomyItem,
+    TaxonomyKind,
 )
 from paperless_assistant.policy import discord_safe_chunks, select_ordinal
 from paperless_assistant.ports import CredentialRepository, PaperlessGateway
@@ -146,117 +153,634 @@ def _result_view(
     return view
 
 
-class AISuggestionsEditModal(discord.ui.Modal, title="Edit Suggested Title"):
+class AISuggestionsEditModal(discord.ui.Modal, title="Review Suggested Title and Date"):
     def __init__(
         self,
-        current_title: str,
-        callback: Callable[[discord.Interaction, str], Coroutine[Any, Any, None]],
+        selection: SuggestionSelection,
+        callback: Callable[
+            [discord.Interaction, str | None, date | None], Coroutine[Any, Any, None]
+        ],
     ) -> None:
         super().__init__()
         self.callback = callback
         self.title_input: discord.ui.TextInput[Any] = discord.ui.TextInput(
-            label="Document Title",
-            default=current_title,
+            label="Document title (blank keeps current)",
+            default=selection.title or "",
             max_length=128,
-            required=True,
+            required=False,
+        )
+        self.date_input: discord.ui.TextInput[Any] = discord.ui.TextInput(
+            label="Document date YYYY-MM-DD (blank keeps current)",
+            default=selection.created.isoformat() if selection.created else "",
+            max_length=10,
+            required=False,
         )
         self.add_item(self.title_input)
+        self.add_item(self.date_input)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        await self.callback(interaction, self.title_input.value)
+        raw_date = self.date_input.value.strip()
+        try:
+            selected_date = date.fromisoformat(raw_date) if raw_date else None
+        except ValueError:
+            await interaction.response.send_message(
+                "Use a valid date in YYYY-MM-DD format.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        await self.callback(interaction, self.title_input.value.strip() or None, selected_date)
+
+
+_TAXONOMY_LABELS = {
+    TaxonomyKind.TAG: "Tags",
+    TaxonomyKind.CORRESPONDENT: "Correspondent",
+    TaxonomyKind.DOCUMENT_TYPE: "Document Type",
+    TaxonomyKind.STORAGE_PATH: "Storage Path",
+}
+_NORMALIZE_TAXONOMY = re.compile(r"[^\w\s]")
+_CLOSE_MATCH_THRESHOLD = 0.6
+_SELECT_OPTION_LIMIT = 25
+
+
+def _taxonomy_values(taxonomy: Taxonomy, kind: TaxonomyKind) -> tuple[TaxonomyItem, ...]:
+    return {
+        TaxonomyKind.TAG: taxonomy.tags,
+        TaxonomyKind.CORRESPONDENT: taxonomy.correspondents,
+        TaxonomyKind.DOCUMENT_TYPE: taxonomy.document_types,
+        TaxonomyKind.STORAGE_PATH: taxonomy.storage_paths,
+    }[kind]
+
+
+def _suggested_names(suggestions: AISuggestions, kind: TaxonomyKind) -> tuple[str, ...]:
+    return {
+        TaxonomyKind.TAG: suggestions.suggested_tags,
+        TaxonomyKind.CORRESPONDENT: suggestions.suggested_correspondents,
+        TaxonomyKind.DOCUMENT_TYPE: suggestions.suggested_document_types,
+        TaxonomyKind.STORAGE_PATH: suggestions.suggested_storage_paths,
+    }[kind]
+
+
+def _matched_ids(suggestions: AISuggestions, kind: TaxonomyKind) -> tuple[int, ...]:
+    return {
+        TaxonomyKind.TAG: suggestions.tag_ids,
+        TaxonomyKind.CORRESPONDENT: suggestions.correspondent_ids,
+        TaxonomyKind.DOCUMENT_TYPE: suggestions.document_type_ids,
+        TaxonomyKind.STORAGE_PATH: suggestions.storage_path_ids,
+    }[kind]
+
+
+def _taxonomy_name(identifier: int | None, values: Sequence[TaxonomyItem]) -> str:
+    if identifier is None:
+        return "Keep current"
+    return next((item.name for item in values if item.id == identifier), f"ID {identifier}")
+
+
+def _normalized_taxonomy(value: str) -> str:
+    return _NORMALIZE_TAXONOMY.sub("", value.casefold()).strip()
+
+
+def _close_existing_items(
+    names: Sequence[str],
+    values: Sequence[TaxonomyItem],
+    excluded_ids: Sequence[int],
+) -> tuple[tuple[TaxonomyItem, str], ...]:
+    candidates: list[tuple[TaxonomyItem, str, float]] = []
+    excluded = frozenset(excluded_ids)
+    for suggested in names:
+        target = _normalized_taxonomy(suggested)
+        ranked = sorted(
+            (
+                (
+                    item,
+                    SequenceMatcher(
+                        None,
+                        target,
+                        _normalized_taxonomy(item.name),
+                    ).ratio(),
+                )
+                for item in values
+                if item.id not in excluded
+            ),
+            key=lambda value: value[1],
+            reverse=True,
+        )
+        if ranked and ranked[0][1] >= _CLOSE_MATCH_THRESHOLD:
+            candidates.append((ranked[0][0], suggested, ranked[0][1]))
+    unique: dict[int, tuple[TaxonomyItem, str, float]] = {}
+    for item, suggested, score in candidates:
+        current = unique.get(item.id)
+        if current is None or score > current[2]:
+            unique[item.id] = (item, suggested, score)
+    return tuple((item, suggested) for item, suggested, _ in unique.values())
+
+
+def _bounded_lines(lines: Sequence[str]) -> str:
+    if not lines:
+        return "None"
+    rendered = "\n".join(lines)
+    return rendered if len(rendered) <= 1024 else f"{rendered[:1019]}…"
 
 
 def _build_suggestions_embed(
-    document: Document,
-    suggestions: AISuggestions,
-    taxonomy: Taxonomy | None,
-    current_title: str | None = None,
+    review: SuggestionReview,
+    selection: SuggestionSelection,
 ) -> discord.Embed:
-    def taxonomy_name(identifier: int | None, values: Sequence[Any]) -> str:
-        if identifier is None:
-            return "None"
-        return next((item.name for item in values if item.id == identifier), str(identifier))
-
-    def joined(values: Sequence[str]) -> str:
-        return ", ".join(values)[:1024] if values else "None"
-
-    title_val = current_title or suggestions.title or document.title or "None"
+    document = review.document
+    suggestions = review.suggestions
+    taxonomy = review.taxonomy
     embed = discord.Embed(
-        title=f"🤖 AI Suggestions for {document.title}",
+        title=f"🤖 AI Metadata Review for {document.title}",
         description=(
-            "Generated by Paperless's configured LLM. Existing taxonomy matches can be applied; "
-            "new names are shown for review but are not created automatically."
+            "Paperless existing matches are selected by default. New AI names are unchecked. "
+            "Use the menus to customize the selection; nothing changes until **Apply Selected**."
         ),
         color=discord.Color.purple(),
     )
     embed.add_field(
-        name="Suggested Title",
-        value=title_val,
+        name="Title",
+        value=f"Current: {document.title}\nSelected: {selection.title or 'Keep current'}",
+        inline=False,
+    )
+    date_candidates = tuple(
+        value.raw if value.value is not None else f"⚠ {value.raw} (invalid)"
+        for value in suggestions.dates
+    )
+    embed.add_field(
+        name="Date",
+        value=(
+            f"Current: {document.created.isoformat() if document.created else 'None'}\n"
+            f"Selected: {selection.created.isoformat() if selection.created else 'Keep current'}\n"
+            f"AI candidates: {', '.join(date_candidates) if date_candidates else 'None'}"
+        ),
         inline=False,
     )
 
-    corr_name = taxonomy_name(
-        suggestions.correspondent_id,
-        taxonomy.correspondents if taxonomy else (),
-    )
-    embed.add_field(name="Correspondent", value=corr_name, inline=True)
+    selected_scalars = {
+        TaxonomyKind.CORRESPONDENT: selection.correspondent_id,
+        TaxonomyKind.DOCUMENT_TYPE: selection.document_type_id,
+        TaxonomyKind.STORAGE_PATH: selection.storage_path_id,
+    }
+    selected_new_scalars = {
+        TaxonomyKind.CORRESPONDENT: selection.new_correspondents,
+        TaxonomyKind.DOCUMENT_TYPE: selection.new_document_types,
+        TaxonomyKind.STORAGE_PATH: selection.new_storage_paths,
+    }
+    current_scalars = {
+        TaxonomyKind.CORRESPONDENT: document.correspondent_id,
+        TaxonomyKind.DOCUMENT_TYPE: document.document_type_id,
+        TaxonomyKind.STORAGE_PATH: document.storage_path_id,
+    }
+    for kind in (
+        TaxonomyKind.CORRESPONDENT,
+        TaxonomyKind.DOCUMENT_TYPE,
+        TaxonomyKind.STORAGE_PATH,
+    ):
+        values = _taxonomy_values(taxonomy, kind)
+        selected_id = selected_scalars[kind]
+        selected_new = selected_new_scalars[kind]
+        matched = tuple(
+            f"{'☑' if selected_id == identifier else '☐'} Existing · "
+            f"{_taxonomy_name(identifier, values)}"
+            for identifier in _matched_ids(suggestions, kind)
+        )
+        close = tuple(
+            f"{'☑' if selected_id == item.id else '☐'} Close existing · "
+            f"{item.name} (for AI: {suggested})"
+            for item, suggested in _close_existing_items(
+                _suggested_names(suggestions, kind),
+                values,
+                _matched_ids(suggestions, kind),
+            )
+        )
+        unmatched = tuple(
+            f"{'☑' if name in selected_new else '☐'} New · {name}"
+            for name in _suggested_names(suggestions, kind)
+        )
+        embed.add_field(
+            name=_TAXONOMY_LABELS[kind],
+            value=_bounded_lines(
+                (
+                    f"Current: {_taxonomy_name(current_scalars[kind], values)}",
+                    *matched,
+                    *close,
+                    *unmatched,
+                )
+            ),
+            inline=False,
+        )
 
-    type_name = taxonomy_name(
-        suggestions.document_type_id,
-        taxonomy.document_types if taxonomy else (),
+    tag_values = _taxonomy_values(taxonomy, TaxonomyKind.TAG)
+    current_tags = tuple(_taxonomy_name(identifier, tag_values) for identifier in document.tag_ids)
+    tag_lines = (
+        f"Current: {', '.join(current_tags) if current_tags else 'None'}",
+        *(
+            f"{'☑' if identifier in selection.tag_ids else '☐'} Existing · "
+            f"{_taxonomy_name(identifier, tag_values)}"
+            for identifier in suggestions.tag_ids
+        ),
+        *(
+            f"{'☑' if item.id in selection.tag_ids else '☐'} Close existing · "
+            f"{item.name} (for AI: {suggested})"
+            for item, suggested in _close_existing_items(
+                suggestions.suggested_tags,
+                tag_values,
+                suggestions.tag_ids,
+            )
+        ),
+        *(
+            f"{'☑' if name in selection.new_tags else '☐'} New · {name}"
+            for name in suggestions.suggested_tags
+        ),
     )
-    embed.add_field(name="Document Type", value=type_name, inline=True)
-
-    storage_name = taxonomy_name(
-        suggestions.storage_path_id,
-        taxonomy.storage_paths if taxonomy else (),
-    )
-    embed.add_field(name="Storage Path", value=storage_name, inline=True)
-
-    tag_names: list[str] = []
-    if suggestions.tag_ids:
-        tag_names = [
-            next((t.name for t in taxonomy.tags if t.id == tid), str(tid)) if taxonomy else str(tid)
-            for tid in suggestions.tag_ids
-        ]
-    embed.add_field(name="Matched Tags", value=joined(tag_names), inline=False)
-    embed.add_field(
-        name="Suggested Date",
-        value=suggestions.dates[0].isoformat() if suggestions.dates else "None",
-        inline=True,
-    )
-    unmatched = (
-        *suggestions.suggested_tags,
-        *suggestions.suggested_correspondents,
-        *suggestions.suggested_document_types,
-        *suggestions.suggested_storage_paths,
-    )
-    embed.add_field(
-        name="New Taxonomy Names (not auto-created)", value=joined(unmatched), inline=False
-    )
-
+    embed.add_field(name="Tags", value=_bounded_lines(tag_lines), inline=False)
+    embed.set_footer(text="Reload Review may return Paperless's cached AI response.")
     return embed
 
 
+class _MetadataSelect(discord.ui.Select[discord.ui.View]):
+    def __init__(self, review_view: AISuggestionsView, kind: TaxonomyKind, row: int) -> None:
+        self.review_view = review_view
+        self.kind = kind
+        options = review_view.options_for(kind)
+        if len(options) > _SELECT_OPTION_LIMIT:
+            option_count = len(options)
+            options = options[: _SELECT_OPTION_LIMIT - 1]
+            options.append(
+                discord.SelectOption(
+                    label=f"Review all {option_count} choices…",
+                    value="more",
+                    description="Open a paginated selector for this category.",
+                )
+            )
+        super().__init__(
+            placeholder=f"Review {_TAXONOMY_LABELS[kind].lower()}",
+            min_values=0,
+            max_values=len(options) if kind is TaxonomyKind.TAG else 1,
+            options=options,
+            row=row,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if "more" in self.values:
+            await interaction.response.send_message(
+                f"Review {_TAXONOMY_LABELS[self.kind].lower()} on one or more pages.",
+                view=_MetadataOverflowView(
+                    self.review_view,
+                    self.kind,
+                    interaction.message,
+                ),
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        self.review_view.update_selection(self.kind, tuple(self.values))
+        if interaction.message:
+            await interaction.response.edit_message(
+                embed=self.review_view.build_embed(),
+                view=self.review_view,
+            )
+        else:
+            await interaction.response.defer()
+
+
+class _MetadataPageSelect(discord.ui.Select[discord.ui.View]):
+    def __init__(self, overflow: _MetadataOverflowView) -> None:
+        self.overflow = overflow
+        options = overflow.page_options
+        super().__init__(
+            placeholder=(
+                f"{_TAXONOMY_LABELS[overflow.kind]} {overflow.page + 1}/{overflow.page_count}"
+            ),
+            min_values=0,
+            max_values=len(options) if overflow.kind is TaxonomyKind.TAG else 1,
+            options=options,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.overflow.parent.update_selection(
+            self.overflow.kind,
+            tuple(self.values),
+            preserve_unmentioned=self.overflow.kind is TaxonomyKind.TAG,
+            visible_values=tuple(option.value for option in self.options),
+        )
+        await interaction.response.edit_message(view=self.overflow)
+        if self.overflow.source_message:
+            await self.overflow.source_message.edit(
+                embed=self.overflow.parent.build_embed(),
+                view=self.overflow.parent,
+            )
+
+
+class _MetadataOverflowView(discord.ui.View):
+    def __init__(
+        self,
+        parent: AISuggestionsView,
+        kind: TaxonomyKind,
+        source_message: discord.Message | None,
+        *,
+        page: int = 0,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.parent = parent
+        self.kind = kind
+        self.source_message = source_message
+        self.page = page
+        self._rebuild()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.parent.job.principal_id:
+            return True
+        await interaction.response.send_message(
+            "Only the uploader can edit this review.",
+            ephemeral=True,
+            allowed_mentions=NO_MENTIONS,
+        )
+        return False
+
+    @property
+    def page_count(self) -> int:
+        return max(
+            1,
+            (len(self.parent.options_for(self.kind)) + _SELECT_OPTION_LIMIT - 1)
+            // _SELECT_OPTION_LIMIT,
+        )
+
+    @property
+    def page_options(self) -> list[discord.SelectOption]:
+        start = self.page * _SELECT_OPTION_LIMIT
+        return self.parent.options_for(self.kind)[start : start + _SELECT_OPTION_LIMIT]
+
+    def _rebuild(self) -> None:
+        for child in tuple(self.children):
+            if isinstance(child, _MetadataPageSelect):
+                self.remove_item(child)
+        self.add_item(_MetadataPageSelect(self))
+        self.previous_button.disabled = self.page == 0
+        self.next_button.disabled = self.page + 1 >= self.page_count
+
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary, row=1)
+    async def previous_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[discord.ui.View],
+    ) -> None:
+        del button
+        self.page -= 1
+        self._rebuild()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary, row=1)
+    async def next_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[discord.ui.View],
+    ) -> None:
+        del button
+        self.page += 1
+        self._rebuild()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="Done", style=discord.ButtonStyle.primary, row=1)
+    async def done_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[discord.ui.View],
+    ) -> None:
+        del button
+        await interaction.response.edit_message(content="Selection saved.", view=None)
+
+
+class _ConfirmTaxonomyCreationView(discord.ui.View):
+    def __init__(
+        self,
+        parent: AISuggestionsView,
+        source_message: discord.Message | None,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.parent = parent
+        self.source_message = source_message
+
+    @discord.ui.button(
+        label="Confirm Create & Apply",
+        style=discord.ButtonStyle.danger,
+        emoji="⚠️",
+    )
+    async def confirm(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[discord.ui.View],
+    ) -> None:
+        del button
+        if interaction.user.id != self.parent.job.principal_id:
+            await interaction.response.send_message(
+                "Only the uploader can confirm taxonomy creation.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        await self.parent.apply(interaction, self.source_message, confirm_create=True)
+
+    @discord.ui.button(label="Go Back", style=discord.ButtonStyle.secondary)
+    async def back(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[discord.ui.View],
+    ) -> None:
+        del button
+        await interaction.response.edit_message(
+            content="No taxonomy objects were created.",
+            view=None,
+        )
+
+
 class AISuggestionsView(discord.ui.View):
-    def __init__(  # noqa: PLR0913, PLR0917
+    def __init__(
         self,
         job: IngestionJob,
-        document: Document,
-        suggestions: AISuggestions,
+        review: SuggestionReview,
         ingestion: IngestionService,
         timeout_seconds: float,
-        taxonomy_cache: TaxonomyCache | None = None,
     ) -> None:
         super().__init__(timeout=timeout_seconds)
         self.job = job
-        self.document = document
-        self.suggestions = suggestions
+        self.review = review
         self.ingestion = ingestion
-        self.taxonomy_cache = taxonomy_cache
-        self.current_title = suggestions.title or document.title
+        self.selection = ingestion.initial_suggestion_selection(review)
         self._apply_lock = asyncio.Lock()
         self._applied = False
+        self._rebuild_metadata_selects()
+
+    def _rebuild_metadata_selects(self) -> None:
+        for child in tuple(self.children):
+            if isinstance(child, _MetadataSelect):
+                self.remove_item(child)
+        for row, kind in enumerate(
+            (
+                TaxonomyKind.CORRESPONDENT,
+                TaxonomyKind.DOCUMENT_TYPE,
+                TaxonomyKind.STORAGE_PATH,
+                TaxonomyKind.TAG,
+            )
+        ):
+            if _matched_ids(self.review.suggestions, kind) or _suggested_names(
+                self.review.suggestions, kind
+            ):
+                self.add_item(_MetadataSelect(self, kind, row))
+
+    @property
+    def document(self) -> Document:
+        return self.review.document
+
+    @property
+    def suggestions(self) -> AISuggestions:
+        return self.review.suggestions
+
+    @property
+    def current_title(self) -> str:
+        return self.selection.title or self.document.title
+
+    def build_embed(self) -> discord.Embed:
+        return _build_suggestions_embed(self.review, self.selection)
+
+    def options_for(self, kind: TaxonomyKind) -> list[discord.SelectOption]:
+        values = _taxonomy_values(self.review.taxonomy, kind)
+        matched_ids = _matched_ids(self.suggestions, kind)
+        suggestions = _suggested_names(self.suggestions, kind)
+        options: list[discord.SelectOption] = []
+        selected_id = {
+            TaxonomyKind.CORRESPONDENT: self.selection.correspondent_id,
+            TaxonomyKind.DOCUMENT_TYPE: self.selection.document_type_id,
+            TaxonomyKind.STORAGE_PATH: self.selection.storage_path_id,
+        }.get(kind)
+        selected_new = {
+            TaxonomyKind.TAG: self.selection.new_tags,
+            TaxonomyKind.CORRESPONDENT: self.selection.new_correspondents,
+            TaxonomyKind.DOCUMENT_TYPE: self.selection.new_document_types,
+            TaxonomyKind.STORAGE_PATH: self.selection.new_storage_paths,
+        }[kind]
+        if kind is not TaxonomyKind.TAG:
+            options.append(
+                discord.SelectOption(
+                    label="Keep current",
+                    value="keep",
+                    default=selected_id is None and not selected_new,
+                )
+            )
+        options.extend(
+            [
+                discord.SelectOption(
+                    label=f"Existing · {_taxonomy_name(identifier, values)}"[:100],
+                    value=f"id:{identifier}",
+                    description="Paperless matched this existing object.",
+                    default=(
+                        identifier in self.selection.tag_ids
+                        if kind is TaxonomyKind.TAG
+                        else selected_id == identifier
+                    ),
+                )
+                for identifier in matched_ids
+            ]
+        )
+        for item, suggested in _close_existing_items(suggestions, values, matched_ids):
+            options.append(
+                discord.SelectOption(
+                    label=f"Close existing · {item.name}"[:100],
+                    value=f"id:{item.id}",
+                    description=f"Close to AI suggestion: {suggested}"[:100],
+                    default=(
+                        item.id in self.selection.tag_ids
+                        if kind is TaxonomyKind.TAG
+                        else selected_id == item.id
+                    ),
+                )
+            )
+        for index, name in enumerate(suggestions):
+            options.append(
+                discord.SelectOption(
+                    label=f"New · {name}"[:100],
+                    value=f"new:{index}",
+                    description="Unchecked; selecting may require confirmed creation.",
+                    default=name in selected_new,
+                )
+            )
+        return options
+
+    def update_selection(
+        self,
+        kind: TaxonomyKind,
+        values: tuple[str, ...],
+        *,
+        preserve_unmentioned: bool = False,
+        visible_values: tuple[str, ...] = (),
+    ) -> None:
+        if kind is TaxonomyKind.TAG and preserve_unmentioned:
+            retained = tuple(
+                value for value in self._selected_option_values(kind) if value not in visible_values
+            )
+            values = (*retained, *values)
+        selected_ids = tuple(
+            int(value.removeprefix("id:")) for value in values if value.startswith("id:")
+        )
+        names = _suggested_names(self.suggestions, kind)
+        selected_names = tuple(
+            names[int(value.removeprefix("new:"))] for value in values if value.startswith("new:")
+        )
+        if kind is TaxonomyKind.TAG:
+            self.selection = replace(
+                self.selection,
+                tag_ids=selected_ids,
+                new_tags=selected_names,
+            )
+        elif kind is TaxonomyKind.CORRESPONDENT:
+            self.selection = replace(
+                self.selection,
+                correspondent_id=selected_ids[0] if selected_ids else None,
+                new_correspondents=selected_names[:1],
+            )
+        elif kind is TaxonomyKind.DOCUMENT_TYPE:
+            self.selection = replace(
+                self.selection,
+                document_type_id=selected_ids[0] if selected_ids else None,
+                new_document_types=selected_names[:1],
+            )
+        else:
+            self.selection = replace(
+                self.selection,
+                storage_path_id=selected_ids[0] if selected_ids else None,
+                new_storage_paths=selected_names[:1],
+            )
+        self._rebuild_metadata_selects()
+
+    def _selected_option_values(self, kind: TaxonomyKind) -> tuple[str, ...]:
+        if kind is not TaxonomyKind.TAG:
+            selected_id = {
+                TaxonomyKind.CORRESPONDENT: self.selection.correspondent_id,
+                TaxonomyKind.DOCUMENT_TYPE: self.selection.document_type_id,
+                TaxonomyKind.STORAGE_PATH: self.selection.storage_path_id,
+            }[kind]
+            if selected_id is not None:
+                return (f"id:{selected_id}",)
+            names = {
+                TaxonomyKind.CORRESPONDENT: self.selection.new_correspondents,
+                TaxonomyKind.DOCUMENT_TYPE: self.selection.new_document_types,
+                TaxonomyKind.STORAGE_PATH: self.selection.new_storage_paths,
+            }[kind]
+            suggested = _suggested_names(self.suggestions, kind)
+            return tuple(f"new:{suggested.index(name)}" for name in names if name in suggested) or (
+                "keep",
+            )
+        suggested_tags = self.suggestions.suggested_tags
+        return (
+            *(f"id:{identifier}" for identifier in self.selection.tag_ids),
+            *(
+                f"new:{suggested_tags.index(name)}"
+                for name in self.selection.new_tags
+                if name in suggested_tags
+            ),
+        )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """Allow only the uploader to operate this document review."""
@@ -269,82 +793,172 @@ class AISuggestionsView(discord.ui.View):
         )
         return False
 
-    @discord.ui.button(label="Approve All & Apply", style=discord.ButtonStyle.green, emoji="🟢")
-    async def approve_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button[discord.ui.View]
-    ) -> None:
-        del button
-        await interaction.response.defer(ephemeral=True)
-
-        updates = DocumentUpdate(
-            title=self.current_title,
-            correspondent_id=self.suggestions.correspondent_id,
-            document_type_id=self.suggestions.document_type_id,
-            storage_path_id=self.suggestions.storage_path_id,
-            created=self.suggestions.dates[0] if self.suggestions.dates else None,
-            tag_ids=self.suggestions.tag_ids or None,
+    def _new_taxonomy_summary(self) -> tuple[str, ...]:
+        return (
+            *(f"Tag: {name}" for name in self.selection.new_tags),
+            *(f"Correspondent: {name}" for name in self.selection.new_correspondents),
+            *(f"Document type: {name}" for name in self.selection.new_document_types),
+            *(f"Storage path: {name}" for name in self.selection.new_storage_paths),
         )
+
+    async def _resolve_new_selection(self) -> SuggestionSelection:
+        tag_ids = list(self.selection.tag_ids)
+        for name in self.selection.new_tags:
+            item = await self.ingestion.resolve_or_create_taxonomy(
+                self.job,
+                TaxonomyKind.TAG,
+                name,
+                confirm_create=True,
+            )
+            tag_ids.append(item.id)
+        correspondent_id = self.selection.correspondent_id
+        if self.selection.new_correspondents:
+            item = await self.ingestion.resolve_or_create_taxonomy(
+                self.job,
+                TaxonomyKind.CORRESPONDENT,
+                self.selection.new_correspondents[0],
+                confirm_create=True,
+            )
+            correspondent_id = item.id
+        document_type_id = self.selection.document_type_id
+        if self.selection.new_document_types:
+            item = await self.ingestion.resolve_or_create_taxonomy(
+                self.job,
+                TaxonomyKind.DOCUMENT_TYPE,
+                self.selection.new_document_types[0],
+                confirm_create=True,
+            )
+            document_type_id = item.id
+        storage_path_id = self.selection.storage_path_id
+        if self.selection.new_storage_paths:
+            name = self.selection.new_storage_paths[0]
+            item = await self.ingestion.resolve_or_create_taxonomy(
+                self.job,
+                TaxonomyKind.STORAGE_PATH,
+                name,
+                confirm_create=True,
+                storage_path=name,
+            )
+            storage_path_id = item.id
+        return replace(
+            self.selection,
+            correspondent_id=correspondent_id,
+            document_type_id=document_type_id,
+            storage_path_id=storage_path_id,
+            tag_ids=tuple(dict.fromkeys(tag_ids)),
+        )
+
+    async def apply(
+        self,
+        interaction: discord.Interaction,
+        source_message: discord.Message | None,
+        *,
+        confirm_create: bool,
+    ) -> None:
         async with self._apply_lock:
             if self._applied:
                 await interaction.followup.send(
-                    "These suggestions were already applied.",
+                    "These selections were already applied.",
                     ephemeral=True,
                     allowed_mentions=NO_MENTIONS,
                 )
                 return
+            selected = self.selection
             try:
+                if confirm_create:
+                    selected = await self._resolve_new_selection()
+                updates = DocumentUpdate(
+                    title=selected.title,
+                    correspondent_id=selected.correspondent_id,
+                    document_type_id=selected.document_type_id,
+                    storage_path_id=selected.storage_path_id,
+                    created=selected.created,
+                    tag_ids=selected.tag_ids or None,
+                )
                 await self.ingestion.apply_suggestions(
                     self.job,
                     updates,
                     expected_modified=self.document.modified,
                 )
+                self.selection = selected
                 self._applied = True
             except StaleSuggestionError:
-                await interaction.followup.send(
+                message = (
                     "The Paperless document changed after this review opened. "
-                    "Open a fresh review before applying suggestions.",
-                    ephemeral=True,
-                    allowed_mentions=NO_MENTIONS,
+                    "Reload the review before applying."
                 )
-                return
             except UnlinkedUserError:
-                await interaction.followup.send(
-                    "Your Paperless account is no longer linked.",
-                    ephemeral=True,
-                    allowed_mentions=NO_MENTIONS,
-                )
-                return
+                message = "Your Paperless account is no longer linked."
             except PaperlessUnavailableError:
-                await interaction.followup.send(
-                    "Paperless could not apply these suggestions. Please retry later.",
-                    ephemeral=True,
-                    allowed_mentions=NO_MENTIONS,
+                message = (
+                    "Paperless could not resolve or apply these selections. "
+                    "No automatic retry was attempted."
                 )
-                return
             except Exception as error:
                 logger.error(
                     "ai_suggestion_apply_failed",
                     extra={"error_type": type(error).__name__},
                 )
+                message = "The selections could not be applied. Please retry later."
+            else:
+                if source_message:
+                    embed = self.build_embed()
+                    embed.title = f"✅ Applied to {self.document.title}"
+                    embed.color = discord.Color.green()
+                    await source_message.edit(embed=embed, view=None)
                 await interaction.followup.send(
-                    "The suggestions could not be applied. Please retry later.",
+                    "Paperless confirmed the selected metadata.",
                     ephemeral=True,
                     allowed_mentions=NO_MENTIONS,
                 )
                 return
-        if interaction.message:
-            embed = interaction.message.embeds[0]
-            embed.title = f"✅ Applied to {self.document.title}"
-            embed.color = discord.Color.green()
-            await interaction.message.edit(embed=embed, view=None)
+            await interaction.followup.send(
+                message,
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
 
-    @discord.ui.button(label="Edit Title", style=discord.ButtonStyle.secondary, emoji="✏️")
+    @discord.ui.button(
+        label="Apply Selected",
+        style=discord.ButtonStyle.green,
+        emoji="✅",
+        row=4,
+    )
+    async def approve_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button[discord.ui.View]
+    ) -> None:
+        del button
+        new_items = self._new_taxonomy_summary()
+        if new_items:
+            await interaction.response.send_message(
+                "The following selected names do not currently map to an exact Paperless object:\n"
+                f"{_bounded_lines(tuple(f'• {value}' for value in new_items))}\n\n"
+                "Paperless permissions and exact-name existence will be checked again before "
+                "creation. Existing close matches remain preferred in the selection menus.",
+                view=_ConfirmTaxonomyCreationView(self, interaction.message),
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        await self.apply(interaction, interaction.message, confirm_create=False)
+
+    @discord.ui.button(
+        label="Title / Date",
+        style=discord.ButtonStyle.secondary,
+        emoji="✏️",
+        row=4,
+    )
     async def edit_button(
         self, interaction: discord.Interaction, button: discord.ui.Button[discord.ui.View]
     ) -> None:
         del button
 
-        async def on_modal_submit(modal_interaction: discord.Interaction, new_title: str) -> None:
+        async def on_modal_submit(
+            modal_interaction: discord.Interaction,
+            title: str | None,
+            selected_date: date | None,
+        ) -> None:
             if modal_interaction.user.id != self.job.principal_id:
                 await modal_interaction.response.send_message(
                     "Only the uploader can edit this review.",
@@ -352,30 +966,39 @@ class AISuggestionsView(discord.ui.View):
                     allowed_mentions=NO_MENTIONS,
                 )
                 return
-            self.current_title = new_title
+            self.selection = replace(self.selection, title=title, created=selected_date)
             if modal_interaction.message:
-                embed = modal_interaction.message.embeds[0]
-                for i, field in enumerate(embed.fields):
-                    if field.name == "Suggested Title":
-                        embed.set_field_at(i, name=field.name, value=new_title, inline=field.inline)
-                        break
-                await modal_interaction.response.edit_message(embed=embed, view=self)
+                await modal_interaction.response.edit_message(
+                    embed=self.build_embed(),
+                    view=self,
+                )
             else:
                 await modal_interaction.response.defer()
 
         await interaction.response.send_modal(
-            AISuggestionsEditModal(self.current_title, on_modal_submit)
+            AISuggestionsEditModal(self.selection, on_modal_submit)
         )
 
-    @discord.ui.button(label="Reload", style=discord.ButtonStyle.secondary, emoji="🔄")
+    @discord.ui.button(
+        label="Reload Review",
+        style=discord.ButtonStyle.secondary,
+        emoji="🔄",
+        row=4,
+    )
     async def refresh_button(
         self, interaction: discord.Interaction, button: discord.ui.Button[discord.ui.View]
     ) -> None:
         del button
         await interaction.response.defer(ephemeral=True)
-
         try:
-            fresh = await self.ingestion.reload_suggestions_for_job(self.job)
+            fresh = await self.ingestion.get_suggestion_review(self.job)
+        except StaleSuggestionError:
+            await interaction.followup.send(
+                "The document changed while Paperless generated suggestions. Try reloading again.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
         except UnlinkedUserError:
             await interaction.followup.send(
                 "Your Paperless account is no longer linked.",
@@ -391,17 +1014,23 @@ class AISuggestionsView(discord.ui.View):
             )
             return
         if fresh:
-            self.document, self.suggestions = fresh
-            self.current_title = self.suggestions.title or self.document.title
-
-        taxonomy = self.taxonomy_cache.snapshot if self.taxonomy_cache else None
-        embed = _build_suggestions_embed(
-            self.document, self.suggestions, taxonomy, current_title=self.current_title
-        )
+            self.review = fresh
+            self.selection = self.ingestion.initial_suggestion_selection(fresh)
+            self._rebuild_metadata_selects()
         if interaction.message:
-            await interaction.message.edit(embed=embed, view=self)
+            await interaction.message.edit(embed=self.build_embed(), view=self)
+        await interaction.followup.send(
+            "Review reloaded. Paperless may have returned its cached AI response.",
+            ephemeral=True,
+            allowed_mentions=NO_MENTIONS,
+        )
 
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="❌")
+    @discord.ui.button(
+        label="Cancel",
+        style=discord.ButtonStyle.secondary,
+        emoji="❌",
+        row=4,
+    )
     async def cancel_button(
         self, interaction: discord.Interaction, button: discord.ui.Button[discord.ui.View]
     ) -> None:
@@ -1077,23 +1706,21 @@ class DiscordAssistant(discord.Client):
                         f"{note}."
                     )
                     try:
-                        suggestions = await self._ingestion.get_suggestions_for_job(recovered.job)
-                    except PaperlessUnavailableError:
-                        suggestions = None
+                        review = await self._ingestion.get_suggestion_review(recovered.job)
+                    except PaperlessUnavailableError, StaleSuggestionError:
+                        review = None
                         results.append(
                             f"{index}. AI suggestions are unavailable; "
                             "the server log contains the Paperless error."
                         )
                     except UnlinkedUserError:
-                        suggestions = None
+                        review = None
                         results.append(
                             f"{index}. AI suggestions are unavailable because "
                             "the Paperless account is no longer linked."
                         )
-                    if suggestions is not None:
-                        await self._send_suggestions_ui(
-                            thread, recovered.job, recovered.document, suggestions
-                        )
+                    if review is not None:
+                        await self._send_suggestions_ui(thread, recovered.job, review)
                 elif recovered.notification_timed_out:
                     results.append(
                         f"{index}. `{job.original_filename}` — still processing; "
@@ -1129,20 +1756,15 @@ class DiscordAssistant(discord.Client):
         self,
         thread: discord.Thread,
         job: IngestionJob,
-        document: Document,
-        suggestions: AISuggestions,
+        review: SuggestionReview,
     ) -> None:
-        taxonomy = self._taxonomy.snapshot
-        embed = _build_suggestions_embed(document, suggestions, taxonomy)
         view = AISuggestionsView(
             job,
-            document,
-            suggestions,
+            review,
             self._ingestion,
             self._settings.suggestion_review_timeout_seconds,
-            taxonomy_cache=self._taxonomy,
         )
-        await thread.send(embed=embed, view=view, allowed_mentions=NO_MENTIONS)
+        await thread.send(embed=view.build_embed(), view=view, allowed_mentions=NO_MENTIONS)
 
     async def _replace_status(
         self,
