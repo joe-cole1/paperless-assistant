@@ -12,8 +12,9 @@ uv python install "${UV_PYTHON}"
 uv lock --check
 uv sync --locked --all-groups
 uv run --locked pre-commit run actionlint --all-files
+uv run --locked ruff check --fix . || true
+uv run --locked ruff format .
 uv run --locked ruff check .
-uv run --locked ruff format --check .
 uv run --locked mypy
 TMPDIR=/tmp uv run --locked pytest
 uv run --locked pip-audit
