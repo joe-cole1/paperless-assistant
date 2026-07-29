@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS ingestion_jobs (
     state TEXT NOT NULL,
     paperless_task_id TEXT,
     paperless_document_id INTEGER,
+    duplicate_confirmed INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (discord_message_id, discord_attachment_id)
@@ -260,6 +261,7 @@ class SQLiteRepository:
                 ("discord_status_channel_id", "INTEGER"),
                 ("discord_message_cleaned", "INTEGER NOT NULL DEFAULT 0"),
                 ("discord_status_message_cleaned", "INTEGER NOT NULL DEFAULT 0"),
+                ("duplicate_confirmed", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if name not in columns:
                     connection.execute(f"ALTER TABLE ingestion_jobs ADD COLUMN {name} {definition}")
@@ -345,8 +347,8 @@ class SQLiteRepository:
                     discord_status_channel_id, principal_id, staged_path,
                     original_filename, media_type, office_dependent, caption,
                     guidance_json, state, paperless_task_id,
-                    paperless_document_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    paperless_document_id, duplicate_confirmed, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(job.id),
@@ -365,6 +367,7 @@ class SQLiteRepository:
                     job.state.value,
                     str(job.paperless_task_id) if job.paperless_task_id else None,
                     int(job.paperless_document_id) if job.paperless_document_id else None,
+                    int(job.duplicate_confirmed),
                     _iso(now),
                     _iso(job.updated_at or now),
                 ),
@@ -398,6 +401,7 @@ class SQLiteRepository:
             paperless_document_id=DocumentId(row["paperless_document_id"])
             if row["paperless_document_id"] is not None
             else None,
+            duplicate_confirmed=bool(row["duplicate_confirmed"]),
             created_at=_parse_datetime(row["created_at"]),
             updated_at=_parse_datetime(row["updated_at"]),
         )
@@ -728,7 +732,7 @@ class SQLiteRepository:
                 )
         return tuple(targets)
 
-    async def transition_job(
+    async def transition_job(  # noqa: PLR0913
         self,
         job_id: UUID,
         expected: JobState,
@@ -736,6 +740,7 @@ class SQLiteRepository:
         *,
         task_id: UUID | None = None,
         document_id: int | None = None,
+        duplicate_confirmed: bool = False,
     ) -> bool:
         """Apply a compare-and-swap state transition."""
         if target not in ALLOWED_JOB_TRANSITIONS[expected]:
@@ -747,6 +752,8 @@ class SQLiteRepository:
                 SET state = ?,
                     paperless_task_id = COALESCE(?, paperless_task_id),
                     paperless_document_id = COALESCE(?, paperless_document_id),
+                    duplicate_confirmed =
+                        CASE WHEN ? THEN 1 ELSE duplicate_confirmed END,
                     updated_at = ?
                 WHERE id = ? AND state = ?
                 """,
@@ -754,6 +761,7 @@ class SQLiteRepository:
                     target.value,
                     str(task_id) if task_id else None,
                     document_id,
+                    int(duplicate_confirmed),
                     _iso(_utc_now()),
                     str(job_id),
                     expected.value,

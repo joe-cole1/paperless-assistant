@@ -354,6 +354,7 @@ class FakeIngestion:
         self.stage_error: Exception | None = None
         self.stage_duplicate = False
         self.submit_state = JobState.SUBMITTED
+        self.submit_duplicate_attachments: set[int] = set()
         self.poll_outcome: IngestionOutcome | None = None
         self.recovered = False
         self.office_dependent = False
@@ -519,6 +520,7 @@ class FakeIngestion:
         return job
 
     async def submit(self, job: IngestionJob) -> IngestionOutcome:
+        duplicate_confirmed = job.discord_attachment_id in self.submit_duplicate_attachments
         submitted = IngestionJob(
             id=job.id,
             discord_message_id=job.discord_message_id,
@@ -533,8 +535,9 @@ class FakeIngestion:
             office_dependent=job.office_dependent,
             caption=job.caption,
             guidance=job.guidance,
-            state=self.submit_state,
+            state=JobState.FAILED if duplicate_confirmed else self.submit_state,
             paperless_task_id=uuid4(),
+            duplicate_confirmed=duplicate_confirmed,
         )
         return IngestionOutcome(submitted)
 
@@ -1415,6 +1418,87 @@ async def test_upload_success_duplicate_invalid_and_uncertain(
 
 
 @pytest.mark.asyncio
+async def test_immediate_duplicate_uses_helpful_multi_file_message(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    settings.staging_dir.mkdir(parents=True)
+    ingestion = FakeIngestion()
+    ingestion.submit_duplicate_attachments.add(1)
+    assistant = _assistant(
+        settings,
+        FakeQuery(),
+        ingestion,
+        FakeDelivery(tmp_path),
+        FakeTaxonomy(),
+    )
+    channel = FakeChannel(settings.discord_uploads_channel_id)
+    message = FakeMessage(
+        channel=channel,
+        attachments=[
+            FakeAttachment(1, "duplicate.pdf", b"%PDF-1.7"),
+            FakeAttachment(2, "different.pdf", b"%PDF-1.7"),
+        ],
+    )
+
+    await assistant._uploads_message(cast(discord.Message, message))
+
+    expected = (
+        "Paperless identified a duplicate. Check/empty Paperless trash or upload a genuinely "
+        "different file."
+    )
+    summary = _latest_upload_summary(channel).edits[-1]["content"]
+    failed_parent = next(
+        item for item in channel.sent if hasattr(item, "thread") and expected in item.content
+    )
+    assert expected in summary
+    assert "uploaded as" in summary
+    assert expected in failed_parent.thread.sent[-1].content
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_task_duplicate_uses_same_helpful_message(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    settings.staging_dir.mkdir(parents=True)
+    ingestion = FakeIngestion()
+    ingestion.poll_outcome = IngestionOutcome(
+        replace(
+            _job(tmp_path, JobState.FAILED),
+            discord_attachment_id=3,
+            duplicate_confirmed=True,
+        )
+    )
+    assistant = _assistant(
+        settings,
+        FakeQuery(),
+        ingestion,
+        FakeDelivery(tmp_path),
+        FakeTaxonomy(),
+    )
+    channel = FakeChannel(settings.discord_uploads_channel_id)
+    message = FakeMessage(
+        channel=channel,
+        attachments=[FakeAttachment(3, "duplicate.pdf", b"%PDF-1.7")],
+    )
+
+    await assistant._uploads_message(cast(discord.Message, message))
+
+    expected = (
+        "Paperless identified a duplicate. Check/empty Paperless trash or upload a genuinely "
+        "different file."
+    )
+    summary = _latest_upload_summary(channel).edits[-1]["content"]
+    assert expected in summary
+    assert "private upstream title" not in summary
+    await assistant.close()
+
+
+@pytest.mark.asyncio
 async def test_upload_reports_link_and_ai_review_failures(
     tmp_path: Path,
     settings_factory: Callable[..., Settings],
@@ -1729,6 +1813,97 @@ async def test_warning_recovery_and_status_helpers(  # noqa: PLR0915
         201,
     )
     assert channel.sent[-1].content
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_recovery_updates_file_and_batch_summary(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    ingestion = FakeIngestion()
+    assistant = _assistant(
+        settings,
+        FakeQuery(),
+        ingestion,
+        FakeDelivery(tmp_path),
+        FakeTaxonomy(),
+    )
+    channel = FakeChannel(settings.discord_uploads_channel_id)
+    monkeypatch.setattr(discord, "TextChannel", FakeChannel)
+    monkeypatch.setattr(assistant, "get_channel", lambda _: channel)
+    job = replace(
+        _job(tmp_path, JobState.FAILED),
+        discord_message_id=70,
+        discord_attachment_id=71,
+        duplicate_confirmed=True,
+    )
+    await ingestion.create_upload_batch(
+        UploadBatch(70, channel.id, 72, channel.id, 201, 2),
+        (
+            UploadItem(
+                70,
+                71,
+                1,
+                "duplicate.pdf",
+                state=UploadItemState.PROCESSING,
+                job_id=job.id,
+            ),
+            UploadItem(
+                70,
+                73,
+                2,
+                "different.pdf",
+                state=UploadItemState.SUCCEEDED,
+            ),
+        ),
+    )
+
+    await assistant._notify_recovery(IngestionOutcome(job))
+
+    expected = (
+        "Paperless identified a duplicate. Check/empty Paperless trash or upload a genuinely "
+        "different file."
+    )
+    failed_parent = next(item for item in channel.sent if expected in item.content)
+    summary = next(item for item in channel.partial if item.id == 72)
+    assert expected in failed_parent.thread.sent[-1].content
+    assert expected in summary.edits[-1]["content"]
+    assert "2. `different.pdf` — upload succeeded; review ready." in summary.edits[-1]["content"]
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_office_duplicate_recovery_uses_helpful_message(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    assistant = _assistant(
+        settings,
+        FakeQuery(),
+        FakeIngestion(),
+        FakeDelivery(tmp_path),
+        FakeTaxonomy(),
+    )
+    channel = FakeChannel(settings.discord_uploads_channel_id)
+    monkeypatch.setattr(discord, "TextChannel", FakeChannel)
+    monkeypatch.setattr(assistant, "get_channel", lambda _: channel)
+    job = replace(
+        _job(tmp_path, JobState.FAILED, office_dependent=True),
+        duplicate_confirmed=True,
+    )
+
+    await assistant._notify_recovery(IngestionOutcome(job))
+
+    expected = (
+        "Paperless identified a duplicate. Check/empty Paperless trash or upload a genuinely "
+        "different file."
+    )
+    assert expected in channel.sent[-1].content
     await assistant.close()
 
 

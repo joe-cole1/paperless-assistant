@@ -270,6 +270,7 @@ class PaperlessTask:
     state: TaskState
     document_id: DocumentId | None = None
     message: str | None = None
+    duplicate_confirmed: bool = False
 
 
 class JobState(StrEnum):
@@ -319,6 +320,7 @@ class IngestionJob:
     state: JobState = JobState.STAGED
     paperless_task_id: UUID | None = None
     paperless_document_id: DocumentId | None = None
+    duplicate_confirmed: bool = False
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

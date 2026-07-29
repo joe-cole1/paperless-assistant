@@ -467,7 +467,9 @@ does not add another AI or try to make the result exhaustive.
     `/clean` and confirm it removes only bot-owned orphan/duplicate upload artifacts while
     preserving active and uncertain reviews.
 18. Upload the same synthetic file again in a separate Discord message. Confirm the assistant sends
-    it again and Paperless owns duplicate handling.
+    it again and, only after Paperless explicitly identifies the duplicate, the per-file failure
+    and batch summary suggest checking/emptying Paperless trash or uploading a genuinely different
+    file. Restart during task polling and confirm recovery uses the same wording.
 
 ### Failure and recovery
 

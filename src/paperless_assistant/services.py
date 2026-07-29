@@ -16,6 +16,7 @@ from paperless_assistant.config import Settings
 from paperless_assistant.errors import (
     AmbiguousSubmissionError,
     ConfigurationUnavailableError,
+    DuplicateUploadError,
     PaperlessUnavailableError,
     RateLimitedError,
     StaleSuggestionError,
@@ -540,6 +541,17 @@ class IngestionService:
             current = await self._required_job(job.id)
             await self._record(current, "reconciliation_required")
             return IngestionOutcome(current)
+        except DuplicateUploadError:
+            await self._repository.transition_job(
+                job.id,
+                JobState.SUBMITTING,
+                JobState.FAILED,
+                duplicate_confirmed=True,
+            )
+            job.staged_path.unlink(missing_ok=True)
+            current = await self._required_job(job.id)
+            await self._record(current, "failed_duplicate")
+            return IngestionOutcome(current)
         except PaperlessUnavailableError:
             await self._repository.transition_job(job.id, JobState.SUBMITTING, JobState.FAILED)
             job.staged_path.unlink(missing_ok=True)
@@ -600,10 +612,18 @@ class IngestionService:
                         "truncated": truncated,
                     },
                 )
-            await self._repository.transition_job(job.id, JobState.SUBMITTED, JobState.FAILED)
+            await self._repository.transition_job(
+                job.id,
+                JobState.SUBMITTED,
+                JobState.FAILED,
+                duplicate_confirmed=task.duplicate_confirmed,
+            )
             job.staged_path.unlink(missing_ok=True)
             current = await self._required_job(job.id)
-            await self._record(current, "failed")
+            await self._record(
+                current,
+                "failed_duplicate" if task.duplicate_confirmed else "failed",
+            )
             return IngestionOutcome(current)
         note_failed = False
         if job.caption:

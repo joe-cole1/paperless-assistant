@@ -19,6 +19,7 @@ from pydantic import SecretStr
 from paperless_assistant.config import Settings
 from paperless_assistant.errors import (
     AmbiguousSubmissionError,
+    DuplicateUploadError,
     PaperlessAIConfigurationError,
     PaperlessAIDisabledError,
     PaperlessAITimeoutError,
@@ -147,6 +148,20 @@ def _operation(response: httpx.Response) -> str:
     except RuntimeError:
         return "paperless_request"
     return f"{method} {_PATH_IDENTIFIER.sub('/{id}/', path)}"
+
+
+def _confirmed_duplicate(payload: object) -> bool:
+    """Recognize only Paperless's explicit structured duplicate marker."""
+    if not isinstance(payload, Mapping):
+        return False
+    duplicate_of = payload.get("duplicate_of")
+    if type(duplicate_of) is int and duplicate_of > 0:
+        return True
+    result_data = payload.get("result_data")
+    if not isinstance(result_data, Mapping):
+        return False
+    nested_duplicate_of = result_data.get("duplicate_of")
+    return type(nested_duplicate_of) is int and nested_duplicate_of > 0
 
 
 def parse_chat_response(response: str) -> ChatResult:
@@ -735,6 +750,22 @@ class HttpPaperlessGateway:
                 )
         except (OSError, httpx.HTTPError) as error:
             raise AmbiguousSubmissionError("document POST outcome is unknown") from error
+        if response.status_code == 400:
+            try:
+                duplicate_confirmed = _confirmed_duplicate(response.json())
+            except ValueError:
+                duplicate_confirmed = False
+            if duplicate_confirmed:
+                logger.warning(
+                    "paperless_request_failed",
+                    extra={
+                        "operation": _operation(response),
+                        "status_code": response.status_code,
+                        "paperless_error": "[confirmed duplicate]",
+                        "truncated": False,
+                    },
+                )
+                raise DuplicateUploadError("Paperless confirmed a duplicate upload")
         await self._raise_status(response)
         try:
             raw = response.json()
@@ -763,7 +794,7 @@ class HttpPaperlessGateway:
             document_id = related[0] if isinstance(related, list) and related else None
             result_data = item.get("result_data", {})
             if document_id is None and isinstance(result_data, dict):
-                document_id = result_data.get("document_id", result_data.get("duplicate_of"))
+                document_id = result_data.get("document_id")
             if document_id is None:
                 document_id = item.get("related_document", item.get("document_id"))
             message = item.get("message", item.get("result"))
@@ -779,11 +810,13 @@ class HttpPaperlessGateway:
             "failure": TaskState.FAILURE,
             "failed": TaskState.FAILURE,
         }.get(raw_state, TaskState.UNKNOWN)
+        duplicate_confirmed = state is TaskState.FAILURE and _confirmed_duplicate(result_data)
         return PaperlessTask(
             task_id=task_id,
             state=state,
             document_id=DocumentId(document_id) if isinstance(document_id, int) else None,
             message=message if isinstance(message, str) else None,
+            duplicate_confirmed=duplicate_confirmed,
         )
 
     async def add_note(

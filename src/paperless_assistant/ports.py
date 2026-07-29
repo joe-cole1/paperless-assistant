@@ -212,7 +212,7 @@ class IngestionRepository(Protocol):
         self,
     ) -> tuple[DiscordMessageTarget, ...]: ...
 
-    async def transition_job(
+    async def transition_job(  # noqa: PLR0913
         self,
         job_id: UUID,
         expected: JobState,
@@ -220,6 +220,7 @@ class IngestionRepository(Protocol):
         *,
         task_id: UUID | None = None,
         document_id: int | None = None,
+        duplicate_confirmed: bool = False,
     ) -> bool: ...
 
     async def recoverable_jobs(self) -> tuple[IngestionJob, ...]: ...

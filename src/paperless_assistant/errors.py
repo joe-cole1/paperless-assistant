@@ -47,6 +47,10 @@ class AmbiguousSubmissionError(AssistantError):
     """The upload response is unknown and must not be retried automatically."""
 
 
+class DuplicateUploadError(AssistantError):
+    """Paperless definitively identified an upload as a duplicate."""
+
+
 class InvalidAttachmentError(AssistantError):
     """An attachment failed a user-correctable validation rule."""
 

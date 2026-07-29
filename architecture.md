@@ -99,8 +99,9 @@ Domain and application code do not import Discord or HTTP client implementations
   unrestricted metadata update, or user administration operation in application code. A second
   creation prompt is required by default and may be disabled by deployment policy.
 - No tokens, authorization headers, document bytes, or audit payloads containing user content.
-  Discord receives only generic Paperless failures. Restricted server logs may contain a bounded,
-  JSON-escaped, credential-redacted Paperless error body for operator diagnosis.
+  Discord receives generic Paperless failures except for fixed guidance when a structured
+  `duplicate_of` field definitively confirms a duplicate. Restricted server logs may contain a
+  bounded, JSON-escaped, credential-redacted Paperless error body for operator diagnosis.
 - Similar controls require the original requester's active thread context, use that requester's
   linked Paperless token, return at most three permission-filtered documents, and never repeat the
   source document.
