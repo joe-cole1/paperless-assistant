@@ -20,6 +20,7 @@ from pydantic import SecretStr
 from paperless_assistant.config import Settings
 from paperless_assistant.errors import (
     InvalidAttachmentError,
+    PaperlessPermissionError,
     PaperlessUnavailableError,
     RateLimitedError,
     StaleSuggestionError,
@@ -108,13 +109,15 @@ def _document_embed(document: Document, public_url: str) -> discord.Embed:
     return embed
 
 
-class DismissButton(discord.ui.Button[discord.ui.View]):
+class UploadDismissButton(discord.ui.Button[discord.ui.View]):
+    """Dismiss one legacy upload-status notification."""
+
     def __init__(self, allowed_user_ids: frozenset[int]) -> None:
         super().__init__(
             label="Dismiss",
             style=discord.ButtonStyle.secondary,
             emoji="🗑️",
-            custom_id=f"paperless:dismiss:{uuid4().hex[:8]}",
+            custom_id=f"paperless:upload-dismiss:{uuid4().hex[:8]}",
         )
         self._allowed_user_ids = allowed_user_ids
 
@@ -142,7 +145,7 @@ def _upload_outcome_view(
                 url=public_url,
             )
         )
-    view.add_item(DismissButton(allowed_user_ids))
+    view.add_item(UploadDismissButton(allowed_user_ids))
     return view
 
 
@@ -150,7 +153,6 @@ def _result_view(
     principal_id: int,
     document_id: int,
     public_url: str,
-    allowed_user_ids: frozenset[int],
 ) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     view.add_item(
@@ -167,7 +169,14 @@ def _result_view(
             custom_id=f"paperless:send:{principal_id}:{document_id}",
         )
     )
-    view.add_item(DismissButton(allowed_user_ids))
+    view.add_item(
+        discord.ui.Button(
+            label="Similar",
+            style=discord.ButtonStyle.secondary,
+            emoji="🔎",
+            custom_id=f"paperless:similar:{principal_id}:{document_id}",
+        )
+    )
     return view
 
 
@@ -2476,9 +2485,7 @@ class DiscordAssistant(discord.Client):
             url = self._delivery_url(int(document.id))
             result_message = await status.channel.send(
                 embed=_document_embed(document, url),
-                view=_result_view(
-                    principal_id, int(document.id), url, self._settings.discord_allowed_user_ids
-                ),
+                view=_result_view(principal_id, int(document.id), url),
                 allowed_mentions=NO_MENTIONS,
             )
             result_message_ids.append(result_message.id)
@@ -2543,18 +2550,31 @@ class DiscordAssistant(discord.Client):
         return guild.filesize_limit if guild is not None else 10 * 1024 * 1024
 
     async def on_interaction(self, interaction: discord.Interaction) -> None:
-        """Handle restart-safe Send File component IDs through database context."""
+        """Handle restart-safe result components through database context."""
         custom_id = (
             interaction.data.get("custom_id") if isinstance(interaction.data, dict) else None
         )
-        if not isinstance(custom_id, str) or not custom_id.startswith("paperless:send:"):
+        if not isinstance(custom_id, str):
             return
-        try:
-            _, _, principal_raw, document_raw = custom_id.split(":")
-            principal_id = int(principal_raw)
-            document_id = int(document_raw)
-        except TypeError, ValueError:
+        if custom_id.startswith("paperless:dismiss:"):
+            await interaction.response.send_message(
+                "This old Dismiss control is no longer available.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
             return
+        if custom_id.startswith("paperless:similar:"):
+            await self._similar_interaction(interaction, custom_id)
+            return
+        if custom_id.startswith("paperless:send:"):
+            await self._send_file_interaction(interaction, custom_id)
+
+    async def _result_context_id(
+        self,
+        interaction: discord.Interaction,
+        principal_id: int,
+        document_id: int,
+    ) -> int | None:
         channel = getattr(interaction, "channel", None)
         channel_id = (
             channel.parent_id if isinstance(channel, discord.Thread) else interaction.channel_id
@@ -2568,6 +2588,21 @@ class DiscordAssistant(discord.Client):
         target_context_id = channel.id if isinstance(channel, discord.Thread) else principal_id
         context = await self._query.context(target_context_id) if authorized else None
         if context is None or DocumentId(document_id) not in context.document_ids:
+            return None
+        return target_context_id
+
+    async def _send_file_interaction(
+        self,
+        interaction: discord.Interaction,
+        custom_id: str,
+    ) -> None:
+        try:
+            _, _, principal_raw, document_raw = custom_id.split(":")
+            principal_id = int(principal_raw)
+            document_id = int(document_raw)
+        except TypeError, ValueError:
+            return
+        if await self._result_context_id(interaction, principal_id, document_id) is None:
             await interaction.response.send_message(
                 "That file request has expired or is unavailable.",
                 ephemeral=True,
@@ -2612,6 +2647,79 @@ class DiscordAssistant(discord.Client):
         finally:
             if "plan" in locals():
                 self._delivery.cleanup(plan)
+
+    async def _similar_interaction(
+        self,
+        interaction: discord.Interaction,
+        custom_id: str,
+    ) -> None:
+        try:
+            _, _, principal_raw, document_raw = custom_id.split(":")
+            principal_id = int(principal_raw)
+            document_id = int(document_raw)
+        except TypeError, ValueError:
+            await interaction.response.send_message(
+                "That Similar request is invalid or has expired.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        context_id = await self._result_context_id(interaction, principal_id, document_id)
+        channel = getattr(interaction, "channel", None)
+        if context_id is None or not isinstance(channel, discord.Thread):
+            await interaction.response.send_message(
+                "That Similar request has expired or is unavailable.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            response = await self._query.find_similar(
+                principal_id,
+                document_id,
+                context_id=context_id,
+            )
+            status = await channel.send(
+                f"Finding documents similar to Paperless document #{document_id}…",
+                allowed_mentions=NO_MENTIONS,
+            )
+            await self._render_query(
+                status,
+                response,
+                principal_id,
+                context_id=context_id,
+            )
+            await interaction.followup.send(
+                "Similar results were posted in this thread.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+        except RateLimitedError:
+            await interaction.followup.send(
+                "You've searched several times quickly. Please try again in a few minutes.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+        except UnlinkedUserError:
+            await interaction.followup.send(
+                "You have not linked your Paperless account yet. "
+                "Please run `/auth link <token>` to connect.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+        except PaperlessPermissionError:
+            await interaction.followup.send(
+                "Paperless did not allow access to that source document.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+        except PaperlessUnavailableError:
+            await interaction.followup.send(
+                "That source document is unavailable, or Paperless could not complete the search.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
 
     @staticmethod
     def _safe_upload_filename(filename: str, limit: int = 120) -> str:

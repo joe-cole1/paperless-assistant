@@ -1,7 +1,7 @@
 # Paperless Assistant architecture
 
 Status: Discord-first MVP with durable per-file AI review
-Last updated: 2026-07-28
+Last updated: 2026-07-29
 
 ## 1. Purpose
 
@@ -22,6 +22,7 @@ Issue #79 separates each attachment into a durable per-file review and makes sha
 depend on explicit resolution.
 Issue #81 makes per-file rendering idempotent and removes resolved or safely orphaned review
 artifacts.
+Issue #43 replaces document-result dismissal with owner-only native Paperless similarity search.
 
 ## 2. System context
 
@@ -61,12 +62,13 @@ container-local listener.
 ## 4. Ports and adapters
 
 - inbound Discord adapter: validates transport identity, posts one bounded metadata parent and
-  public review thread per upload attachment, renders references and AI review controls, and
-  enforces uploader ownership on every metadata-write interaction;
+  public review thread per upload attachment, renders references, owner-only similarity actions,
+  and AI review controls, and enforces uploader ownership on every metadata-write interaction;
 - application services: authorize users and enforce query, delivery, ingestion, suggestion
-  freshness/tag merging, batch inbox polling, and confirmed cleanup policy;
+  similarity, freshness/tag merging, batch inbox polling, and confirmed cleanup policy;
 - Paperless gateway: the only component that performs Paperless HTTP calls, including the
-  synchronous 3.0.4 AI suggestion trigger and bounded diagnostic logging;
+  synchronous 3.0.4 AI suggestion trigger, native `more_like_id` search, and bounded diagnostic
+  logging;
 - ingestion and audit repositories: durable SQLite implementations tracking exact message/channel
   cleanup targets and confirmation state;
 - delivery adapter: stages and sends Discord files or returns authenticated Paperless links.
@@ -99,6 +101,9 @@ Domain and application code do not import Discord or HTTP client implementations
 - No tokens, authorization headers, document bytes, or audit payloads containing user content.
   Discord receives only generic Paperless failures. Restricted server logs may contain a bounded,
   JSON-escaped, credential-redacted Paperless error body for operator diagnosis.
+- Similar controls require the original requester's active thread context, use that requester's
+  linked Paperless token, return at most three permission-filtered documents, and never repeat the
+  source document.
 - AI metadata writes require the original uploader, an enabled field, a fresh document-state
   check, serialized apply, bounded controls, and preservation of existing tags. Unmatched taxonomy
   names require an exact-name race check and a fresh Paperless `add_*` permission check; deployment
@@ -184,6 +189,7 @@ SQLite job/audit state is included according to operator policy.
 - ADR 0011: configurable review fields, persistent thread controls, and creation-prompt policy.
 - ADR 0012: durable per-file review artifacts and explicit batch-resolution cleanup.
 - ADR 0013: idempotent per-file rendering and resolved-artifact deletion.
+- ADR 0014: owner-only native Paperless similarity from document results.
 
 Issue #10 is the canonical Discord MVP. Issue #20 corrects its default storage deployment. Issue
 #65 is the July 2026 hardening and AI-suggestions correction. Issues #44 and #70 complete its

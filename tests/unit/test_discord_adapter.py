@@ -23,7 +23,7 @@ from paperless_assistant.discord_adapter import (
     AISuggestionsTitleModal,
     AISuggestionsView,
     DiscordAssistant,
-    DismissButton,
+    UploadDismissButton,
     _bounded_lines,
     _close_existing_items,
     _ConfirmCloseAllView,
@@ -54,6 +54,7 @@ from paperless_assistant.discord_adapter import (
 )
 from paperless_assistant.errors import (
     InvalidAttachmentError,
+    PaperlessPermissionError,
     PaperlessUnavailableError,
     RateLimitedError,
     StaleSuggestionError,
@@ -282,8 +283,15 @@ class FakeQuery:
             False,
             uuid4(),
         )
+        self.similar_response = QueryResponse(
+            "Documents similar to Paperless document #7:",
+            (Document(DocumentId(8), "Similar", date(2024, 2, 3)),),
+            False,
+            uuid4(),
+        )
         self.error: Exception | None = None
         self.asked: list[tuple[int, str, int | None]] = []
+        self.similar_requests: list[tuple[int, int, int | None]] = []
         self.saved: tuple[int, tuple[DocumentId, ...], tuple[int, ...]] | None = None
 
     async def context(self, principal_id: int) -> ReferenceContext | None:
@@ -309,6 +317,18 @@ class FakeQuery:
         result_message_ids: tuple[int, ...],
     ) -> None:
         self.saved = (principal_id, document_ids, result_message_ids)
+
+    async def find_similar(
+        self,
+        principal_id: int,
+        document_id: int,
+        *,
+        context_id: int | None = None,
+    ) -> QueryResponse:
+        self.similar_requests.append((principal_id, document_id, context_id))
+        if self.error:
+            raise self.error
+        return self.similar_response
 
 
 class FakeTaxonomy:
@@ -738,10 +758,14 @@ async def test_view_and_exact_message_routing(
         FakeDelivery(tmp_path),
         FakeTaxonomy(),
     )
-    view = _result_view(
-        201, 7, "https://paperless.example.test/doc", settings.discord_allowed_user_ids
-    )
+    view = _result_view(201, 7, "https://paperless.example.test/doc")
     assert len(view.children) == 3
+    assert [getattr(child, "label", None) for child in view.children] == [
+        "Open in Paperless",
+        "Send File",
+        "Similar",
+    ]
+    assert getattr(view.children[-1], "custom_id", None) == "paperless:similar:201:7"
 
     questions = AsyncMock()
     uploads = AsyncMock()
@@ -980,6 +1004,250 @@ async def test_persistent_delivery_interaction(
     )
     await assistant.on_interaction(cast(discord.Interaction, ignored))
     assert not ignored.response.sent
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_similar_interaction_renders_owner_scoped_results(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    query.current_context = _context(7)
+    assistant = _assistant(
+        settings,
+        query,
+        FakeIngestion(),
+        FakeDelivery(tmp_path),
+        FakeTaxonomy(),
+    )
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    interaction = SimpleNamespace(
+        data={"custom_id": "paperless:similar:201:7"},
+        guild_id=settings.discord_guild_id,
+        channel_id=thread.id,
+        channel=thread,
+        user=SimpleNamespace(id=201),
+        response=FakeInteractionResponse(),
+        followup=FakeFollowup(),
+    )
+
+    await assistant.on_interaction(cast(discord.Interaction, interaction))
+
+    assert interaction.response.deferred
+    assert query.similar_requests == [(201, 7, 5001)]
+    assert thread.sent[0].content == "Documents similar to Paperless document #7:"
+    result_view = thread.sent[1].send_kwargs["view"]
+    assert getattr(result_view.children[-1], "custom_id", None) == "paperless:similar:201:8"
+    assert query.saved is not None
+    assert query.saved[0] == 5001
+    assert interaction.followup.sent[0]["content"] == "Similar results were posted in this thread."
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_similar_interaction_empty_result(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    query.current_context = _context(7)
+    query.similar_response = QueryResponse(
+        "No similar documents were found for Paperless document #7.",
+        (),
+        False,
+        uuid4(),
+    )
+    assistant = _assistant(
+        settings,
+        query,
+        FakeIngestion(),
+        FakeDelivery(tmp_path),
+        FakeTaxonomy(),
+    )
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    interaction = SimpleNamespace(
+        data={"custom_id": "paperless:similar:201:7"},
+        guild_id=settings.discord_guild_id,
+        channel_id=thread.id,
+        channel=thread,
+        user=SimpleNamespace(id=201),
+        response=FakeInteractionResponse(),
+        followup=FakeFollowup(),
+    )
+
+    await assistant.on_interaction(cast(discord.Interaction, interaction))
+
+    assert len(thread.sent) == 1
+    assert thread.sent[0].content == ("No similar documents were found for Paperless document #7.")
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        ("paperless:similar:201:7", 202, True, "expired or is unavailable"),
+        ("paperless:similar:201:7", 201, False, "expired or is unavailable"),
+        ("paperless:similar:invalid", 201, True, "invalid or has expired"),
+    ],
+)
+async def test_similar_interactions_fail_gracefully(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+    case: tuple[str, int, bool, str],
+) -> None:
+    custom_id, user_id, has_context, expected = case
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    query.current_context = _context(7) if has_context else None
+    assistant = _assistant(
+        settings,
+        query,
+        FakeIngestion(),
+        FakeDelivery(tmp_path),
+        FakeTaxonomy(),
+    )
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    interaction = SimpleNamespace(
+        data={"custom_id": custom_id},
+        guild_id=settings.discord_guild_id,
+        channel_id=thread.id,
+        channel=thread,
+        user=SimpleNamespace(id=user_id),
+        response=FakeInteractionResponse(),
+        followup=FakeFollowup(),
+    )
+
+    await assistant.on_interaction(cast(discord.Interaction, interaction))
+
+    assert expected in interaction.response.sent[0]
+    assert query.similar_requests == []
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_dismiss_interaction_fails_gracefully(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    assistant = _assistant(
+        settings,
+        FakeQuery(),
+        FakeIngestion(),
+        FakeDelivery(tmp_path),
+        FakeTaxonomy(),
+    )
+    interaction = SimpleNamespace(
+        data={"custom_id": "paperless:dismiss:legacy"},
+        response=FakeInteractionResponse(),
+    )
+
+    await assistant.on_interaction(cast(discord.Interaction, interaction))
+
+    assert "no longer available" in interaction.response.sent[0]
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_similar_interaction_requires_thread(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    query.current_context = _context(7)
+    assistant = _assistant(
+        settings,
+        query,
+        FakeIngestion(),
+        FakeDelivery(tmp_path),
+        FakeTaxonomy(),
+    )
+    channel = FakeChannel(settings.discord_questions_channel_id)
+    outside_thread = SimpleNamespace(
+        data={"custom_id": "paperless:similar:201:7"},
+        guild_id=settings.discord_guild_id,
+        channel_id=channel.id,
+        channel=channel,
+        user=SimpleNamespace(id=201),
+        response=FakeInteractionResponse(),
+        followup=FakeFollowup(),
+    )
+
+    await assistant.on_interaction(cast(discord.Interaction, outside_thread))
+
+    assert "expired or is unavailable" in outside_thread.response.sent[0]
+    assert query.similar_requests == []
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_non_string_component_is_ignored(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    assistant = _assistant(
+        settings,
+        FakeQuery(),
+        FakeIngestion(),
+        FakeDelivery(tmp_path),
+        FakeTaxonomy(),
+    )
+    interaction = SimpleNamespace(data=None, response=FakeInteractionResponse())
+
+    await assistant.on_interaction(cast(discord.Interaction, interaction))
+
+    assert interaction.response.sent == []
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (RateLimitedError("synthetic"), "searched several times"),
+        (UnlinkedUserError("synthetic"), "not linked"),
+        (PaperlessPermissionError("synthetic"), "did not allow access"),
+        (PaperlessUnavailableError("synthetic"), "could not complete"),
+    ],
+)
+async def test_similar_interaction_maps_safe_errors(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+    error: Exception,
+    expected: str,
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    query.current_context = _context(7)
+    query.error = error
+    assistant = _assistant(
+        settings,
+        query,
+        FakeIngestion(),
+        FakeDelivery(tmp_path),
+        FakeTaxonomy(),
+    )
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    interaction = SimpleNamespace(
+        data={"custom_id": "paperless:similar:201:7"},
+        guild_id=settings.discord_guild_id,
+        channel_id=thread.id,
+        channel=thread,
+        user=SimpleNamespace(id=201),
+        response=FakeInteractionResponse(),
+        followup=FakeFollowup(),
+    )
+
+    await assistant.on_interaction(cast(discord.Interaction, interaction))
+
+    assert expected in interaction.followup.sent[0]["content"]
+    assert thread.sent == []
     await assistant.close()
 
 
@@ -2503,12 +2771,12 @@ async def test_gateway_lifecycle_hooks(
 
 
 @pytest.mark.asyncio
-async def test_dismiss_button_callback(
+async def test_upload_dismiss_button_callback(
     tmp_path: Path,
     settings_factory: Callable[..., Settings],
 ) -> None:
     settings = settings_factory(data_dir=tmp_path)
-    button = DismissButton(settings.discord_allowed_user_ids)
+    button = UploadDismissButton(settings.discord_allowed_user_ids)
     msg = FakeMessage(channel=FakeChannel(settings.discord_questions_channel_id))
     interaction_allowed = AsyncMock()
     interaction_allowed.user = SimpleNamespace(id=201)

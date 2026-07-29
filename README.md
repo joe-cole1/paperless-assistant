@@ -18,7 +18,11 @@ testing—follow [docs/INSTALL.md](docs/INSTALL.md).
 Configure two private Discord text channels:
 
 - **questions** — ask “give me John's vaccine records from 2024” or “find the receipts from our
-  Venice trip.” The bot auto-creates a dedicated public thread for each query. Paperless native chat returns up to three references rendered as rich Discord embed cards inside the thread with Open, Send File, and Dismiss controls, and thread-scoped follow-up context.
+  Venice trip.” The bot auto-creates a dedicated public thread for each query. Paperless native
+  chat returns up to three references rendered as rich Discord embed cards inside the thread with
+  Open, Send File, and owner-only Similar controls. Similar uses Paperless's native document
+  similarity with the requester's linked token and returns at most three visible results.
+  Follow-up and component actions use short-lived thread-scoped context.
 - **uploads** — attach up to ten documents. The bot posts an immediate batch summary and creates
   one rich metadata parent and public review thread per attachment. Each success has its own
   Paperless link and review of title, correspondent, document type, storage path, date, and tags;

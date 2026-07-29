@@ -385,16 +385,19 @@ Use only synthetic files and harmless test identities.
 2. Confirm the bot first posts `Searching Paperless…`, then edits that status with Paperless's
    native answer.
 3. Confirm it shows no more than three referenced documents.
-4. Confirm each result shows title, date, ID, **Open in Paperless**, and **Send File**.
+4. Confirm each result shows title, date, ID, **Open in Paperless**, **Send File**, and **Similar**.
 5. Select **Open in Paperless** and verify the HTTPS browser link.
 6. Select **Send File**:
    - a small original should arrive as an attachment;
    - a large original should use an archived PDF when one fits, or return the authenticated
      original-download link.
-7. Ask `send me the second one` and `send me all of them`.
-8. Reply directly to a result message with a follow-up question. Confirm Paperless answers about
+7. Select **Similar** and confirm the same thread receives no more than three related documents
+   visible to your linked Paperless account. Confirm the source Paperless ID is identified and is
+   not repeated in the results.
+8. Ask `send me the second one` and `send me all of them`.
+9. Reply directly to a result message with a follow-up question. Confirm Paperless answers about
    that document.
-9. With several prior results, ask an ambiguous follow-up such as `what about the date?`; the bot
+10. With several prior results, ask an ambiguous follow-up such as `what about the date?`; the bot
    should ask which result you mean.
 
 Paperless native chat controls answer quality and returns at most three references. The assistant
