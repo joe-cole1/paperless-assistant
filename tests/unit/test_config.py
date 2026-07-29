@@ -42,6 +42,7 @@ def test_safe_defaults(settings_factory: Callable[..., Settings]) -> None:
     assert settings.allow_edit_storage_path is True
     assert settings.allow_edit_tags is True
     assert settings.require_new_metadata_confirmation is True
+    assert settings.ai_review_completion_tag is None
 
 
 def test_ai_review_flags_parse_compose_boolean_strings(
@@ -66,6 +67,12 @@ def test_ai_review_flags_parse_compose_boolean_strings(
     assert settings.require_new_metadata_confirmation is False
 
 
+def test_optional_ai_review_completion_tag_parses_blank_as_disabled(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    assert settings_factory(ai_review_completion_tag="").ai_review_completion_tag is None
+
+
 def test_required_secrets_and_ids_have_no_defaults() -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
@@ -86,6 +93,7 @@ def test_required_secrets_and_ids_have_no_defaults() -> None:
         ("paperless_public_url", "http://paperless.example.test"),
         ("paperless_source_tag", " Discord "),
         ("cleanup_inbox_tag", " inbox "),
+        ("ai_review_completion_tag", " reviewed "),
     ],
 )
 def test_invalid_configuration_is_rejected(
@@ -105,3 +113,5 @@ def test_related_limits_are_validated(settings_factory: Callable[..., Settings])
             paperless_task_poll_initial_seconds=20,
             paperless_task_poll_max_seconds=10,
         )
+    with pytest.raises(ValidationError, match="must differ"):
+        settings_factory(ai_review_completion_tag="INBOX")

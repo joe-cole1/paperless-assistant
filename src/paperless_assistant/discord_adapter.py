@@ -697,6 +697,8 @@ class AISuggestionsView(discord.ui.View):
         self.saved_selection = SuggestionSelection()
         self._apply_lock = asyncio.Lock()
         self._applied = False
+        self._needs_finalization = False
+        self._last_apply_metadata_saved = False
         self.title_message: discord.Message | discord.PartialMessage | None = None
         self.metadata_message: discord.Message | discord.PartialMessage | None = None
         self.actions_message: discord.Message | discord.PartialMessage | None = None
@@ -953,7 +955,13 @@ class AISuggestionsView(discord.ui.View):
         if self._applied:
             return (
                 "**Changes applied**\n"
-                "Paperless confirmed the selected metadata. Use **Refresh** to start a new review."
+                "Paperless confirmed the selected metadata and review tags. "
+                "Use **Refresh** to start a new review."
+            )
+        if self._needs_finalization:
+            return (
+                "**Metadata saved; review tags need reconciliation**\n"
+                "Use **Apply Changes** to retry after resolving the reported Paperless issue."
             )
         if self.is_dirty:
             return "**Pending changes**\nNothing is written until you choose **Apply Changes**."
@@ -1264,15 +1272,18 @@ class AISuggestionsView(discord.ui.View):
         interaction: discord.Interaction,
         *,
         confirm_create: bool,
-    ) -> None:
+        respond: bool = True,
+    ) -> bool:
         async with self._apply_lock:
+            self._last_apply_metadata_saved = False
             if self._applied:
-                await interaction.followup.send(
-                    "These selections were already applied.",
-                    ephemeral=True,
-                    allowed_mentions=NO_MENTIONS,
-                )
-                return
+                if respond:
+                    await interaction.followup.send(
+                        "These selections were already applied.",
+                        ephemeral=True,
+                        allowed_mentions=NO_MENTIONS,
+                    )
+                return True
             selected = self.selection
             try:
                 if confirm_create:
@@ -1285,36 +1296,28 @@ class AISuggestionsView(discord.ui.View):
                     created=selected.created,
                     tag_ids=selected.tag_ids or None,
                 )
-                await self.ingestion.apply_suggestions(
+                result = await self.ingestion.apply_suggestions(
                     self.job,
                     updates,
                     expected_modified=self.document.modified,
                 )
-                updated_document = replace(
-                    self.document,
-                    title=selected.title or self.document.title,
-                    created=selected.created or self.document.created,
-                    correspondent_id=(
-                        selected.correspondent_id
-                        if selected.correspondent_id is not None
-                        else self.document.correspondent_id
-                    ),
-                    document_type_id=(
-                        selected.document_type_id
-                        if selected.document_type_id is not None
-                        else self.document.document_type_id
-                    ),
-                    storage_path_id=(
-                        selected.storage_path_id
-                        if selected.storage_path_id is not None
-                        else self.document.storage_path_id
-                    ),
-                    tag_ids=tuple(dict.fromkeys((*self.document.tag_ids, *selected.tag_ids))),
-                )
-                self.review = replace(self.review, document=updated_document)
+                if result is None:
+                    raise PaperlessUnavailableError("document is unavailable")
+                self.review = replace(self.review, document=result.document)
                 self.selection = SuggestionSelection()
                 self.saved_selection = SuggestionSelection()
-                self._applied = True
+                self._last_apply_metadata_saved = True
+                self._applied = result.review_tags_finalized
+                self._needs_finalization = not result.review_tags_finalized
+                message = (
+                    "Paperless confirmed the selected metadata and finalized the review tags."
+                    if result.review_tags_finalized
+                    else result.finalization_message
+                    or (
+                        "Paperless saved the metadata, but review-tag finalization needs "
+                        "retry or reconciliation."
+                    )
+                )
             except StaleSuggestionError:
                 message = (
                     "The Paperless document changed after this review opened. "
@@ -1335,17 +1338,22 @@ class AISuggestionsView(discord.ui.View):
                 message = "The selections could not be applied. Please retry later."
             else:
                 await self.render()
+                if respond:
+                    await interaction.followup.send(
+                        message,
+                        ephemeral=True,
+                        allowed_mentions=NO_MENTIONS,
+                    )
+                    if result.review_tags_finalized:
+                        await self.ingestion.mark_review_finalization_notified(self.job)
+                return result.review_tags_finalized
+            if respond:
                 await interaction.followup.send(
-                    "Paperless confirmed the selected metadata.",
+                    message,
                     ephemeral=True,
                     allowed_mentions=NO_MENTIONS,
                 )
-                return
-            await interaction.followup.send(
-                message,
-                ephemeral=True,
-                allowed_mentions=NO_MENTIONS,
-            )
+            return False
 
     async def request_apply(self, interaction: discord.Interaction) -> None:
         new_items = self._new_taxonomy_summary()
@@ -1618,8 +1626,10 @@ class _UploadBatchController:
         return tuple(sorted(sessions, key=lambda session: session.ordinal))
 
     @property
-    def dirty_sessions(self) -> tuple[AISuggestionsView, ...]:
-        return tuple(session for session in self.sessions if session.is_dirty)
+    def saveable_sessions(self) -> tuple[AISuggestionsView, ...]:
+        return tuple(
+            session for session in self.sessions if session.is_dirty or session._needs_finalization
+        )
 
     def add(self, controller: _ReviewThreadController) -> None:
         if (
@@ -1665,15 +1675,17 @@ class _UploadBatchController:
         )
 
     async def request_save_all(self, interaction: discord.Interaction) -> None:
-        dirty = self.dirty_sessions
-        if not dirty:
+        saveable = self.saveable_sessions
+        if not saveable:
             await interaction.response.send_message(
                 "There are no pending document changes to save.",
                 ephemeral=True,
                 allowed_mentions=NO_MENTIONS,
             )
             return
-        new_items = tuple(value for session in dirty for value in session._new_taxonomy_summary())
+        new_items = tuple(
+            value for session in saveable for value in session._new_taxonomy_summary()
+        )
         creation_note = (
             "\nPotential new Paperless objects:\n"
             f"{_bounded_lines(tuple(f'• {value}' for value in new_items))}"
@@ -1681,7 +1693,7 @@ class _UploadBatchController:
             else ""
         )
         await interaction.response.send_message(
-            f"Save pending AI selections for {len(dirty)} document(s)? "
+            f"Save pending AI selections for {len(saveable)} document(s)? "
             "Documents are saved sequentially and remain open."
             f"{creation_note}",
             view=_ConfirmSaveAllView(self),
@@ -1691,24 +1703,34 @@ class _UploadBatchController:
 
     async def save_all(self, interaction: discord.Interaction) -> None:
         async with self._operation_lock:
-            dirty = self.dirty_sessions
+            saveable = self.saveable_sessions
             saved = 0
-            failures = 0
-            for session in dirty:
-                await session.apply(
+            finalization_failures = 0
+            metadata_failures = 0
+            finalized_sessions: list[AISuggestionsView] = []
+            for session in saveable:
+                finalized = await session.apply(
                     interaction,
                     confirm_create=bool(session._new_taxonomy_summary()),
+                    respond=False,
                 )
-                if session._applied:
+                if finalized:
                     saved += 1
+                    finalized_sessions.append(session)
+                elif session._last_apply_metadata_saved:
+                    finalization_failures += 1
                 else:
-                    failures += 1
+                    metadata_failures += 1
             await interaction.followup.send(
-                f"Save All finished: {saved} saved, {failures} failed. "
+                f"Save All finished: {saved} saved, {finalization_failures} metadata saved but "
+                "review-tag finalization needs retry/reconciliation, "
+                f"{metadata_failures} failed before metadata confirmation. "
                 "All document threads remain open.",
                 ephemeral=True,
                 allowed_mentions=NO_MENTIONS,
             )
+            for session in finalized_sessions:
+                await session.ingestion.mark_review_finalization_notified(session.job)
 
     async def request_close_all(self, interaction: discord.Interaction) -> None:
         open_controllers = tuple(

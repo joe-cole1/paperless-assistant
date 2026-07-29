@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import discord
 import pytest
@@ -73,6 +73,7 @@ from paperless_assistant.models import (
     MetadataGuidance,
     ReferenceContext,
     SuggestedDate,
+    SuggestionApplyResult,
     SuggestionReview,
     SuggestionSelection,
     Taxonomy,
@@ -366,6 +367,8 @@ class FakeIngestion:
         self.confirmed_cleanup: list[DiscordMessageTarget] = []
         self.active_outcomes: tuple[IngestionOutcome, ...] = ()
         self.active_items_for_restore: tuple[UploadItem, ...] = ()
+        self.finalization_notifications: list[UUID] = []
+        self.applied_updates: DocumentUpdate | None = None
 
     async def create_upload_batch(
         self,
@@ -632,9 +635,24 @@ class FakeIngestion:
         updates: DocumentUpdate,
         *,
         expected_modified: datetime | None,
-    ) -> None:
-        del expected_modified
+    ) -> SuggestionApplyResult:
         self.applied_updates = updates
+        return SuggestionApplyResult(
+            Document(
+                DocumentId(7),
+                updates.title or "Current",
+                updates.created,
+                modified=expected_modified,
+                tag_ids=updates.tag_ids or (2,),
+                correspondent_id=updates.correspondent_id,
+                document_type_id=updates.document_type_id,
+                storage_path_id=updates.storage_path_id,
+            ),
+            True,
+        )
+
+    async def mark_review_finalization_notified(self, job: IngestionJob) -> None:
+        self.finalization_notifications.append(job.id)
 
     async def check_inbox_tag_removals(self) -> tuple[DiscordMessageTarget, ...]:
         return ()
@@ -2234,6 +2252,8 @@ async def test_per_file_recovery_rebuilds_saved_artifacts(  # noqa: PLR0915
     assistant._restored_upload_jobs.add(outcome.job.id)
     await assistant._restore_active_upload_reviews()
     assistant._notify_recovery.assert_awaited_once_with(outcome)
+    assert ingestion.applied_updates is None
+    assert ingestion.finalization_notifications == []
     await assistant.close()
 
 
@@ -3782,7 +3802,9 @@ async def test_ai_new_taxonomy_confirmation_is_configurable(
         ),
         taxonomy=Taxonomy((), (), (), ()),
     )
-    ingestion.apply_suggestions = AsyncMock()  # type: ignore[method-assign]
+    ingestion.apply_suggestions = AsyncMock(  # type: ignore[method-assign]
+        return_value=SuggestionApplyResult(review.document, True)
+    )
     ingestion.resolve_or_create_taxonomy = AsyncMock(  # type: ignore[method-assign]
         side_effect=(
             TaxonomyItem(101, "new-topic"),
@@ -3826,7 +3848,9 @@ async def test_ai_new_taxonomy_confirmation_is_configurable(
     assert updates.storage_path_id == 104
 
     silent_ingestion = FakeIngestion()
-    silent_ingestion.apply_suggestions = AsyncMock()  # type: ignore[method-assign]
+    silent_ingestion.apply_suggestions = AsyncMock(  # type: ignore[method-assign]
+        return_value=SuggestionApplyResult(review.document, True)
+    )
     silent_ingestion.resolve_or_create_taxonomy = AsyncMock(  # type: ignore[method-assign]
         return_value=TaxonomyItem(200, "new-topic")
     )
@@ -3935,7 +3959,9 @@ async def test_ai_review_apply_errors_reload_and_disabled_fields(  # noqa: PLR09
         assert expected in interaction.followup.send.call_args.args[0]
         assert "secret detail" not in interaction.followup.send.call_args.args[0]
 
-    ingestion.apply_suggestions = AsyncMock()  # type: ignore[method-assign]
+    ingestion.apply_suggestions = AsyncMock(  # type: ignore[method-assign]
+        return_value=SuggestionApplyResult(review.document, True)
+    )
     applied = AISuggestionsView(
         job,
         review,
@@ -3972,6 +3998,232 @@ async def test_ai_review_apply_errors_reload_and_disabled_fields(  # noqa: PLR09
     assert applied.is_dirty
     applied.saved_selection = applied.selection
     assert applied.actions_content() == "**No pending changes**"
+
+
+@pytest.mark.asyncio
+async def test_individual_save_reports_metadata_success_tag_finalization_failure(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    job, review, ingestion = _ai_review_fixture(tmp_path)
+    ingestion.apply_suggestions = AsyncMock(  # type: ignore[method-assign]
+        return_value=SuggestionApplyResult(
+            review.document,
+            False,
+            "Paperless saved the metadata, but review-tag finalization needs reconciliation.",
+        )
+    )
+    view = AISuggestionsView(
+        job,
+        review,
+        cast(Any, ingestion),
+        settings_factory(data_dir=tmp_path),
+    )
+    interaction = AsyncMock()
+
+    finalized = await view.apply(interaction, confirm_create=False)
+
+    assert not finalized
+    assert view._needs_finalization
+    assert view._last_apply_metadata_saved
+    assert "saved the metadata" in interaction.followup.send.call_args.args[0]
+    assert "reconciliation" in view.actions_content()
+    assert ingestion.finalization_notifications == []
+
+
+@pytest.mark.asyncio
+async def test_individual_save_opens_cleanup_gate_after_response(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    job, review, ingestion = _ai_review_fixture(tmp_path)
+    events: list[str] = []
+    view = AISuggestionsView(
+        job,
+        review,
+        cast(Any, ingestion),
+        settings_factory(data_dir=tmp_path),
+    )
+    interaction = AsyncMock()
+    interaction.followup.send.side_effect = lambda *args, **kwargs: events.append("response")
+
+    async def notified(saved_job: IngestionJob) -> None:
+        assert saved_job.id == job.id
+        assert events == ["response"]
+        events.append("cleanup-ready")
+
+    ingestion.mark_review_finalization_notified = notified  # type: ignore[assignment]
+
+    assert await view.apply(interaction, confirm_create=False)
+    assert events == ["response", "cleanup-ready"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_no_difference_save_still_finalizes_review(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    job, review, ingestion = _ai_review_fixture(tmp_path)
+    view = AISuggestionsView(
+        job,
+        review,
+        cast(Any, ingestion),
+        settings_factory(data_dir=tmp_path),
+    )
+    view.saved_selection = view.selection
+    interaction = AsyncMock()
+
+    assert not view.is_dirty
+    await view.request_apply(interaction)
+
+    assert ingestion.finalization_notifications == [job.id]
+    assert "finalized the review tags" in interaction.followup.send.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_save_all_reports_tag_failure_without_releasing_cleanup(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    job, review, ingestion = _ai_review_fixture(tmp_path)
+    ingestion.apply_suggestions = AsyncMock(  # type: ignore[method-assign]
+        return_value=SuggestionApplyResult(
+            review.document,
+            False,
+            "Paperless saved metadata but finalization failed.",
+        )
+    )
+    session = AISuggestionsView(
+        job,
+        review,
+        cast(Any, ingestion),
+        settings_factory(data_dir=tmp_path),
+    )
+    controller = _ReviewThreadController(201, 900)
+    controller.add(session)
+    batch = _UploadBatchController(201, 900)
+    batch.add(controller)
+    interaction = AsyncMock()
+
+    await batch.save_all(interaction)
+
+    assert "1 metadata saved" in interaction.followup.send.call_args.args[0]
+    assert ingestion.finalization_notifications == []
+    assert session in batch.saveable_sessions
+
+
+@pytest.mark.asyncio
+async def test_save_all_releases_cleanup_only_after_summary_response(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    job, review, ingestion = _ai_review_fixture(tmp_path)
+    session = AISuggestionsView(
+        job,
+        review,
+        cast(Any, ingestion),
+        settings_factory(data_dir=tmp_path),
+    )
+    controller = _ReviewThreadController(201, 900)
+    controller.add(session)
+    batch = _UploadBatchController(201, 900)
+    batch.add(controller)
+    events: list[str] = []
+    interaction = AsyncMock()
+    interaction.followup.send.side_effect = lambda *args, **kwargs: events.append("summary")
+
+    async def notified(saved_job: IngestionJob) -> None:
+        assert saved_job.id == job.id
+        assert events == ["summary"]
+        events.append("cleanup-ready")
+
+    ingestion.mark_review_finalization_notified = notified  # type: ignore[assignment]
+
+    await batch.save_all(interaction)
+    assert events == ["summary", "cleanup-ready"]
+
+
+@pytest.mark.asyncio
+async def test_apply_missing_document_result_is_generic_and_safe(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    job, review, ingestion = _ai_review_fixture(tmp_path)
+    ingestion.apply_suggestions = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    view = AISuggestionsView(
+        job,
+        review,
+        cast(Any, ingestion),
+        settings_factory(data_dir=tmp_path),
+    )
+    interaction = AsyncMock()
+
+    assert not await view.apply(interaction, confirm_create=False)
+    assert "could not resolve or apply" in interaction.followup.send.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_silent_batch_apply_failure_does_not_send_per_item_response(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    job, review, ingestion = _ai_review_fixture(tmp_path)
+    ingestion.apply_suggestions = AsyncMock(  # type: ignore[method-assign]
+        side_effect=StaleSuggestionError("stale")
+    )
+    view = AISuggestionsView(
+        job,
+        review,
+        cast(Any, ingestion),
+        settings_factory(data_dir=tmp_path),
+    )
+    interaction = AsyncMock()
+
+    assert not await view.apply(interaction, confirm_create=False, respond=False)
+    interaction.followup.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_silent_already_applied_review_does_not_repeat_response(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    job, review, ingestion = _ai_review_fixture(tmp_path)
+    view = AISuggestionsView(
+        job,
+        review,
+        cast(Any, ingestion),
+        settings_factory(data_dir=tmp_path),
+    )
+    view._applied = True
+    interaction = AsyncMock()
+
+    assert await view.apply(interaction, confirm_create=False, respond=False)
+    interaction.followup.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_refresh_reset_cancel_close_and_recovery_do_not_apply_metadata(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    job, review, ingestion = _ai_review_fixture(tmp_path)
+    view = AISuggestionsView(
+        job,
+        review,
+        cast(Any, ingestion),
+        settings_factory(data_dir=tmp_path),
+    )
+    await view.reload()
+    await view.reset(AsyncMock())
+    confirmation = _ConfirmTaxonomyCreationView(view)
+    await confirmation.back.callback(AsyncMock())
+    controller = _ReviewThreadController(201, 900)
+    controller.add(view)
+    await controller.finish(AsyncMock(channel=FakeThread(102)))
+
+    assert ingestion.applied_updates is None
+    assert ingestion.finalization_notifications == []
 
 
 @pytest.mark.asyncio
@@ -4279,18 +4531,38 @@ async def test_bound_review_batch_controls_and_failure_dismissal(  # noqa: PLR09
         _ConfirmSaveAllView,
     )
 
-    async def save_success(interaction: Any, *, confirm_create: bool) -> None:
+    async def save_success(
+        interaction: Any,
+        *,
+        confirm_create: bool,
+        respond: bool,
+    ) -> bool:
+        del interaction
         assert confirm_create
+        assert not respond
         second._applied = True
+        return True
 
-    async def save_failure(interaction: Any, *, confirm_create: bool) -> None:
+    async def save_failure(
+        interaction: Any,
+        *,
+        confirm_create: bool,
+        respond: bool,
+    ) -> bool:
+        del interaction
         assert not confirm_create
+        assert not respond
+        return False
 
-    second.apply = save_success  # type: ignore[method-assign]
-    first.apply = save_failure  # type: ignore[method-assign]
+    second.apply = save_success  # type: ignore[assignment]
+    first.apply = save_failure  # type: ignore[assignment]
     save_interaction = AsyncMock(user=SimpleNamespace(id=201))
     await batch.save_all(save_interaction)
-    assert "1 saved, 1 failed" in save_interaction.followup.send.call_args.args[0]
+    assert "1 saved" in save_interaction.followup.send.call_args.args[0]
+    assert (
+        "1 failed before metadata confirmation"
+        in (save_interaction.followup.send.call_args.args[0])
+    )
 
     first.saved_selection = first.selection
     second.saved_selection = second.selection

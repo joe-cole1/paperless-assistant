@@ -18,6 +18,7 @@ from paperless_assistant.models import (
     JobState,
     MetadataGuidance,
     ReferenceContext,
+    ReviewFinalizationState,
     UploadBatch,
     UploadItem,
     UploadItemState,
@@ -82,12 +83,17 @@ async def test_initialize_migrates_status_message_column(tmp_path: Path) -> None
             "    duplicate_confirmed INTEGER NOT NULL DEFAULT 0,\n",
             "",
         )
+        legacy_schema = legacy_schema.replace(
+            "    review_finalization_state TEXT NOT NULL DEFAULT 'not_started',\n",
+            "",
+        )
         legacy_schema = legacy_schema.replace("    channel_id INTEGER,\n", "")
         for column in (
             "    title_message_id INTEGER,\n",
             "    metadata_message_id INTEGER,\n",
             "    actions_message_id INTEGER,\n",
             "    controls_message_id INTEGER,\n",
+            "    review_finalization_state TEXT NOT NULL DEFAULT 'not_started',\n",
             "    parent_cleaned INTEGER NOT NULL DEFAULT 0,\n",
             "    thread_cleaned INTEGER NOT NULL DEFAULT 0,\n",
         ):
@@ -109,7 +115,7 @@ async def test_initialize_migrates_status_message_column(tmp_path: Path) -> None
     assert "discord_status_channel_id" in columns
     assert "discord_message_cleaned" in columns
     assert "discord_status_message_cleaned" in columns
-    assert "duplicate_confirmed" in columns
+    assert {"duplicate_confirmed", "review_finalization_state"} <= columns
     connection = sqlite3.connect(database)
     try:
         question_columns = {
@@ -128,6 +134,7 @@ async def test_initialize_migrates_status_message_column(tmp_path: Path) -> None
         "metadata_message_id",
         "actions_message_id",
         "controls_message_id",
+        "review_finalization_state",
         "parent_cleaned",
         "thread_cleaned",
     } <= upload_columns
@@ -270,6 +277,83 @@ async def test_job_idempotency_roundtrip_and_transitions(tmp_path: Path) -> None
     with pytest.raises(ValueError, match="invalid job transition"):
         await repository.transition_job(job.id, JobState.SUCCEEDED, JobState.STAGED)
     assert await repository.get_job(uuid4()) is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_review_finalization_gate_blocks_cleanup_until_notified(
+    tmp_path: Path,
+) -> None:
+    repository = SQLiteRepository(tmp_path / "db.sqlite3", lease_seconds=60)
+    await repository.initialize()
+    job = _job(tmp_path / "staged")
+    assert await repository.create_job(job)
+    assert await repository.transition_job(job.id, JobState.STAGED, JobState.SUBMITTING)
+    assert await repository.transition_job(
+        job.id,
+        JobState.SUBMITTING,
+        JobState.SUBMITTED,
+        task_id=uuid4(),
+    )
+    assert await repository.transition_job(
+        job.id,
+        JobState.SUBMITTED,
+        JobState.SUCCEEDED,
+        document_id=42,
+    )
+    assert await repository.set_review_finalization_state(
+        job.id,
+        ReviewFinalizationState.PENDING_NOTIFICATION,
+    )
+    future = (datetime.now(tz=UTC) + timedelta(days=1)).isoformat()
+
+    assert await repository.active_succeeded_uploads() == ()
+    assert await repository.cleanup_message_ids(
+        context_before=future,
+        succeeded_before=future,
+        failed_before=future,
+    ) == ((), ())
+
+    assert await repository.set_review_finalization_state(
+        job.id,
+        ReviewFinalizationState.READY_FOR_CLEANUP,
+    )
+    assert await repository.active_succeeded_uploads() == (
+        (
+            (
+                DiscordMessageTarget(102, 10),
+                DiscordMessageTarget(500, 50),
+            ),
+            42,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_atomic_inbox_close_rejects_disappeared_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = SQLiteRepository(tmp_path / "db.sqlite3", lease_seconds=60)
+    await repository.initialize()
+    await repository.create_upload_batch(
+        UploadBatch(100, 102, 200, 102, 30, 1),
+        (
+            UploadItem(
+                100,
+                101,
+                1,
+                "synthetic.pdf",
+                state=UploadItemState.SUCCEEDED,
+            ),
+        ),
+    )
+
+    async def missing_batch(source_message_id: int) -> None:
+        assert source_message_id == 100
+
+    monkeypatch.setattr(repository, "get_upload_batch", missing_batch)
+    with pytest.raises(ValueError, match="disappeared"):
+        await repository.close_upload_item_if_cleanup_eligible(100, 101)
 
 
 @pytest.mark.asyncio
@@ -443,6 +527,17 @@ async def test_upload_batch_lifecycle_cleanup_and_purge(  # noqa: PLR0915
     assert snapshot.items[0].controls_message_id == 404
     assert await repository.upload_item_for_job(job.id) == snapshot.items[0]
     assert await repository.upload_item_for_job(uuid4()) is None
+    assert await repository.set_review_finalization_state(
+        job.id,
+        ReviewFinalizationState.PENDING_NOTIFICATION,
+    )
+    assert not await repository.set_review_finalization_state(
+        uuid4(),
+        ReviewFinalizationState.PENDING_NOTIFICATION,
+    )
+    gated = await repository.upload_item_for_job(job.id)
+    assert gated is not None
+    assert gated.review_finalization_state is ReviewFinalizationState.PENDING_NOTIFICATION
     assert {item.attachment_id for item in await repository.active_upload_items()} == {
         11,
         12,

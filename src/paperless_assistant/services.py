@@ -12,11 +12,16 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
+from pydantic import SecretStr
+
 from paperless_assistant.config import Settings
 from paperless_assistant.errors import (
+    AmbiguousPaperlessMutationError,
     AmbiguousSubmissionError,
     ConfigurationUnavailableError,
     DuplicateUploadError,
+    PaperlessAuthenticationError,
+    PaperlessPermissionError,
     PaperlessUnavailableError,
     RateLimitedError,
     StaleSuggestionError,
@@ -34,6 +39,8 @@ from paperless_assistant.models import (
     JobState,
     MetadataGuidance,
     ReferenceContext,
+    ReviewFinalizationState,
+    SuggestionApplyResult,
     SuggestionReview,
     SuggestionSelection,
     TaskState,
@@ -50,7 +57,12 @@ from paperless_assistant.paperless import (
     PAPERLESS_NO_CONTENT,
     sanitize_paperless_error,
 )
-from paperless_assistant.policy import find_required_tag, resolve_taxonomy, validate_attachment
+from paperless_assistant.policy import (
+    find_required_tag,
+    normalize_text,
+    resolve_taxonomy,
+    validate_attachment,
+)
 from paperless_assistant.ports import (
     AuditRepository,
     CredentialRepository,
@@ -74,6 +86,15 @@ class QueryResponse:
     documents: tuple[Document, ...]
     used_search_fallback: bool
     correlation_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
+class _ReviewTagFinalization:
+    """Internal privacy-safe result of the post-metadata tag operation."""
+
+    succeeded: bool
+    outcome: str
+    user_message: str | None = None
 
 
 class QuestionRateLimiter:
@@ -715,11 +736,7 @@ class IngestionService:
         taxonomy = self._taxonomy.snapshot
         if taxonomy is None:
             return ()
-        inbox_tag_name = self._settings.cleanup_inbox_tag.casefold()
-        inbox_tag = next(
-            (tag for tag in taxonomy.tags if tag.name.casefold() == inbox_tag_name),
-            None,
-        )
+        inbox_tag = find_required_tag(taxonomy, self._settings.cleanup_inbox_tag)
         if inbox_tag is None:
             return ()
         document_ids = tuple(doc_id for _, doc_id in active_uploads)
@@ -743,16 +760,18 @@ class IngestionService:
         active_items = tuple(
             item
             for item in await self._repository.active_upload_items()
-            if item.state is UploadItemState.SUCCEEDED and item.document_id is not None
+            if item.state is UploadItemState.SUCCEEDED
+            and item.document_id is not None
+            and item.review_finalization_state
+            in {
+                ReviewFinalizationState.NOT_STARTED,
+                ReviewFinalizationState.READY_FOR_CLEANUP,
+            }
         )
         taxonomy = self._taxonomy.snapshot
         if not active_items or taxonomy is None:
             return (), ()
-        inbox_tag_name = self._settings.cleanup_inbox_tag.casefold()
-        inbox_tag = next(
-            (tag for tag in taxonomy.tags if tag.name.casefold() == inbox_tag_name),
-            None,
-        )
+        inbox_tag = find_required_tag(taxonomy, self._settings.cleanup_inbox_tag)
         if inbox_tag is None:
             return (), ()
         document_ids = tuple(int(item.document_id) for item in active_items if item.document_id)
@@ -767,11 +786,12 @@ class IngestionService:
             doc_tag_ids = tags_by_document[document_id]
             if doc_tag_ids is not None and inbox_tag.id in doc_tag_ids:
                 continue
-            snapshot = await self._repository.update_upload_item(
+            snapshot = await self._repository.close_upload_item_if_cleanup_eligible(
                 item.source_message_id,
                 item.attachment_id,
-                UploadItemState.CLOSED,
             )
+            if snapshot is None:
+                continue
             closed.append(replace(item, state=UploadItemState.CLOSED))
             if snapshot.cleanup_ready:
                 cleanup_targets.extend(snapshot.cleanup_targets)
@@ -820,17 +840,57 @@ class IngestionService:
         updates: DocumentUpdate,
         *,
         expected_modified: datetime | None,
-    ) -> None:
-        """Re-read, merge, and apply uploader-approved suggestions once."""
+    ) -> SuggestionApplyResult | None:
+        """Apply confirmed metadata, then finalize review tags with the uploader token."""
         if job.paperless_document_id is None:
-            return
-        user_token = (
-            await self._credentials.get_user_token(job.principal_id)
-            if self._credentials is not None
-            else None
+            return None
+        gated = await self._repository.set_review_finalization_state(
+            job.id,
+            ReviewFinalizationState.PENDING_NOTIFICATION,
         )
-        if self._credentials is not None and user_token is None:
-            raise UnlinkedUserError("Paperless account is not linked")
+        try:
+            if self._credentials is None:
+                raise UnlinkedUserError("Paperless account is not linked")
+            user_token = await self._credentials.get_user_token(job.principal_id)
+            if user_token is None:
+                raise UnlinkedUserError("Paperless account is not linked")
+            applied = await self._apply_confirmed_metadata(
+                int(job.paperless_document_id),
+                updates,
+                expected_modified=expected_modified,
+                user_token=user_token,
+            )
+        except Exception:
+            if gated:
+                await self._repository.set_review_finalization_state(
+                    job.id,
+                    ReviewFinalizationState.NOT_STARTED,
+                )
+            raise
+        await self._record(job, "suggestions_applied")
+        finalization = await self._finalize_review_tags(job, applied, user_token)
+        await self._record_review_finalization(job, finalization.outcome)
+        if not finalization.succeeded:
+            if gated:
+                await self._repository.set_review_finalization_state(
+                    job.id,
+                    ReviewFinalizationState.NEEDS_RECONCILIATION,
+                )
+            return SuggestionApplyResult(
+                document=applied,
+                review_tags_finalized=False,
+                finalization_message=finalization.user_message,
+            )
+        return SuggestionApplyResult(document=applied, review_tags_finalized=True)
+
+    async def _apply_confirmed_metadata(
+        self,
+        document_id: int,
+        updates: DocumentUpdate,
+        *,
+        expected_modified: datetime | None,
+        user_token: SecretStr | None,
+    ) -> Document:
         disabled = (
             (updates.title is not None and not self._settings.allow_edit_title)
             or (updates.created is not None and not self._settings.allow_edit_date)
@@ -845,14 +905,13 @@ class IngestionService:
         )
         if disabled:
             raise PaperlessUnavailableError("suggestion field editing is disabled")
-        current = await self._gateway.get_document(int(job.paperless_document_id), token=user_token)
+        current = await self._gateway.get_document(document_id, token=user_token)
         if (
             expected_modified is None
             or current.modified is None
             or current.modified != expected_modified
         ):
             raise StaleSuggestionError("document changed after suggestions were generated")
-        document_id = int(job.paperless_document_id)
         scalar_updates = replace(updates, tag_ids=None)
         await self._gateway.update_document(document_id, scalar_updates, token=user_token)
         approved_tags = tuple(
@@ -884,7 +943,218 @@ class IngestionService:
         )
         if not scalar_matches or not set(approved_tags).issubset(applied.tag_ids):
             raise PaperlessUnavailableError("Paperless did not confirm suggestion updates")
-        await self._record(job, "suggestions_applied")
+        return applied
+
+    async def mark_review_finalization_notified(self, job: IngestionJob) -> None:
+        """Open the cleanup gate only after Discord delivered the successful save response."""
+        await self._repository.set_review_finalization_state(
+            job.id,
+            ReviewFinalizationState.READY_FOR_CLEANUP,
+        )
+
+    async def _finalize_review_tags(  # noqa: PLR0911
+        self,
+        job: IngestionJob,
+        applied: Document,
+        user_token: SecretStr | None,
+    ) -> _ReviewTagFinalization:
+        try:
+            taxonomy = await self._gateway.get_taxonomy(token=user_token)
+        except PaperlessAuthenticationError:
+            return _ReviewTagFinalization(
+                False,
+                "credential_rejected",
+                "Paperless saved the metadata, but the linked credential could not finalize "
+                "review tags. Relink the account and Save again.",
+            )
+        except PaperlessPermissionError:
+            return _ReviewTagFinalization(
+                False,
+                "taxonomy_permission_denied",
+                "Paperless saved the metadata, but review-tag finalization was denied. "
+                "Ask an administrator to check tag visibility and permissions, then Save again.",
+            )
+        except PaperlessUnavailableError:
+            return _ReviewTagFinalization(
+                False,
+                "taxonomy_unavailable",
+                "Paperless saved the metadata, but review-tag finalization could not load the "
+                "visible tag taxonomy. Save again after Paperless recovers.",
+            )
+
+        inbox_matches = self._matching_visible_tags(
+            taxonomy,
+            self._settings.cleanup_inbox_tag,
+        )
+        completion_matches = (
+            self._matching_visible_tags(
+                taxonomy,
+                self._settings.ai_review_completion_tag,
+            )
+            if self._settings.ai_review_completion_tag is not None
+            else ()
+        )
+        if len(inbox_matches) != 1 or (
+            self._settings.ai_review_completion_tag is not None and len(completion_matches) != 1
+        ):
+            outcome = (
+                "configured_tag_ambiguous"
+                if len(inbox_matches) > 1 or len(completion_matches) > 1
+                else "configured_tag_missing"
+            )
+            return _ReviewTagFinalization(
+                False,
+                outcome,
+                "Paperless saved the metadata, but a configured review tag is missing or "
+                "ambiguous in your visible taxonomy. Ask an administrator to make each "
+                "configured tag uniquely visible, then Save again.",
+            )
+
+        inbox_tag = inbox_matches[0]
+        completion_tag = completion_matches[0] if completion_matches else None
+        remove_tag_ids = (inbox_tag.id,) if inbox_tag.id in applied.tag_ids else ()
+        add_tag_ids = (
+            (completion_tag.id,)
+            if completion_tag is not None and completion_tag.id not in applied.tag_ids
+            else ()
+        )
+        if add_tag_ids or remove_tag_ids:
+            try:
+                await self._gateway.modify_document_tags(
+                    int(applied.id),
+                    add_tag_ids=add_tag_ids,
+                    remove_tag_ids=remove_tag_ids,
+                    token=user_token,
+                )
+            except AmbiguousPaperlessMutationError:
+                return await self._reconcile_ambiguous_review_tag_mutation(
+                    applied,
+                    inbox_tag.id,
+                    completion_tag.id if completion_tag is not None else None,
+                    user_token,
+                )
+            except PaperlessAuthenticationError:
+                return _ReviewTagFinalization(
+                    False,
+                    "credential_rejected",
+                    "Paperless saved the metadata, but the linked credential could not finalize "
+                    "review tags. Relink the account and Save again.",
+                )
+            except PaperlessPermissionError:
+                return _ReviewTagFinalization(
+                    False,
+                    "mutation_permission_denied",
+                    "Paperless saved the metadata, but it denied the review-tag update. "
+                    "Ask an administrator to grant document tag-edit permission, then Save again.",
+                )
+            except PaperlessUnavailableError:
+                return _ReviewTagFinalization(
+                    False,
+                    "mutation_unavailable",
+                    "Paperless saved the metadata, but review-tag finalization could not be "
+                    "confirmed. No automatic retry was attempted; Save again after checking "
+                    "Paperless.",
+                )
+        return await self._verify_review_tag_state(
+            applied,
+            inbox_tag.id,
+            completion_tag.id if completion_tag is not None else None,
+            user_token,
+            success_outcome="finalized",
+        )
+
+    @staticmethod
+    def _matching_visible_tags(
+        taxonomy: Taxonomy,
+        configured_name: str,
+    ) -> tuple[TaxonomyItem, ...]:
+        normalized = normalize_text(configured_name)
+        return tuple(tag for tag in taxonomy.tags if normalize_text(tag.name) == normalized)
+
+    async def _reconcile_ambiguous_review_tag_mutation(
+        self,
+        applied: Document,
+        inbox_tag_id: int,
+        completion_tag_id: int | None,
+        user_token: SecretStr | None,
+    ) -> _ReviewTagFinalization:
+        reconciled = await self._verify_review_tag_state(
+            applied,
+            inbox_tag_id,
+            completion_tag_id,
+            user_token,
+            success_outcome="finalized_after_reconciliation",
+        )
+        if reconciled.succeeded:
+            return reconciled
+        return _ReviewTagFinalization(
+            False,
+            "ambiguous_mutation_unconfirmed",
+            "Paperless saved the metadata, but the review-tag update has an uncertain outcome. "
+            "The observed tag state did not confirm completion. Reconcile it in Paperless before "
+            "trying Save again.",
+        )
+
+    async def _verify_review_tag_state(
+        self,
+        applied: Document,
+        inbox_tag_id: int,
+        completion_tag_id: int | None,
+        user_token: SecretStr | None,
+        *,
+        success_outcome: str,
+    ) -> _ReviewTagFinalization:
+        try:
+            verified = await self._gateway.get_document(
+                int(applied.id),
+                token=user_token,
+            )
+        except PaperlessAuthenticationError:
+            return _ReviewTagFinalization(
+                False,
+                "verification_credential_rejected",
+                "Paperless saved the metadata, but the linked credential could not verify "
+                "review-tag finalization. Relink the account and Save again.",
+            )
+        except PaperlessPermissionError:
+            return _ReviewTagFinalization(
+                False,
+                "verification_permission_denied",
+                "Paperless saved the metadata, but the final review-tag state was not visible. "
+                "Ask an administrator to check document permissions before retrying.",
+            )
+        except PaperlessUnavailableError:
+            return _ReviewTagFinalization(
+                False,
+                "verification_unavailable",
+                "Paperless saved the metadata, but the final review-tag state could not be "
+                "verified. Save again after Paperless recovers.",
+            )
+        matches = inbox_tag_id not in verified.tag_ids and (
+            completion_tag_id is None or completion_tag_id in verified.tag_ids
+        )
+        if not matches:
+            return _ReviewTagFinalization(
+                False,
+                "verification_mismatch",
+                "Paperless saved the metadata, but it did not confirm the intended review-tag "
+                "state. Reconcile the tags in Paperless before trying Save again.",
+            )
+        return _ReviewTagFinalization(True, success_outcome)
+
+    async def _record_review_finalization(self, job: IngestionJob, outcome: str) -> None:
+        await self._audit.record(
+            AuditEvent(
+                principal_id=job.principal_id,
+                action="ai_review_tag_finalization",
+                outcome=outcome,
+                occurred_at=_now(),
+                correlation_id=uuid4(),
+                job_id=job.id,
+                task_id=job.paperless_task_id,
+                document_id=job.paperless_document_id,
+            )
+        )
 
     async def resolve_or_create_taxonomy(
         self,

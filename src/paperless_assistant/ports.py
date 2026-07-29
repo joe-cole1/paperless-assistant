@@ -23,6 +23,7 @@ from paperless_assistant.models import (
     MetadataGuidance,
     PaperlessTask,
     ReferenceContext,
+    ReviewFinalizationState,
     Taxonomy,
     TaxonomyCapabilities,
     TaxonomyItem,
@@ -190,6 +191,18 @@ class IngestionRepository(Protocol):
     ) -> UploadBatchSnapshot: ...
 
     async def upload_item_for_job(self, job_id: UUID) -> UploadItem | None: ...
+
+    async def set_review_finalization_state(
+        self,
+        job_id: UUID,
+        state: ReviewFinalizationState,
+    ) -> bool: ...
+
+    async def close_upload_item_if_cleanup_eligible(
+        self,
+        source_message_id: int,
+        attachment_id: int,
+    ) -> UploadBatchSnapshot | None: ...
 
     async def active_upload_items(
         self,

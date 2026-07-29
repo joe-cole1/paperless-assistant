@@ -23,6 +23,8 @@ depend on explicit resolution.
 Issue #81 makes per-file rendering idempotent and removes resolved or safely orphaned review
 artifacts.
 Issue #43 replaces document-result dismissal with owner-only native Paperless similarity search.
+Issue #83 couples explicit, confirmed AI review saves to exact Paperless tag finalization while
+preserving a durable Discord-notification cleanup gate.
 
 ## 2. System context
 
@@ -113,6 +115,14 @@ Domain and application code do not import Discord or HTTP client implementations
   **Finish & Close** behavior. The batch summary adds **Refresh All**, **Save All**, and **Close
   All**; bulk operations remain serialized and use the same per-document authorization,
   freshness, permission, audit, and verification checks.
+- Only a confirmed individual Save or Save All item finalizes review tags. The application uses
+  the durable job uploader's linked credential, removes the exact `CLEANUP_INBOX_TAG`, optionally
+  adds one exact existing completion tag, preserves unrelated tags, re-fetches to verify, and
+  records an audit outcome without tag names. Loading, refresh, retry rendering, cancel, close,
+  recovery, and polling never initiate this write.
+- A durable per-item finalization state blocks inbox cleanup while the tag operation is pending or
+  needs reconciliation. Discord opens that gate only after delivering the successful Save
+  response. An ambiguous mutation is re-fetched and reconciled without automatic retry.
 - A rich per-file parent contains bounded metadata but no OCR or document content while its item is
   unresolved. Closing or dismissing an item deletes its thread and parent; independently confirmed
   cleanup flags make partial Discord failures retryable.
@@ -137,7 +147,8 @@ SQLite WAL storage holds ingestion jobs, a durable upload-batch graph with order
 parent/thread/control-message, state, per-file cleanup, and shared-cleanup identifiers, Discord
 event idempotency, short-lived
 document-reference context, exact cleanup channel/message targets and confirmations, the
-missing-tag warning ID/timestamp, encrypted per-user tokens, and privacy-minimized audit. Staged
+missing-tag warning ID/timestamp, per-item review-finalization cleanup gate, encrypted per-user
+tokens, and privacy-minimized audit. Staged
 files use job UUID names and restrictive permissions.
 
 The target state machine is:
@@ -191,6 +202,7 @@ SQLite job/audit state is included according to operator policy.
 - ADR 0012: durable per-file review artifacts and explicit batch-resolution cleanup.
 - ADR 0013: idempotent per-file rendering and resolved-artifact deletion.
 - ADR 0014: owner-only native Paperless similarity from document results.
+- ADR 0015: confirmed AI review tag finalization and notification-gated cleanup.
 
 Issue #10 is the canonical Discord MVP. Issue #20 corrects its default storage deployment. Issue
 #65 is the July 2026 hardening and AI-suggestions correction. Issues #44 and #70 complete its

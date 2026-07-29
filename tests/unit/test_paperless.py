@@ -15,6 +15,7 @@ from pydantic import SecretStr
 
 from paperless_assistant.config import Settings
 from paperless_assistant.errors import (
+    AmbiguousPaperlessMutationError,
     AmbiguousSubmissionError,
     DuplicateUploadError,
     PaperlessAIConfigurationError,
@@ -955,6 +956,29 @@ async def test_modify_document_tags_uses_bulk_edit(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "expected_error"),
+    [
+        (401, PaperlessAuthenticationError),
+        (403, PaperlessPermissionError),
+        (500, AmbiguousPaperlessMutationError),
+    ],
+)
+async def test_modify_document_tags_classifies_definite_and_ambiguous_failures(
+    settings_factory: Callable[..., Settings],
+    status_code: int,
+    expected_error: type[PaperlessUnavailableError],
+) -> None:
+    gateway = _gateway(
+        settings_factory,
+        lambda _: httpx.Response(status_code, text="sensitive upstream detail"),
+    )
+
+    with pytest.raises(expected_error):
+        await gateway.modify_document_tags(7, add_tag_ids=(2,), remove_tag_ids=(3,))
+
+
+@pytest.mark.asyncio
 async def test_new_taxonomy_endpoint_failures_are_fail_closed(
     settings_factory: Callable[..., Settings],
 ) -> None:
@@ -972,7 +996,7 @@ async def test_new_taxonomy_endpoint_failures_are_fail_closed(
         await network.get_document_tag_ids(7)
     with pytest.raises(PaperlessUnavailableError, match="documents unavailable"):
         await network.get_documents_tag_ids((7,))
-    with pytest.raises(PaperlessUnavailableError, match="tag update unavailable"):
+    with pytest.raises(PaperlessUnavailableError, match="outcome is unknown"):
         await network.modify_document_tags(7, add_tag_ids=(1,))
 
     for capability_payload in ({}, {"permissions": "bad"}, {"permissions": [1]}):

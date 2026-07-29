@@ -236,6 +236,7 @@ ALLOW_EDIT_DOCUMENT_TYPE=true
 ALLOW_EDIT_STORAGE_PATH=true
 ALLOW_EDIT_TAGS=true
 REQUIRE_NEW_METADATA_CONFIRMATION=true
+AI_REVIEW_COMPLETION_TAG=
 
 CLEANUP_INBOX_TAG=inbox
 CLEANUP_INBOX_TAG_ENABLED=true
@@ -280,6 +281,12 @@ Important details:
   selected unmatched tags, correspondents, document types, or storage paths. When set to `false`,
   **Apply Changes** is sufficient creation authorization; exact-name lookup, ambiguity failure,
   Paperless permission checks, freshness checks, audit, and write verification still run.
+- `AI_REVIEW_COMPLETION_TAG` is optional and disabled when blank. When configured, it must name
+  one exact, uniquely uploader-visible existing Paperless tag. The assistant never auto-creates it.
+- After Paperless confirms an explicit individual Save or Save All item,
+  `CLEANUP_INBOX_TAG` is removed and the optional completion tag is added with the linked
+  uploader's credential. Refresh, Retry Review, cancel, close, recovery, and polling never mutate
+  these tags.
 - `CLEANUP_QUESTION_DELAY_MINUTES` and `CLEANUP_UPLOAD_DELAY_MINUTES` optionally set auto-deletion timers (0 = default daily 03:00 purge).
 - `DISCORD_MAX_ATTACHMENT_BYTES` controls incoming uploads only. Outgoing files use Discord's
   effective runtime limit automatically.
@@ -432,44 +439,60 @@ does not add another AI or try to make the result exhaustive.
    when kept. Uncheck a match, select a close existing choice, add a harmless custom tag, choose an
    AI date, and enter a custom date. Confirm **Reset Changes** restores the original proposal
    without writing to Paperless.
-8. Repeat the choices and select **Apply Changes**. With the default
+8. Before saving, ensure the exact configured `CLEANUP_INBOX_TAG` exists and is attached to the
+   synthetic document. If testing `AI_REVIEW_COMPLETION_TAG`, create that tag in Paperless first,
+   make it visible to the uploader, and configure its exact name; the assistant must not create it.
+9. Repeat the choices and select **Apply Changes**. With the default
    `REQUIRE_NEW_METADATA_CONFIRMATION=true`, confirm selected unmatched names show the separate
    create-and-apply prompt. Verify Paperless receives only the selected fields and preserves its
-   existing tags.
-9. Make an unapplied change and select per-file **Refresh**; confirm Discord warns before
+   unrelated tags. Confirm the inbox tag is removed, the optional completion tag is added, and
+   Discord reports success before the review becomes eligible for background cleanup.
+10. Make an unapplied change and select per-file **Refresh**; confirm Discord warns before
    discarding it.
    Cancel once, then confirm the refresh and verify the review remains usable. Paperless may return
-   its cached LLM proposal.
-10. Make another unapplied change and select **Finish & Close**; confirm Discord warns that local
+   its cached LLM proposal. Confirm the inbox/completion tags did not change.
+11. Make another unapplied change and select **Finish & Close**; confirm Discord warns that local
     choices will be discarded. Cancel once. After applying or resetting, select it again and
     confirm that document's thread and rich parent are deleted while unresolved sibling reviews
-    remain.
-11. As a different allowlisted user, try an AI or thread control and confirm it is rejected. As the
+    remain. Confirm closing without another Save does not mutate the finalization tags.
+12. As a different allowlisted user, try an AI or thread control and confirm it is rejected. As the
     uploader, change the document in Paperless before applying another proposal and confirm the
     stale review is rejected instead of overwriting the newer edit.
-12. Set one `ALLOW_EDIT_*` value to `false`, recreate the container, upload a fresh synthetic
+13. Set one `ALLOW_EDIT_*` value to `false`, recreate the container, upload a fresh synthetic
     document, and confirm that field is absent while the others remain usable. Restore it to
     `true`.
-13. Set `REQUIRE_NEW_METADATA_CONFIRMATION=false`, recreate the container, select a harmless new
+14. Set `REQUIRE_NEW_METADATA_CONFIRMATION=false`, recreate the container, select a harmless new
     taxonomy name, and choose **Apply Changes**. Confirm there is no second prompt, the object is
     created once, and it is applied. Restore the default `true` unless this is the desired policy.
-14. Exercise **Save All** and confirm one prompt saves dirty reviews in attachment order without
-    closing them. Exercise **Close All** and confirm one prompt closes successful reviews, warns
-    about discarded local choices, and does not dismiss failures.
-15. Cause one safe validation failure. Confirm it receives a per-file failure thread and the
+15. Exercise **Save All** and confirm one prompt saves dirty or finalization-retry reviews in
+    attachment order. Confirm each successful document is finalized, the aggregate response is
+    delivered before cleanup eligibility, and shared artifacts remain until the existing
+    all-items-resolved rule is satisfied. Exercise **Close All** and confirm one prompt closes
+    successful reviews, warns about discarded local choices, and does not dismiss failures.
+16. Temporarily make a configured finalization tag missing or ambiguous, or remove the uploader's
+    document tag-edit permission. Save and confirm Discord says the metadata was saved but tag
+    finalization needs retry/reconciliation; the review evidence must remain. Restore the exact
+    tag/permission and Save again. Do not expect an ambiguous write to be retried automatically.
+17. Cause one safe validation failure. Confirm it receives a per-file failure thread and the
     original upload remains. Dismiss that failure only after closing every success; confirm the
     failed thread and parent disappear, and the original upload and batch summary are then deleted
     together.
-16. Leave an upload uncertain and confirm neither **Close All**, `/clean`, nor scheduled cleanup
+18. Leave an upload uncertain and confirm neither **Close All**, `/clean`, nor scheduled cleanup
     removes its shared artifacts or offers failure dismissal.
-17. Restart the worker while a successful review remains open. Confirm recovery edits the existing
+19. Restart the worker while a successful review remains open. Confirm recovery edits the existing
     title, metadata, action, and control messages instead of posting a duplicate review panel. Run
     `/clean` and confirm it removes only bot-owned orphan/duplicate upload artifacts while
-    preserving active and uncertain reviews.
-18. Upload the same synthetic file again in a separate Discord message. Confirm the assistant sends
+    preserving active and uncertain reviews. Confirm recovery rendering did not mutate document
+    tags.
+20. Upload the same synthetic file again in a separate Discord message. Confirm the assistant sends
     it again and, only after Paperless explicitly identifies the duplicate, the per-file failure
     and batch summary suggest checking/emptying Paperless trash or uploading a genuinely different
     file. Restart during task polling and confirm recovery uses the same wording.
+
+Rollback a review finalization in Paperless by restoring the configured inbox tag and removing the
+optional completion tag. This reverses the document taxonomy state but cannot recreate Discord
+artifacts that cleanup already deleted; `/clean` remains available to retry partial Discord
+cleanup failures.
 
 ### Failure and recovery
 
