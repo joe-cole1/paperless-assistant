@@ -727,7 +727,7 @@ async def test_check_inbox_tag_removals(
 
 
 @pytest.mark.asyncio
-async def test_upload_batch_service_resolution_and_inbox_closures(
+async def test_upload_batch_service_resolution_and_inbox_closures(  # noqa: PLR0915
     tmp_path: Path,
     settings_factory: Callable[..., Settings],
 ) -> None:
@@ -790,8 +790,15 @@ async def test_upload_batch_service_resolution_and_inbox_closures(
         parent_message_id=301,
         parent_channel_id=102,
         thread_id=401,
+        title_message_id=501,
+        metadata_message_id=502,
+        actions_message_id=503,
+        controls_message_id=504,
     )
     assert updated.items[0].thread_id == 401
+    assert updated.items[0].controls_message_id == 504
+    assert len(await ingestion.tracked_upload_items()) == 2
+    assert await ingestion.resolved_upload_items_pending_cleanup() == ()
 
     gateway.doc_tags = {44: (1, 2), 45: (1,)}
     closed, targets = await ingestion.check_inbox_upload_closures()
@@ -805,6 +812,15 @@ async def test_upload_batch_service_resolution_and_inbox_closures(
         DiscordMessageTarget(102, 50),
         DiscordMessageTarget(102, 20),
     )
+    pending_cleanup = await ingestion.resolved_upload_items_pending_cleanup()
+    assert tuple(item.attachment_id for item in pending_cleanup) == (21,)
+    await ingestion.confirm_upload_item_cleanup(
+        20,
+        21,
+        parent_cleaned=True,
+        thread_cleaned=True,
+    )
+    assert await ingestion.resolved_upload_items_pending_cleanup() == ()
     await ingestion.confirm_upload_cleanup(targets)
     assert await ingestion.terminal_upload_cleanup_targets() == ()
 

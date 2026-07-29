@@ -291,6 +291,10 @@ class IngestionService:
         parent_message_id: int | None = None,
         parent_channel_id: int | None = None,
         thread_id: int | None = None,
+        title_message_id: int | None = None,
+        metadata_message_id: int | None = None,
+        actions_message_id: int | None = None,
+        controls_message_id: int | None = None,
         failure_reason: str | None = None,
     ) -> UploadBatchSnapshot:
         """Persist one review transition and return its batch cleanup decision."""
@@ -303,6 +307,10 @@ class IngestionService:
             parent_message_id=parent_message_id,
             parent_channel_id=parent_channel_id,
             thread_id=thread_id,
+            title_message_id=title_message_id,
+            metadata_message_id=metadata_message_id,
+            actions_message_id=actions_message_id,
+            controls_message_id=controls_message_id,
             failure_reason=failure_reason,
         )
 
@@ -329,8 +337,32 @@ class IngestionService:
     async def terminal_upload_cleanup_targets(
         self,
     ) -> tuple[DiscordMessageTarget, ...]:
-        """Return explicitly resolved batch targets without touching rich parents."""
+        """Return shared targets for batches whose items are explicitly resolved."""
         return await self._repository.terminal_upload_cleanup_targets()
+
+    async def tracked_upload_items(self) -> tuple[UploadItem, ...]:
+        """Return durable per-file Discord identities for safe orphan checks."""
+        return await self._repository.tracked_upload_items()
+
+    async def resolved_upload_items_pending_cleanup(self) -> tuple[UploadItem, ...]:
+        """Return resolved parent/thread pairs whose deletion needs retrying."""
+        return await self._repository.resolved_upload_items_pending_cleanup()
+
+    async def confirm_upload_item_cleanup(
+        self,
+        source_message_id: int,
+        attachment_id: int,
+        *,
+        parent_cleaned: bool,
+        thread_cleaned: bool,
+    ) -> None:
+        """Confirm exact per-file artifacts only after Discord deletion or absence."""
+        await self._repository.confirm_upload_item_cleanup(
+            source_message_id,
+            attachment_id,
+            parent_cleaned=parent_cleaned,
+            thread_cleaned=thread_cleaned,
+        )
 
     async def active_upload_outcomes(self) -> tuple[IngestionOutcome, ...]:
         """Rebuild terminal outcomes whose per-file controls must survive restart."""

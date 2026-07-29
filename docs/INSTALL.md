@@ -134,8 +134,9 @@ need Administrator.
 
 After installation, review the two private channels' permission overrides. The bot role must have
 the permissions above in both channels. **Create Public Threads**, **Send Messages in Threads**,
-and **Manage Threads** allow the bot to create, populate, archive, and lock per-file reviews, while
-**Manage Messages** lets it remove resolved batches' shared source and summary messages. Do not
+and **Manage Threads** allow the bot to create, populate, and delete resolved per-file reviews,
+while **Manage Messages** lets it remove resolved parents and batches' shared source and summary
+messages. Do not
 grant it access to unrelated private channels.
 
 Discord explains bot tokens, scopes, and least-privilege server permissions in its
@@ -438,7 +439,8 @@ does not add another AI or try to make the result exhaustive.
    its cached LLM proposal.
 10. Make another unapplied change and select **Finish & Close**; confirm Discord warns that local
     choices will be discarded. Cancel once. After applying or resetting, select it again and
-    confirm only that thread is archived and locked while its rich parent remains.
+    confirm that document's thread and rich parent are deleted while unresolved sibling reviews
+    remain.
 11. As a different allowlisted user, try an AI or thread control and confirm it is rejected. As the
     uploader, change the document in Paperless before applying another proposal and confirm the
     stale review is rejected instead of overwriting the newer edit.
@@ -453,11 +455,16 @@ does not add another AI or try to make the result exhaustive.
     about discarded local choices, and does not dismiss failures.
 15. Cause one safe validation failure. Confirm it receives a per-file failure thread and the
     original upload remains. Dismiss that failure only after closing every success; confirm the
-    original upload and batch summary are then deleted together while rich parents remain.
+    failed thread and parent disappear, and the original upload and batch summary are then deleted
+    together.
 16. Leave an upload uncertain and confirm neither **Close All**, `/clean`, nor scheduled cleanup
     removes its shared artifacts or offers failure dismissal.
-17. Upload the same synthetic file again in a separate Discord message. Confirm the assistant sends
-   it again and Paperless owns duplicate handling.
+17. Restart the worker while a successful review remains open. Confirm recovery edits the existing
+    title, metadata, action, and control messages instead of posting a duplicate review panel. Run
+    `/clean` and confirm it removes only bot-owned orphan/duplicate upload artifacts while
+    preserving active and uncertain reviews.
+18. Upload the same synthetic file again in a separate Discord message. Confirm the assistant sends
+    it again and Paperless owns duplicate handling.
 
 ### Failure and recovery
 

@@ -20,6 +20,8 @@ Issue #77 makes review-field exposure and the extra creation prompt deployment p
 preserving application-layer write enforcement.
 Issue #79 separates each attachment into a durable per-file review and makes shared batch cleanup
 depend on explicit resolution.
+Issue #81 makes per-file rendering idempotent and removes resolved or safely orphaned review
+artifacts.
 
 ## 2. System context
 
@@ -105,8 +107,9 @@ Domain and application code do not import Discord or HTTP client implementations
   **Finish & Close** behavior. The batch summary adds **Refresh All**, **Save All**, and **Close
   All**; bulk operations remain serialized and use the same per-document authorization,
   freshness, permission, audit, and verification checks.
-- A rich per-file parent contains bounded metadata but no OCR or document content. Closing archives
-  and locks its thread without deleting that channel-history record.
+- A rich per-file parent contains bounded metadata but no OCR or document content while its item is
+  unresolved. Closing or dismissing an item deletes its thread and parent; independently confirmed
+  cleanup flags make partial Discord failures retryable.
 - Cleanup is fail-closed: Paperless batch failures do not delete Discord messages, and database
   evidence is purged only after Discord confirms deletion or absence at the exact channel/message.
 - Shared upload source and summary messages become cleanup-eligible only when every success is
@@ -125,7 +128,8 @@ placed in source, image layers, tests, documentation examples, issues, or pull r
 ## 8. Persistence and recovery target
 
 SQLite WAL storage holds ingestion jobs, a durable upload-batch graph with ordered item,
-parent/thread, state, and shared-cleanup identifiers, Discord event idempotency, short-lived
+parent/thread/control-message, state, per-file cleanup, and shared-cleanup identifiers, Discord
+event idempotency, short-lived
 document-reference context, exact cleanup channel/message targets and confirmations, the
 missing-tag warning ID/timestamp, encrypted per-user tokens, and privacy-minimized audit. Staged
 files use job UUID names and restrictive permissions.
@@ -179,6 +183,7 @@ SQLite job/audit state is included according to operator policy.
 - ADR 0010: complete selective AI review, confirmed taxonomy creation, and cache validation.
 - ADR 0011: configurable review fields, persistent thread controls, and creation-prompt policy.
 - ADR 0012: durable per-file review artifacts and explicit batch-resolution cleanup.
+- ADR 0013: idempotent per-file rendering and resolved-artifact deletion.
 
 Issue #10 is the canonical Discord MVP. Issue #20 corrects its default storage deployment. Issue
 #65 is the July 2026 hardening and AI-suggestions correction. Issues #44 and #70 complete its

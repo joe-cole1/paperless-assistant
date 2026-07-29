@@ -26,7 +26,8 @@ Configure two private Discord text channels:
   one-at-a-time custom names. Only the uploader can save changes. Existing matches start selected,
   unmatched names stay pending until an explicit save, and every write rechecks the document,
   preserves existing tags, verifies permissions and freshness, and records a privacy-minimized
-  audit. Per-file **Finish & Close** archives that thread and retains its rich parent. The batch
+  audit. Per-file **Finish & Close** resolves the review and deletes its thread and rich parent. The
+  batch
   summary offers **Refresh All**, **Save All**, and **Close All**; Close All closes successes but
   never acknowledges failures. A failed item must be explicitly dismissed, while an uncertain
   upload remains unresolved. The original upload and summary are deleted together only after all
@@ -39,7 +40,8 @@ Slash commands available to users:
 - `/auth link <token>` — Ephemerally test and store your Paperless API token.
 - `/auth unlink` — Remove your linked Paperless API token.
 - `/auth status` — Check whether your Paperless account token is linked and valid.
-- `/clean [count]` — Bulk-purge assistant messages on demand in assistant channels.
+- `/clean [count]` — Retry resolved upload cleanup and remove strictly identified bot-owned
+  orphan messages/threads; in the questions channel, purge recent unpinned messages.
 
 If an original exceeds Discord's effective attachment limit, the assistant offers an archived PDF
 when it fits and always provides the session-authenticated original Paperless download link.
@@ -152,9 +154,10 @@ tag becomes healthy.
 
 Uploads and their ordered per-file Discord artifacts are durable in SQLite. A saved task UUID
 resumes polling after restart and restores the matching success, failure, or uncertain review
-surface. An interrupted ambiguous upload POST is marked `reconciliation_required` and is never
-automatically repeated. Nightly cleanup and `/clean` follow the durable batch graph and never
-delete active or reconciliation artifacts.
+surface by editing its durable control-message IDs. An interrupted ambiguous upload POST is marked
+`reconciliation_required` and is never automatically repeated. Nightly cleanup and `/clean`
+follow the durable batch graph, retry partially deleted resolved reviews, remove only strictly
+identified bot-owned orphans, and never delete active or reconciliation artifacts.
 Paperless HTTP and task errors remain generic in Discord. Server logs include a bounded,
 control-character-safe, credential-redacted Paperless diagnostic plus operation and status code;
 they never include authorization headers.

@@ -198,6 +198,12 @@ class UploadItem:
     parent_message_id: int | None = None
     parent_channel_id: int | None = None
     thread_id: int | None = None
+    title_message_id: int | None = None
+    metadata_message_id: int | None = None
+    actions_message_id: int | None = None
+    controls_message_id: int | None = None
+    parent_cleaned: bool = False
+    thread_cleaned: bool = False
     failure_reason: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
