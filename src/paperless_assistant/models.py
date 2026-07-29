@@ -146,6 +146,15 @@ class Document:
 
 
 @dataclass(frozen=True, slots=True)
+class SuggestionApplyResult:
+    """Confirmed metadata state plus the review-tag finalization outcome."""
+
+    document: Document
+    review_tags_finalized: bool
+    finalization_message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class DiscordMessageTarget:
     """One exact Discord channel/message pair eligible for policy cleanup."""
 
@@ -163,6 +172,15 @@ class UploadItemState(StrEnum):
     RECONCILIATION_REQUIRED = "reconciliation_required"
     CLOSED = "closed"
     DISMISSED = "dismissed"
+
+
+class ReviewFinalizationState(StrEnum):
+    """Durable cleanup gate around uploader-confirmed review finalization."""
+
+    NOT_STARTED = "not_started"
+    PENDING_NOTIFICATION = "pending_notification"
+    NEEDS_RECONCILIATION = "needs_reconciliation"
+    READY_FOR_CLEANUP = "ready_for_cleanup"
 
 
 RESOLVED_UPLOAD_ITEM_STATES = frozenset({UploadItemState.CLOSED, UploadItemState.DISMISSED})
@@ -202,6 +220,7 @@ class UploadItem:
     metadata_message_id: int | None = None
     actions_message_id: int | None = None
     controls_message_id: int | None = None
+    review_finalization_state: ReviewFinalizationState = ReviewFinalizationState.NOT_STARTED
     parent_cleaned: bool = False
     thread_cleaned: bool = False
     failure_reason: str | None = None

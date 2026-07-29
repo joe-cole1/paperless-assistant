@@ -38,8 +38,10 @@ Configure two private Discord text channels:
   explains that the uploader can check/empty Paperless trash or send a genuinely different file.
   The original upload and summary are deleted together only after all successes are closed, all
   failures are dismissed, and no item remains active or uncertain.
-  Removing `CLEANUP_INBOX_TAG` (default `inbox`) closes the corresponding successful review and
-  applies the same batch cleanup rule.
+  A confirmed Save removes the exact `CLEANUP_INBOX_TAG` (default `inbox`) and can add the exact
+  existing `AI_REVIEW_COMPLETION_TAG`. Refresh, reset/cancel, close, recovery, and polling never
+  perform this finalization. Inbox-tag removal closes the corresponding successful review and
+  applies the same batch cleanup rule only after Discord delivers the Save result.
 
 Slash commands available to users:
 
@@ -120,8 +122,11 @@ Replace every example ID, URL, and token in `.env`. Important settings:
 - `REQUIRE_NEW_METADATA_CONFIRMATION=true` — require a second confirmation before selected
   unmatched taxonomy names are exact-checked, created, and applied; when `false`, **Apply
   Changes** is the creation authorization and all other safety checks remain
+- `AI_REVIEW_COMPLETION_TAG=` — optional exact existing tag added after a confirmed AI metadata
+  save; blank disables it, and the assistant never creates it
 - `PAPERLESS_OFFICE_UPLOADS_ENABLED=false` — upload policy flag only
-- `CLEANUP_INBOX_TAG=inbox` — tag monitored for removal to auto-delete upload notifications
+- `CLEANUP_INBOX_TAG=inbox` — exact existing tag removed after confirmed AI metadata saves and
+  monitored for removal to auto-delete upload notifications
 - `CLEANUP_INBOX_TAG_POLL_INTERVAL_SECONDS=300` — polling frequency for tag removal checks
 - `CLEANUP_QUESTION_DELAY_MINUTES=0` — optional auto-delete delay for Q&A pairs (0 = daily 03:00 purge)
 - `CLEANUP_UPLOAD_DELAY_MINUTES=0` — optional auto-delete delay for upload notifications
@@ -164,10 +169,20 @@ surface by editing its durable control-message IDs. An interrupted ambiguous upl
 `reconciliation_required` and is never automatically repeated. Nightly cleanup and `/clean`
 follow the durable batch graph, retry partially deleted resolved reviews, remove only strictly
 identified bot-owned orphans, and never delete active or reconciliation artifacts.
+AI review finalization also has a durable cleanup gate: a failed or uncertain tag update retains
+the review evidence, while a successful update becomes cleanup-eligible only after its Discord
+response. Both configured finalization tags must be uniquely visible to the linked uploader.
+Finalization uses that uploader's token, preserves every unrelated tag, performs one combined
+add/remove mutation, re-fetches the document, and never retries an ambiguous write before
+reconciling the observed state.
 Paperless HTTP and task errors remain generic in Discord except for an explicit structured
 duplicate confirmation, which receives fixed privacy-safe guidance. Server logs include a bounded,
 control-character-safe, credential-redacted Paperless diagnostic plus operation and status code;
 they never include authorization headers.
+
+To roll back a completed review finalization, restore `CLEANUP_INBOX_TAG` and remove
+`AI_REVIEW_COMPLETION_TAG` from the document in Paperless. If Discord artifacts were already
+cleaned, the Paperless tag rollback does not recreate them.
 
 Paperless 3.0.4 exposes two different suggestion systems. This assistant deliberately calls
 `GET /api/documents/{id}/ai_suggestions/`, which synchronously invokes Paperless's configured LLM.

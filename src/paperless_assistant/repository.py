@@ -23,6 +23,7 @@ from paperless_assistant.models import (
     JobState,
     MetadataGuidance,
     ReferenceContext,
+    ReviewFinalizationState,
     UploadBatch,
     UploadBatchSnapshot,
     UploadItem,
@@ -67,6 +68,7 @@ CREATE TABLE IF NOT EXISTS ingestion_jobs (
     paperless_task_id TEXT,
     paperless_document_id INTEGER,
     duplicate_confirmed INTEGER NOT NULL DEFAULT 0,
+    review_finalization_state TEXT NOT NULL DEFAULT 'not_started',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (discord_message_id, discord_attachment_id)
@@ -104,6 +106,7 @@ CREATE TABLE IF NOT EXISTS upload_items (
     metadata_message_id INTEGER,
     actions_message_id INTEGER,
     controls_message_id INTEGER,
+    review_finalization_state TEXT NOT NULL DEFAULT 'not_started',
     parent_cleaned INTEGER NOT NULL DEFAULT 0,
     thread_cleaned INTEGER NOT NULL DEFAULT 0,
     failure_reason TEXT,
@@ -262,6 +265,10 @@ class SQLiteRepository:
                 ("discord_message_cleaned", "INTEGER NOT NULL DEFAULT 0"),
                 ("discord_status_message_cleaned", "INTEGER NOT NULL DEFAULT 0"),
                 ("duplicate_confirmed", "INTEGER NOT NULL DEFAULT 0"),
+                (
+                    "review_finalization_state",
+                    "TEXT NOT NULL DEFAULT 'not_started'",
+                ),
             ):
                 if name not in columns:
                     connection.execute(f"ALTER TABLE ingestion_jobs ADD COLUMN {name} {definition}")
@@ -280,6 +287,10 @@ class SQLiteRepository:
                 ("metadata_message_id", "INTEGER"),
                 ("actions_message_id", "INTEGER"),
                 ("controls_message_id", "INTEGER"),
+                (
+                    "review_finalization_state",
+                    "TEXT NOT NULL DEFAULT 'not_started'",
+                ),
                 ("parent_cleaned", "INTEGER NOT NULL DEFAULT 0"),
                 ("thread_cleaned", "INTEGER NOT NULL DEFAULT 0"),
             ):
@@ -449,9 +460,9 @@ class SQLiteRepository:
                     source_message_id, attachment_id, ordinal, original_filename,
                     state, job_id, document_id, parent_message_id, parent_channel_id,
                     thread_id, title_message_id, metadata_message_id, actions_message_id,
-                    controls_message_id, parent_cleaned, thread_cleaned, failure_reason,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    controls_message_id, review_finalization_state, parent_cleaned,
+                    thread_cleaned, failure_reason, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     (
@@ -469,6 +480,7 @@ class SQLiteRepository:
                         item.metadata_message_id,
                         item.actions_message_id,
                         item.controls_message_id,
+                        item.review_finalization_state.value,
                         int(item.parent_cleaned),
                         int(item.thread_cleaned),
                         item.failure_reason,
@@ -512,6 +524,7 @@ class SQLiteRepository:
             metadata_message_id=row["metadata_message_id"],
             actions_message_id=row["actions_message_id"],
             controls_message_id=row["controls_message_id"],
+            review_finalization_state=ReviewFinalizationState(row["review_finalization_state"]),
             parent_cleaned=bool(row["parent_cleaned"]),
             thread_cleaned=bool(row["thread_cleaned"]),
             failure_reason=row["failure_reason"],
@@ -615,6 +628,85 @@ class SQLiteRepository:
                 (str(job_id),),
             ).fetchone()
         return self._upload_item_from_row(row) if row is not None else None
+
+    async def set_review_finalization_state(
+        self,
+        job_id: UUID,
+        state: ReviewFinalizationState,
+    ) -> bool:
+        """Persist the save/notification cleanup gate for one durable review."""
+        now = _iso(_utc_now())
+        with self._connection() as connection:
+            item_cursor = connection.execute(
+                """
+                UPDATE upload_items
+                SET review_finalization_state = ?, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (state.value, now, str(job_id)),
+            )
+            job_cursor = connection.execute(
+                """
+                UPDATE ingestion_jobs
+                SET review_finalization_state = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (state.value, now, str(job_id)),
+            )
+            if item_cursor.rowcount:
+                connection.execute(
+                    """
+                    UPDATE upload_batches
+                    SET updated_at = ?
+                    WHERE source_message_id = (
+                        SELECT source_message_id FROM upload_items WHERE job_id = ?
+                    )
+                    """,
+                    (now, str(job_id)),
+                )
+            connection.commit()
+        return item_cursor.rowcount == 1 or job_cursor.rowcount == 1
+
+    async def close_upload_item_if_cleanup_eligible(
+        self,
+        source_message_id: int,
+        attachment_id: int,
+    ) -> UploadBatchSnapshot | None:
+        """Atomically close an inbox-removed item only while its save gate permits."""
+        now = _iso(_utc_now())
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE upload_items
+                SET state = ?, updated_at = ?
+                WHERE source_message_id = ?
+                  AND attachment_id = ?
+                  AND state = ?
+                  AND review_finalization_state IN (?, ?)
+                """,
+                (
+                    UploadItemState.CLOSED.value,
+                    now,
+                    source_message_id,
+                    attachment_id,
+                    UploadItemState.SUCCEEDED.value,
+                    ReviewFinalizationState.NOT_STARTED.value,
+                    ReviewFinalizationState.READY_FOR_CLEANUP.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                return None
+            connection.execute(
+                "UPDATE upload_batches SET updated_at = ? WHERE source_message_id = ?",
+                (now, source_message_id),
+            )
+            connection.commit()
+        snapshot = await self.get_upload_batch(source_message_id)
+        if snapshot is None:
+            raise ValueError("upload batch disappeared")
+        return snapshot
 
     async def active_upload_items(self) -> tuple[UploadItem, ...]:
         """Return non-resolved new-model items for recovery and inbox cleanup."""
@@ -919,6 +1011,9 @@ class SQLiteRepository:
                     discord_status_message_cleaned,
                     MAX(CASE WHEN state NOT IN (?, ?) THEN 1 ELSE 0 END) AS unresolved,
                     MAX(CASE WHEN state = ? THEN 1 ELSE 0 END) AS has_failed,
+                    MAX(
+                        CASE WHEN review_finalization_state IN (?, ?) THEN 1 ELSE 0 END
+                    ) AS finalization_blocked,
                     MAX(updated_at) AS newest_update
                 FROM ingestion_jobs
                 WHERE NOT EXISTS (
@@ -937,13 +1032,19 @@ class SQLiteRepository:
                     JobState.SUCCEEDED.value,
                     JobState.FAILED.value,
                     JobState.FAILED.value,
+                    ReviewFinalizationState.PENDING_NOTIFICATION.value,
+                    ReviewFinalizationState.NEEDS_RECONCILIATION.value,
                 ),
             )
             upload_targets: list[DiscordMessageTarget] = []
             for row in upload_cursor.fetchall():
-                eligible = row["unresolved"] == 0 and (
-                    (row["has_failed"] == 0 and row["newest_update"] < succeeded_before)
-                    or (row["has_failed"] == 1 and row["newest_update"] < failed_before)
+                eligible = (
+                    row["unresolved"] == 0
+                    and row["finalization_blocked"] == 0
+                    and (
+                        (row["has_failed"] == 0 and row["newest_update"] < succeeded_before)
+                        or (row["has_failed"] == 1 and row["newest_update"] < failed_before)
+                    )
                 )
                 if not eligible:
                     continue
@@ -1091,6 +1192,7 @@ class SQLiteRepository:
                 FROM ingestion_jobs
                 WHERE state = ?
                   AND paperless_document_id IS NOT NULL
+                  AND review_finalization_state IN (?, ?)
                   AND NOT EXISTS (
                       SELECT 1 FROM upload_items
                       WHERE upload_items.job_id = ingestion_jobs.id
@@ -1103,7 +1205,11 @@ class SQLiteRepository:
                     )
                   )
                 """,
-                (JobState.SUCCEEDED.value,),
+                (
+                    JobState.SUCCEEDED.value,
+                    ReviewFinalizationState.NOT_STARTED.value,
+                    ReviewFinalizationState.READY_FOR_CLEANUP.value,
+                ),
             )
             rows = cursor.fetchall()
         results: list[tuple[tuple[DiscordMessageTarget, ...], int]] = []

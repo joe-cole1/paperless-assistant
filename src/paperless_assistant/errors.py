@@ -47,6 +47,10 @@ class AmbiguousSubmissionError(AssistantError):
     """The upload response is unknown and must not be retried automatically."""
 
 
+class AmbiguousPaperlessMutationError(PaperlessUnavailableError):
+    """A non-idempotent Paperless write needs read-before-retry reconciliation."""
+
+
 class DuplicateUploadError(AssistantError):
     """Paperless definitively identified an upload as a duplicate."""
 

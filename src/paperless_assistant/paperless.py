@@ -18,6 +18,7 @@ from pydantic import SecretStr
 
 from paperless_assistant.config import Settings
 from paperless_assistant.errors import (
+    AmbiguousPaperlessMutationError,
     AmbiguousSubmissionError,
     DuplicateUploadError,
     PaperlessAIConfigurationError,
@@ -722,8 +723,17 @@ class HttpPaperlessGateway:
                 headers=self._headers(token),
             )
         except httpx.HTTPError as error:
-            raise PaperlessUnavailableError("Paperless tag update unavailable") from error
-        await self._raise_status(response)
+            raise AmbiguousPaperlessMutationError(
+                "Paperless tag update outcome is unknown"
+            ) from error
+        try:
+            await self._raise_status(response)
+        except PaperlessAuthenticationError, PaperlessPermissionError:
+            raise
+        except PaperlessUnavailableError as error:
+            raise AmbiguousPaperlessMutationError(
+                "Paperless tag update outcome is unknown"
+            ) from error
 
     async def submit_document(
         self,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from datetime import timedelta
 from pathlib import Path
 from typing import Literal, Self
@@ -85,6 +86,7 @@ class Settings(BaseSettings):
     allow_edit_storage_path: bool = True
     allow_edit_tags: bool = True
     require_new_metadata_confirmation: bool = True
+    ai_review_completion_tag: str | None = Field(default=None, max_length=100)
 
     cleanup_hour_local: int = Field(default=3, ge=0, le=23)
     cleanup_inbox_tag: str = Field(default="inbox", min_length=1, max_length=100)
@@ -105,11 +107,14 @@ class Settings(BaseSettings):
         "tz",
         "paperless_source_tag",
         "cleanup_inbox_tag",
+        "ai_review_completion_tag",
         mode="before",
     )
     @classmethod
     def reject_surrounding_whitespace(cls, value: object) -> object:
         """Reject ambiguous values rather than silently normalizing them."""
+        if value == "":
+            return None
         if isinstance(value, str) and value != value.strip():
             raise ValueError("must not contain surrounding whitespace")
         return value
@@ -163,6 +168,12 @@ class Settings(BaseSettings):
             raise ValueError("initial task poll interval must not exceed maximum")
         if self.paperless_public_url.scheme != "https":
             raise ValueError("PAPERLESS_PUBLIC_URL must use HTTPS")
+        if (
+            self.ai_review_completion_tag is not None
+            and unicodedata.normalize("NFKC", self.ai_review_completion_tag).casefold()
+            == unicodedata.normalize("NFKC", self.cleanup_inbox_tag).casefold()
+        ):
+            raise ValueError("AI_REVIEW_COMPLETION_TAG must differ from CLEANUP_INBOX_TAG")
         return self
 
     @property

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -10,12 +11,16 @@ from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import pytest
+from pydantic import SecretStr
 
 from paperless_assistant.config import Settings
 from paperless_assistant.errors import (
+    AmbiguousPaperlessMutationError,
     AmbiguousSubmissionError,
     ConfigurationUnavailableError,
     DuplicateUploadError,
+    PaperlessAuthenticationError,
+    PaperlessPermissionError,
     PaperlessUnavailableError,
     RateLimitedError,
     StaleSuggestionError,
@@ -33,7 +38,9 @@ from paperless_assistant.models import (
     JobState,
     MetadataGuidance,
     PaperlessTask,
+    ReviewFinalizationState,
     SuggestedDate,
+    SuggestionApplyResult,
     SuggestionReview,
     TaskState,
     Taxonomy,
@@ -77,7 +84,11 @@ class FakeGateway:
             8: self.search[0],
             44: Document(DocumentId(44), "Consumed", date(2024, 3, 3)),
         }
-        self.taxonomy = Taxonomy((TaxonomyItem(1, "Discord"),), (), ())
+        self.taxonomy = Taxonomy(
+            (TaxonomyItem(1, "Discord"), TaxonomyItem(10, "inbox")),
+            (),
+            (),
+        )
         self.taxonomy_error = False
         self.submit_error: Exception | None = None
         self.search_error = False
@@ -93,6 +104,11 @@ class FakeGateway:
         self.updates_applied: DocumentUpdate | None = None
         self.skip_update = False
         self.tag_changes: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+        self.tag_mutation_error: Exception | None = None
+        self.ignore_tag_changes = False
+        self.document_tokens: list[object] = []
+        self.taxonomy_tokens: list[object] = []
+        self.tag_tokens: list[object] = []
         self.capabilities = TaxonomyCapabilities(True, True, True, True)
         self.taxonomy_matches: tuple[TaxonomyItem, ...] = ()
         self.created_taxonomy: list[tuple[TaxonomyKind, str, str | None]] = []
@@ -149,7 +165,14 @@ class FakeGateway:
         remove_tag_ids: tuple[int, ...] = (),
         token: object = None,
     ) -> None:
+        if not add_tag_ids and not remove_tag_ids:
+            return
+        self.tag_tokens.append(token)
+        if self.tag_mutation_error is not None:
+            raise self.tag_mutation_error
         self.tag_changes.append((add_tag_ids, remove_tag_ids))
+        if self.ignore_tag_changes:
+            return
         current = self.documents[document_id]
         retained = tuple(value for value in current.tag_ids if value not in remove_tag_ids)
         self.documents[document_id] = replace(
@@ -221,9 +244,11 @@ class FakeGateway:
         return self.similar[:limit]
 
     async def get_document(self, document_id: int, *, token: object = None) -> Document:
+        self.document_tokens.append(token)
         return self.documents[document_id]
 
     async def get_taxonomy(self, *, token: object = None) -> Taxonomy:
+        self.taxonomy_tokens.append(token)
         if self.taxonomy_error:
             raise PaperlessUnavailableError("synthetic")
         return self.taxonomy
@@ -292,6 +317,85 @@ async def _services(
     await taxonomy.refresh()
     ingestion = IngestionService(settings, gateway, repository, repository, taxonomy)
     return repository, taxonomy, ingestion
+
+
+_LINKED_USER_TOKEN = SecretStr("linked-user-token")
+
+
+class _Credentials:
+    def __init__(
+        self,
+        token: SecretStr | None = _LINKED_USER_TOKEN,
+    ) -> None:
+        self.token = token
+
+    async def get_user_token(self, principal_id: int) -> SecretStr | None:
+        assert principal_id == 201
+        return self.token
+
+    async def save_user_token(self, principal_id: int, token: SecretStr) -> None:
+        assert principal_id == 201
+        self.token = token
+
+    async def delete_user_token(self, principal_id: int) -> bool:
+        assert principal_id == 201
+        existed = self.token is not None
+        self.token = None
+        return existed
+
+
+def _review_job() -> IngestionJob:
+    return IngestionJob(
+        id=uuid4(),
+        discord_message_id=901,
+        discord_attachment_id=902,
+        principal_id=201,
+        staged_path=Path("synthetic.pdf"),
+        original_filename="synthetic.pdf",
+        media_type="application/pdf",
+        office_dependent=False,
+        caption="",
+        guidance=MetadataGuidance(),
+        state=JobState.SUCCEEDED,
+        paperless_document_id=DocumentId(7),
+    )
+
+
+async def _finalization_services(
+    settings: Settings,
+    gateway: FakeGateway,
+    *,
+    credentials: _Credentials | None = None,
+) -> tuple[SQLiteRepository, IngestionService, IngestionJob]:
+    repository = SQLiteRepository(settings.database_path, lease_seconds=60)
+    await repository.initialize()
+    taxonomy = TaxonomyCache(settings, gateway)
+    await taxonomy.refresh()
+    job = _review_job()
+    await repository.create_job(job)
+    await repository.create_upload_batch(
+        UploadBatch(901, 102, 903, 102, 201, 1),
+        (
+            UploadItem(
+                901,
+                902,
+                1,
+                "synthetic.pdf",
+                state=UploadItemState.SUCCEEDED,
+                job_id=job.id,
+                document_id=DocumentId(7),
+            ),
+        ),
+    )
+    ingestion = IngestionService(
+        settings,
+        gateway,
+        repository,
+        repository,
+        taxonomy,
+        credentials=credentials or _Credentials(),
+    )
+    return repository, ingestion, job
 
 
 @pytest.mark.asyncio
@@ -1433,6 +1537,683 @@ async def test_apply_suggestions(
     gateway.documents[7] = replace(gateway.documents[7], modified=None)
     with pytest.raises(StaleSuggestionError):
         await ingestion.apply_suggestions(job, updates, expected_modified=None)
+
+
+@pytest.mark.asyncio
+async def test_review_finalization_removes_inbox_with_linked_uploader_token(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / "remove-inbox")
+    gateway = FakeGateway()
+    gateway.documents[7] = replace(gateway.documents[7], tag_ids=(1, 9, 10))
+    _, ingestion, job = await _finalization_services(settings, gateway)
+
+    result = await ingestion.apply_suggestions(
+        job,
+        DocumentUpdate(),
+        expected_modified=gateway.documents[7].modified,
+    )
+
+    assert isinstance(result, SuggestionApplyResult)
+    assert result.review_tags_finalized
+    assert gateway.tag_changes == [((), (10,))]
+    assert gateway.documents[7].tag_ids == (1, 9)
+    assert all(
+        isinstance(token, SecretStr) and token.get_secret_value() == "linked-user-token"
+        for token in (*gateway.document_tokens, *gateway.tag_tokens)
+    )
+    assert isinstance(gateway.taxonomy_tokens[-1], SecretStr)
+
+
+@pytest.mark.asyncio
+async def test_review_finalization_adds_optional_completion_tag(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(
+        data_dir=tmp_path / "add-completion",
+        ai_review_completion_tag="AI reviewed",
+    )
+    gateway = FakeGateway()
+    gateway.taxonomy = replace(
+        gateway.taxonomy,
+        tags=(*gateway.taxonomy.tags, TaxonomyItem(11, "AI reviewed")),
+    )
+    _, ingestion, job = await _finalization_services(settings, gateway)
+
+    result = await ingestion.apply_suggestions(
+        job,
+        DocumentUpdate(),
+        expected_modified=gateway.documents[7].modified,
+    )
+
+    assert result is not None
+    assert result.review_tags_finalized
+    assert gateway.tag_changes == [((11,), ())]
+    assert gateway.documents[7].tag_ids == (1, 9, 11)
+
+
+@pytest.mark.asyncio
+async def test_review_finalization_combines_add_and_remove(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(
+        data_dir=tmp_path / "both-tags",
+        ai_review_completion_tag="AI reviewed",
+    )
+    gateway = FakeGateway()
+    gateway.taxonomy = replace(
+        gateway.taxonomy,
+        tags=(*gateway.taxonomy.tags, TaxonomyItem(11, "AI reviewed")),
+    )
+    gateway.documents[7] = replace(gateway.documents[7], tag_ids=(1, 9, 10))
+    _, ingestion, job = await _finalization_services(settings, gateway)
+
+    result = await ingestion.apply_suggestions(
+        job,
+        DocumentUpdate(),
+        expected_modified=gateway.documents[7].modified,
+    )
+
+    assert result is not None
+    assert result.review_tags_finalized
+    assert gateway.tag_changes == [((11,), (10,))]
+    assert gateway.documents[7].tag_ids == (1, 9, 11)
+
+
+@pytest.mark.asyncio
+async def test_review_finalization_audit_omits_tag_names_and_content(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(
+        data_dir=tmp_path / "audit-minimized",
+        ai_review_completion_tag="AI reviewed",
+    )
+    gateway = FakeGateway()
+    gateway.taxonomy = replace(
+        gateway.taxonomy,
+        tags=(*gateway.taxonomy.tags, TaxonomyItem(11, "AI reviewed")),
+    )
+    gateway.documents[7] = replace(gateway.documents[7], tag_ids=(1, 10))
+    _, ingestion, job = await _finalization_services(settings, gateway)
+
+    await ingestion.apply_suggestions(
+        job,
+        DocumentUpdate(title="Private title"),
+        expected_modified=gateway.documents[7].modified,
+    )
+
+    connection = sqlite3.connect(settings.database_path)
+    try:
+        row = connection.execute(
+            """
+            SELECT action, outcome
+            FROM audit_events
+            WHERE action = 'ai_review_tag_finalization'
+            """
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row == ("ai_review_tag_finalization", "finalized")
+    assert "inbox" not in repr(row).casefold()
+    assert "reviewed" not in repr(row).casefold()
+    assert "private title" not in repr(row).casefold()
+
+
+@pytest.mark.asyncio
+async def test_review_finalization_already_complete_is_idempotent_and_verified(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(
+        data_dir=tmp_path / "already-finalized",
+        ai_review_completion_tag="AI reviewed",
+    )
+    gateway = FakeGateway()
+    gateway.taxonomy = replace(
+        gateway.taxonomy,
+        tags=(*gateway.taxonomy.tags, TaxonomyItem(11, "AI reviewed")),
+    )
+    gateway.documents[7] = replace(gateway.documents[7], tag_ids=(1, 9, 11))
+    _, ingestion, job = await _finalization_services(settings, gateway)
+
+    result = await ingestion.apply_suggestions(
+        job,
+        DocumentUpdate(),
+        expected_modified=gateway.documents[7].modified,
+    )
+
+    assert result is not None
+    assert result.review_tags_finalized
+    assert gateway.tag_changes == []
+    assert len(gateway.document_tokens) == 3
+
+
+@pytest.mark.asyncio
+async def test_review_finalization_disabled_completion_only_removes_inbox(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(
+        data_dir=tmp_path / "disabled-completion",
+        ai_review_completion_tag=None,
+    )
+    gateway = FakeGateway()
+    gateway.documents[7] = replace(gateway.documents[7], tag_ids=(1, 10))
+    _, ingestion, job = await _finalization_services(settings, gateway)
+
+    await ingestion.apply_suggestions(
+        job,
+        DocumentUpdate(),
+        expected_modified=gateway.documents[7].modified,
+    )
+
+    assert gateway.tag_changes == [((), (10,))]
+
+
+@pytest.mark.asyncio
+async def test_review_finalization_missing_configured_tag_fails_closed(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / "missing-tag")
+    gateway = FakeGateway()
+    gateway.taxonomy = replace(
+        gateway.taxonomy,
+        tags=tuple(tag for tag in gateway.taxonomy.tags if tag.name != "inbox"),
+    )
+    repository, ingestion, job = await _finalization_services(settings, gateway)
+
+    result = await ingestion.apply_suggestions(
+        job,
+        DocumentUpdate(title="Confirmed"),
+        expected_modified=gateway.documents[7].modified,
+    )
+
+    assert result is not None
+    assert not result.review_tags_finalized
+    assert "missing or ambiguous" in (result.finalization_message or "")
+    assert gateway.documents[7].title == "Confirmed"
+    item = await repository.upload_item_for_job(job.id)
+    assert item is not None
+    assert item.review_finalization_state is ReviewFinalizationState.NEEDS_RECONCILIATION
+
+
+@pytest.mark.asyncio
+async def test_review_finalization_ambiguous_configured_tag_fails_closed(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / "ambiguous-tag")
+    gateway = FakeGateway()
+    gateway.taxonomy = replace(
+        gateway.taxonomy,
+        tags=(*gateway.taxonomy.tags, TaxonomyItem(12, "INBOX")),
+    )
+    _, ingestion, job = await _finalization_services(settings, gateway)
+
+    result = await ingestion.apply_suggestions(
+        job,
+        DocumentUpdate(),
+        expected_modified=gateway.documents[7].modified,
+    )
+
+    assert result is not None
+    assert not result.review_tags_finalized
+    assert gateway.tag_changes == []
+
+
+@pytest.mark.asyncio
+async def test_review_finalization_permission_failure_preserves_metadata(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / "permission-failure")
+    gateway = FakeGateway()
+    gateway.documents[7] = replace(gateway.documents[7], tag_ids=(1, 10))
+    gateway.tag_mutation_error = PaperlessPermissionError("denied")
+    _, ingestion, job = await _finalization_services(settings, gateway)
+
+    result = await ingestion.apply_suggestions(
+        job,
+        DocumentUpdate(title="Confirmed"),
+        expected_modified=gateway.documents[7].modified,
+    )
+
+    assert result is not None
+    assert not result.review_tags_finalized
+    assert "saved the metadata" in (result.finalization_message or "")
+    assert "denied" in (result.finalization_message or "")
+    assert gateway.documents[7].title == "Confirmed"
+
+
+@pytest.mark.asyncio
+async def test_review_finalization_stale_document_never_mutates_tags(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / "stale")
+    gateway = FakeGateway()
+    repository, ingestion, job = await _finalization_services(settings, gateway)
+
+    with pytest.raises(StaleSuggestionError):
+        await ingestion.apply_suggestions(
+            job,
+            DocumentUpdate(),
+            expected_modified=datetime(2025, 1, 1, tzinfo=UTC),
+        )
+
+    assert gateway.tag_changes == []
+    item = await repository.upload_item_for_job(job.id)
+    assert item is not None
+    assert item.review_finalization_state is ReviewFinalizationState.NOT_STARTED
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_tag_mutation_reconciles_without_retry(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / "ambiguous-reconciled")
+    gateway = FakeGateway()
+    gateway.documents[7] = replace(gateway.documents[7], tag_ids=(1, 10))
+    _, ingestion, job = await _finalization_services(settings, gateway)
+    original_modify = gateway.modify_document_tags
+    attempts = 0
+
+    async def applied_then_ambiguous(
+        document_id: int,
+        *,
+        add_tag_ids: tuple[int, ...],
+        remove_tag_ids: tuple[int, ...] = (),
+        token: object = None,
+    ) -> None:
+        nonlocal attempts
+        if not add_tag_ids and not remove_tag_ids:
+            return
+        attempts += 1
+        await original_modify(
+            document_id,
+            add_tag_ids=add_tag_ids,
+            remove_tag_ids=remove_tag_ids,
+            token=token,
+        )
+        raise AmbiguousPaperlessMutationError("unknown")
+
+    gateway.modify_document_tags = applied_then_ambiguous  # type: ignore[method-assign]
+    result = await ingestion.apply_suggestions(
+        job,
+        DocumentUpdate(),
+        expected_modified=gateway.documents[7].modified,
+    )
+
+    assert result is not None
+    assert result.review_tags_finalized
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_tag_mutation_requires_reconciliation_before_retry(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / "ambiguous-unconfirmed")
+    gateway = FakeGateway()
+    gateway.documents[7] = replace(gateway.documents[7], tag_ids=(1, 10))
+    gateway.tag_mutation_error = AmbiguousPaperlessMutationError("unknown")
+    _, ingestion, job = await _finalization_services(settings, gateway)
+
+    result = await ingestion.apply_suggestions(
+        job,
+        DocumentUpdate(),
+        expected_modified=gateway.documents[7].modified,
+    )
+
+    assert result is not None
+    assert not result.review_tags_finalized
+    assert "Reconcile" in (result.finalization_message or "")
+    assert len(gateway.tag_tokens) == 1
+
+
+@pytest.mark.asyncio
+async def test_review_finalization_verification_mismatch_fails_closed(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / "verification-mismatch")
+    gateway = FakeGateway()
+    gateway.documents[7] = replace(gateway.documents[7], tag_ids=(1, 10))
+    gateway.ignore_tag_changes = True
+    _, ingestion, job = await _finalization_services(settings, gateway)
+
+    result = await ingestion.apply_suggestions(
+        job,
+        DocumentUpdate(),
+        expected_modified=gateway.documents[7].modified,
+    )
+
+    assert result is not None
+    assert not result.review_tags_finalized
+    assert "did not confirm" in (result.finalization_message or "")
+
+
+@pytest.mark.asyncio
+async def test_review_finalization_revoked_credential_never_uses_system_token(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / "revoked")
+    gateway = FakeGateway()
+    _, ingestion, job = await _finalization_services(
+        settings,
+        gateway,
+        credentials=_Credentials(None),
+    )
+
+    with pytest.raises(UnlinkedUserError):
+        await ingestion.apply_suggestions(
+            job,
+            DocumentUpdate(),
+            expected_modified=gateway.documents[7].modified,
+        )
+
+    assert gateway.document_tokens == []
+    assert gateway.tag_tokens == []
+
+
+@pytest.mark.asyncio
+async def test_review_finalization_missing_credential_store_never_uses_system_token(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / "missing-credential-store")
+    gateway = FakeGateway()
+    _, ingestion, job = await _finalization_services(settings, gateway)
+    ingestion._credentials = None
+
+    with pytest.raises(UnlinkedUserError):
+        await ingestion.apply_suggestions(
+            job,
+            DocumentUpdate(),
+            expected_modified=gateway.documents[7].modified,
+        )
+
+    assert gateway.document_tokens == []
+    assert gateway.tag_tokens == []
+
+
+@pytest.mark.asyncio
+async def test_review_finalization_rejected_credential_reports_metadata_saved(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / "rejected-after-save")
+    gateway = FakeGateway()
+    _, ingestion, job = await _finalization_services(settings, gateway)
+    gateway.get_taxonomy = AsyncMock(  # type: ignore[method-assign]
+        side_effect=PaperlessAuthenticationError("revoked")
+    )
+
+    result = await ingestion.apply_suggestions(
+        job,
+        DocumentUpdate(title="Confirmed"),
+        expected_modified=gateway.documents[7].modified,
+    )
+
+    assert result is not None
+    assert not result.review_tags_finalized
+    assert "saved the metadata" in (result.finalization_message or "")
+    assert "Relink" in (result.finalization_message or "")
+
+
+@pytest.mark.asyncio
+async def test_review_cleanup_gate_opens_only_after_success_notification(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / "cleanup-gate")
+    gateway = FakeGateway()
+    gateway.documents[7] = replace(gateway.documents[7], tag_ids=(1, 10))
+    repository, ingestion, job = await _finalization_services(settings, gateway)
+    gateway.doc_tags[7] = (1,)
+
+    result = await ingestion.apply_suggestions(
+        job,
+        DocumentUpdate(),
+        expected_modified=gateway.documents[7].modified,
+    )
+    before_notification = await ingestion.check_inbox_upload_closures()
+    await ingestion.mark_review_finalization_notified(job)
+    after_notification = await ingestion.check_inbox_upload_closures()
+
+    assert result is not None
+    assert result.review_tags_finalized
+    assert before_notification == ((), ())
+    assert tuple(item.document_id for item in after_notification[0]) == (DocumentId(7),)
+    assert after_notification[1] == (
+        DiscordMessageTarget(102, 903),
+        DiscordMessageTarget(102, 901),
+    )
+    item = await repository.upload_item_for_job(job.id)
+    assert item is not None
+    assert item.state is UploadItemState.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_cleanup_rechecks_durable_gate_before_closing_stale_candidate(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / "atomic-cleanup-gate")
+    gateway = FakeGateway()
+    repository, ingestion, job = await _finalization_services(settings, gateway)
+    stale_candidate = await repository.upload_item_for_job(job.id)
+    assert stale_candidate is not None
+    assert await repository.set_review_finalization_state(
+        job.id,
+        ReviewFinalizationState.PENDING_NOTIFICATION,
+    )
+    repository.active_upload_items = AsyncMock(  # type: ignore[method-assign]
+        return_value=(stale_candidate,)
+    )
+    gateway.doc_tags[7] = (1,)
+
+    assert await ingestion.check_inbox_upload_closures() == ((), ())
+    current = await repository.upload_item_for_job(job.id)
+    assert current is not None
+    assert current.state is UploadItemState.SUCCEEDED
+
+
+@pytest.mark.asyncio
+async def test_metadata_verification_failure_resets_cleanup_gate(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / "metadata-unconfirmed")
+    gateway = FakeGateway()
+    gateway.skip_update = True
+    repository, ingestion, job = await _finalization_services(settings, gateway)
+
+    with pytest.raises(PaperlessUnavailableError, match="did not confirm"):
+        await ingestion.apply_suggestions(
+            job,
+            DocumentUpdate(title="Not applied"),
+            expected_modified=gateway.documents[7].modified,
+        )
+
+    item = await repository.upload_item_for_job(job.id)
+    assert item is not None
+    assert item.review_finalization_state is ReviewFinalizationState.NOT_STARTED
+
+
+@pytest.mark.asyncio
+async def test_untracked_metadata_failure_preserves_original_error(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / "untracked-metadata-failure")
+    gateway = FakeGateway()
+    gateway.skip_update = True
+    repository = SQLiteRepository(settings.database_path, lease_seconds=60)
+    await repository.initialize()
+    taxonomy = TaxonomyCache(settings, gateway)
+    await taxonomy.refresh()
+    ingestion = IngestionService(
+        settings,
+        gateway,
+        repository,
+        repository,
+        taxonomy,
+        credentials=_Credentials(),
+    )
+
+    with pytest.raises(PaperlessUnavailableError, match="did not confirm"):
+        await ingestion.apply_suggestions(
+            _review_job(),
+            DocumentUpdate(title="Not applied"),
+            expected_modified=gateway.documents[7].modified,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "message_fragment"),
+    [
+        (PaperlessPermissionError("denied"), "visibility and permissions"),
+        (PaperlessUnavailableError("offline"), "could not load"),
+    ],
+)
+async def test_review_finalization_taxonomy_read_failure_is_actionable(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+    error: Exception,
+    message_fragment: str,
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / type(error).__name__)
+    gateway = FakeGateway()
+    _, ingestion, job = await _finalization_services(settings, gateway)
+    gateway.get_taxonomy = AsyncMock(side_effect=error)  # type: ignore[method-assign]
+
+    result = await ingestion.apply_suggestions(
+        job,
+        DocumentUpdate(),
+        expected_modified=gateway.documents[7].modified,
+    )
+
+    assert result is not None
+    assert not result.review_tags_finalized
+    assert message_fragment in (result.finalization_message or "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "message_fragment"),
+    [
+        (PaperlessAuthenticationError("revoked"), "Relink"),
+        (PaperlessUnavailableError("offline"), "No automatic retry"),
+    ],
+)
+async def test_review_finalization_definite_mutation_failure_is_actionable(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+    error: Exception,
+    message_fragment: str,
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / type(error).__name__)
+    gateway = FakeGateway()
+    gateway.documents[7] = replace(gateway.documents[7], tag_ids=(1, 10))
+    gateway.tag_mutation_error = error
+    _, ingestion, job = await _finalization_services(settings, gateway)
+
+    result = await ingestion.apply_suggestions(
+        job,
+        DocumentUpdate(),
+        expected_modified=gateway.documents[7].modified,
+    )
+
+    assert result is not None
+    assert not result.review_tags_finalized
+    assert message_fragment in (result.finalization_message or "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "message_fragment"),
+    [
+        (PaperlessAuthenticationError("revoked"), "Relink"),
+        (PaperlessPermissionError("denied"), "document permissions"),
+        (PaperlessUnavailableError("offline"), "could not be verified"),
+    ],
+)
+async def test_review_finalization_verification_read_failure_is_actionable(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+    error: Exception,
+    message_fragment: str,
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / type(error).__name__)
+    gateway = FakeGateway()
+    _, ingestion, job = await _finalization_services(settings, gateway)
+    original_get_document = gateway.get_document
+    call_count = 0
+
+    async def fail_final_verification(
+        document_id: int,
+        *,
+        token: object = None,
+    ) -> Document:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 3:
+            raise error
+        return await original_get_document(document_id, token=token)
+
+    gateway.get_document = fail_final_verification  # type: ignore[method-assign]
+    result = await ingestion.apply_suggestions(
+        job,
+        DocumentUpdate(),
+        expected_modified=gateway.documents[7].modified,
+    )
+
+    assert result is not None
+    assert not result.review_tags_finalized
+    assert message_fragment in (result.finalization_message or "")
+
+
+@pytest.mark.asyncio
+async def test_untracked_review_finalization_failure_still_fails_closed(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / "legacy-no-gate")
+    gateway = FakeGateway()
+    gateway.taxonomy = Taxonomy((TaxonomyItem(1, "Discord"),), (), ())
+    repository = SQLiteRepository(settings.database_path, lease_seconds=60)
+    await repository.initialize()
+    taxonomy = TaxonomyCache(settings, gateway)
+    await taxonomy.refresh()
+    ingestion = IngestionService(
+        settings,
+        gateway,
+        repository,
+        repository,
+        taxonomy,
+        credentials=_Credentials(),
+    )
+    job = _review_job()
+
+    result = await ingestion.apply_suggestions(
+        job,
+        DocumentUpdate(),
+        expected_modified=gateway.documents[7].modified,
+    )
+
+    assert result is not None
+    assert not result.review_tags_finalized
+    assert await repository.upload_item_for_job(job.id) is None
 
 
 @pytest.mark.asyncio
