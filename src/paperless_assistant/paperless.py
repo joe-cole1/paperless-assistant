@@ -324,6 +324,38 @@ class HttpPaperlessGateway:
             raise PaperlessUnavailableError("malformed search response")
         return tuple(_document(item) for item in results[: min(limit, 3)])
 
+    async def find_similar_documents(
+        self,
+        document_id: int,
+        limit: int = 3,
+        *,
+        token: SecretStr | None = None,
+    ) -> tuple[Document, ...]:
+        """Return a bounded native ``more_like_id`` search without the source document."""
+        bounded_limit = min(max(limit, 0), 3)
+        try:
+            response = await self._client.get(
+                "api/documents/",
+                params={"more_like_id": document_id, "page_size": 4},
+                headers=self._headers(token),
+            )
+        except httpx.HTTPError as error:
+            raise PaperlessUnavailableError("Paperless similar search unavailable") from error
+        await self._raise_status(response)
+        try:
+            payload = response.json()
+            results = payload["results"]
+        except (KeyError, TypeError, ValueError) as error:
+            raise PaperlessUnavailableError("malformed similar search response") from error
+        if not isinstance(results, list):
+            raise PaperlessUnavailableError("malformed similar search response")
+        documents = (
+            document
+            for document in (_document(item) for item in results)
+            if int(document.id) != document_id
+        )
+        return tuple(documents)[:bounded_limit]
+
     async def get_document(self, document_id: int, *, token: SecretStr | None = None) -> Document:
         """Fetch current visible metadata for a referenced document."""
         try:

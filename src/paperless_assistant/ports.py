@@ -47,6 +47,14 @@ class PaperlessGateway(Protocol):
         self, query: str, limit: int = 3, *, token: SecretStr | None = None
     ) -> tuple[Document, ...]: ...
 
+    async def find_similar_documents(
+        self,
+        document_id: int,
+        limit: int = 3,
+        *,
+        token: SecretStr | None = None,
+    ) -> tuple[Document, ...]: ...
+
     async def get_document(
         self, document_id: int, *, token: SecretStr | None = None
     ) -> Document: ...

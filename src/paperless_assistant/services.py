@@ -182,6 +182,55 @@ class QueryService:
         """Read one user's unexpired ordinal context."""
         return await self._repository.get_context(principal_id)
 
+    async def find_similar(
+        self,
+        principal_id: int,
+        document_id: int,
+        *,
+        context_id: int | None = None,
+    ) -> QueryResponse:
+        """Find native Paperless matches for one visible source document."""
+        user_token = (
+            await self._credentials.get_user_token(principal_id)
+            if self._credentials is not None
+            else None
+        )
+        if self._credentials is not None and user_token is None:
+            raise UnlinkedUserError("Paperless account is not linked")
+        await self._rate.acquire(principal_id)
+        correlation_id = uuid4()
+        async with self._semaphore:
+            documents = await self._gateway.find_similar_documents(
+                document_id,
+                3,
+                token=user_token,
+            )
+        target_context_id = context_id if context_id is not None else principal_id
+        if documents:
+            await self._repository.save_context(
+                ReferenceContext(
+                    principal_id=target_context_id,
+                    document_ids=tuple(document.id for document in documents),
+                    expires_at=_now() + self._settings.context_ttl,
+                )
+            )
+        outcome = "found" if documents else "empty"
+        await self._audit.record(
+            AuditEvent(
+                principal_id=principal_id,
+                action="similar_search",
+                outcome=outcome,
+                occurred_at=_now(),
+                correlation_id=correlation_id,
+            )
+        )
+        answer = (
+            f"Documents similar to Paperless document #{document_id}:"
+            if documents
+            else f"No similar documents were found for Paperless document #{document_id}."
+        )
+        return QueryResponse(answer, documents, False, correlation_id)
+
     async def save_rendered_context(
         self,
         principal_id: int,

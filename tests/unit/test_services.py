@@ -61,6 +61,10 @@ class FakeGateway:
         self.chat_result = ChatResult("Native answer", (DocumentId(7),))
         self.chat_error = False
         self.search = (Document(DocumentId(8), "Search result", date(2024, 1, 1)),)
+        self.similar: tuple[Document, ...] = (
+            Document(DocumentId(9), "Similar result", date(2024, 1, 2)),
+        )
+        self.last_similar: tuple[int, int, object] | None = None
         self.documents = {
             7: Document(
                 DocumentId(7),
@@ -205,6 +209,16 @@ class FakeGateway:
         assert query
         return self.search[:limit]
 
+    async def find_similar_documents(
+        self,
+        document_id: int,
+        limit: int = 3,
+        *,
+        token: object = None,
+    ) -> tuple[Document, ...]:
+        self.last_similar = (document_id, limit, token)
+        return self.similar[:limit]
+
     async def get_document(self, document_id: int, *, token: object = None) -> Document:
         return self.documents[document_id]
 
@@ -320,6 +334,82 @@ async def test_query_native_context_and_search_fallback(
     empty = await query.ask(204, "answer without references")
     assert empty.documents == ()
     assert await query.context(204) is None
+
+
+@pytest.mark.asyncio
+async def test_query_similar_uses_linked_token_context_and_audit(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory()
+    gateway = FakeGateway()
+    repository = SQLiteRepository(settings.database_path, lease_seconds=60)
+    await repository.initialize()
+
+    class FakeCredentials:
+        async def get_user_token(self, principal_id: int) -> str | None:
+            assert principal_id == 201
+            return "linked-user-token"
+
+    query = QueryService(
+        settings,
+        gateway,
+        repository,
+        repository,
+        credentials=FakeCredentials(),  # type: ignore[arg-type]
+    )
+
+    response = await query.find_similar(201, 7, context_id=5001)
+    context = await query.context(5001)
+
+    assert response.documents == gateway.similar
+    assert response.answer == "Documents similar to Paperless document #7:"
+    assert gateway.last_similar == (7, 3, "linked-user-token")
+    assert context is not None
+    assert context.document_ids == (DocumentId(9),)
+    assert [action async for action in repository.actions()] == ["similar_search"]
+
+
+@pytest.mark.asyncio
+async def test_query_similar_empty(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory()
+    gateway = FakeGateway()
+    gateway.similar = ()
+    repository = SQLiteRepository(settings.database_path, lease_seconds=60)
+    await repository.initialize()
+    query = QueryService(settings, gateway, repository, repository)
+
+    response = await query.find_similar(201, 7)
+
+    assert response.documents == ()
+    assert response.answer == "No similar documents were found for Paperless document #7."
+    assert await query.context(201) is None
+
+
+@pytest.mark.asyncio
+async def test_query_similar_rejects_unlinked_user(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory()
+    gateway = FakeGateway()
+    repository = SQLiteRepository(settings.database_path, lease_seconds=60)
+    await repository.initialize()
+
+    class MissingCredentials:
+        async def get_user_token(self, principal_id: int) -> None:
+            assert principal_id == 201
+
+    linked_query = QueryService(
+        settings,
+        gateway,
+        repository,
+        repository,
+        credentials=MissingCredentials(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(UnlinkedUserError):
+        await linked_query.find_similar(201, 7)
 
 
 @pytest.mark.asyncio

@@ -212,6 +212,90 @@ async def test_chat_search_documents_and_urls(
 
 
 @pytest.mark.asyncio
+async def test_find_similar_documents_uses_user_token_and_bounds_results(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/documents/"
+        assert dict(request.url.params) == {"more_like_id": "7", "page_size": "4"}
+        assert request.headers["Authorization"] == "Token linked-user-token"
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"id": 7, "title": "Source"},
+                    {"id": 8, "title": "First"},
+                    {"id": 9, "title": "Second"},
+                    {"id": 10, "title": "Third"},
+                ]
+            },
+        )
+
+    documents = await _gateway(settings_factory, handler).find_similar_documents(
+        7,
+        token=SecretStr("linked-user-token"),
+    )
+    empty = await _gateway(settings_factory, handler).find_similar_documents(
+        7,
+        limit=0,
+        token=SecretStr("linked-user-token"),
+    )
+    bounded = await _gateway(settings_factory, handler).find_similar_documents(
+        7,
+        limit=99,
+        token=SecretStr("linked-user-token"),
+    )
+
+    assert tuple(int(document.id) for document in documents) == (8, 9, 10)
+    assert empty == ()
+    assert tuple(int(document.id) for document in bounded) == (8, 9, 10)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [403, 404])
+async def test_find_similar_documents_handles_denied_or_missing_source(
+    settings_factory: Callable[..., Settings],
+    status_code: int,
+) -> None:
+    gateway = _gateway(
+        settings_factory,
+        lambda _: httpx.Response(status_code, text="sensitive upstream detail"),
+    )
+
+    with pytest.raises(PaperlessUnavailableError):
+        await gateway.find_similar_documents(7)
+
+
+@pytest.mark.asyncio
+async def test_find_similar_documents_rejects_transport_failure(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    def transport_error(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadError("synthetic", request=request)
+
+    unavailable = _gateway(settings_factory, transport_error)
+    with pytest.raises(PaperlessUnavailableError, match="unavailable"):
+        await unavailable.find_similar_documents(7)
+
+
+@pytest.mark.asyncio
+async def test_find_similar_documents_rejects_malformed_responses(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    responses = iter(
+        [
+            httpx.Response(200, json={}),
+            httpx.Response(200, json={"results": {}}),
+        ]
+    )
+    malformed = _gateway(settings_factory, lambda _: next(responses))
+    with pytest.raises(PaperlessUnavailableError, match="malformed"):
+        await malformed.find_similar_documents(7)
+    with pytest.raises(PaperlessUnavailableError, match="malformed"):
+        await malformed.find_similar_documents(7)
+
+
+@pytest.mark.asyncio
 async def test_taxonomy_pagination(settings_factory: Callable[..., Settings]) -> None:
     calls: list[str] = []
 
