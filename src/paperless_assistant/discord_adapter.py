@@ -71,6 +71,10 @@ _REVIEW_SURFACE_PREFIXES = (
     "Recovered document review.",
     "AI suggestions are unavailable.",
 )
+_DUPLICATE_UPLOAD_MESSAGE = (
+    "Paperless identified a duplicate. Check/empty Paperless trash or upload a genuinely "
+    "different file."
+)
 
 
 def _is_delivery_request(content: str) -> bool:
@@ -2732,6 +2736,27 @@ class DiscordAssistant(discord.Client):
         bounded_status = status if len(status) <= 105 else f"{status[:104]}…"
         return f"{ordinal}. `{safe_filename}` — {bounded_status}"
 
+    def _recovered_upload_summary(self, snapshot: UploadBatchSnapshot) -> str:
+        statuses = {
+            UploadItemState.PENDING: "waiting to process…",
+            UploadItemState.PROCESSING: "processing in Paperless…",
+            UploadItemState.SUCCEEDED: "upload succeeded; review ready.",
+            UploadItemState.FAILED: "Paperless processing failed.",
+            UploadItemState.RECONCILIATION_REQUIRED: (
+                "The Paperless upload outcome is uncertain; recovery will not resubmit it."
+            ),
+            UploadItemState.CLOSED: "review closed.",
+            UploadItemState.DISMISSED: "failed upload dismissed.",
+        }
+        return "\n".join(
+            self._upload_summary_line(
+                item.ordinal,
+                item.original_filename,
+                item.failure_reason or statuses[item.state],
+            )
+            for item in snapshot.items
+        )
+
     def _upload_parent_channel(self, message: discord.Message) -> Any:
         if isinstance(message.channel, discord.Thread):
             return getattr(message.channel, "parent", None)
@@ -3367,7 +3392,11 @@ class DiscordAssistant(discord.Client):
                     state=UploadItemState.RECONCILIATION_REQUIRED,
                 )
             else:
-                reason = "Paperless rejected the upload."
+                reason = (
+                    _DUPLICATE_UPLOAD_MESSAGE
+                    if outcome.job.duplicate_confirmed
+                    else "Paperless rejected the upload."
+                )
                 results[index] = self._upload_summary_line(
                     index,
                     job.original_filename,
@@ -3444,9 +3473,13 @@ class DiscordAssistant(discord.Client):
                 )
             else:
                 reason = (
-                    "Processing failed. Verify Paperless Tika/Gotenberg and Office upload."
-                    if job.office_dependent
-                    else "Paperless processing failed."
+                    _DUPLICATE_UPLOAD_MESSAGE
+                    if recovered.job.duplicate_confirmed
+                    else (
+                        "Processing failed. Verify Paperless Tika/Gotenberg and Office upload."
+                        if job.office_dependent
+                        else "Paperless processing failed."
+                    )
                 )
                 results[index] = self._upload_summary_line(
                     index,
@@ -3573,6 +3606,8 @@ class DiscordAssistant(discord.Client):
         self,
         snapshot: UploadBatchSnapshot | None,
         controller: _UploadBatchController,
+        *,
+        refresh_content: bool = False,
     ) -> None:
         if snapshot is None:
             return
@@ -3580,11 +3615,14 @@ class DiscordAssistant(discord.Client):
         if not isinstance(channel, discord.TextChannel):
             return
         summary = channel.get_partial_message(snapshot.batch.summary_message_id)
+        edit_kwargs: dict[str, Any] = {
+            "view": controller.build_view(),
+            "allowed_mentions": NO_MENTIONS,
+        }
+        if refresh_content:
+            edit_kwargs["content"] = self._recovered_upload_summary(snapshot)
         with suppress(discord.HTTPException):
-            await summary.edit(
-                view=controller.build_view(),
-                allowed_mentions=NO_MENTIONS,
-            )
+            await summary.edit(**edit_kwargs)
 
     async def _notify_recovery(self, outcome: IngestionOutcome) -> None:
         item_lookup = getattr(self._ingestion, "upload_item_for_job", None)
@@ -3613,12 +3651,19 @@ class DiscordAssistant(discord.Client):
                 "Check Paperless before retrying."
             )
         elif outcome.job.state == JobState.FAILED and outcome.job.office_dependent:
-            content = (
-                f"Recovered ingestion job `{outcome.job.id}`: processing failed. "
-                "Verify Paperless Tika/Gotenberg and the Office-upload flag."
-            )
+            if outcome.job.duplicate_confirmed:
+                content = f"Recovered ingestion job `{outcome.job.id}`: {_DUPLICATE_UPLOAD_MESSAGE}"
+            else:
+                content = (
+                    f"Recovered ingestion job `{outcome.job.id}`: processing failed. "
+                    "Verify Paperless Tika/Gotenberg and the Office-upload flag."
+                )
         elif outcome.job.state == JobState.FAILED:
-            content = f"Recovered ingestion job `{outcome.job.id}`: processing failed."
+            content = (
+                f"Recovered ingestion job `{outcome.job.id}`: {_DUPLICATE_UPLOAD_MESSAGE}"
+                if outcome.job.duplicate_confirmed
+                else f"Recovered ingestion job `{outcome.job.id}`: processing failed."
+            )
         else:
             content = f"Recovered ingestion job `{outcome.job.id}`: {state}."
         await channel.send(
@@ -3770,7 +3815,11 @@ class DiscordAssistant(discord.Client):
         detail = (
             "The upload outcome remains uncertain; inspect Paperless before retrying."
             if state is UploadItemState.RECONCILIATION_REQUIRED
-            else "Paperless processing failed."
+            else (
+                _DUPLICATE_UPLOAD_MESSAGE
+                if outcome.job.duplicate_confirmed
+                else "Paperless processing failed."
+            )
         )
         await self._render_non_success_upload_item(
             item=item,
@@ -3880,7 +3929,7 @@ class DiscordAssistant(discord.Client):
             detail,
             view,
         )
-        await self._ingestion.update_upload_item(
+        updated_batch = await self._ingestion.update_upload_item(
             item.source_message_id,
             item.attachment_id,
             state,
@@ -3891,7 +3940,11 @@ class DiscordAssistant(discord.Client):
             controls_message_id=controls_message.id,
             failure_reason=detail,
         )
-        await self._restore_batch_summary(batch, batch_controller)
+        await self._restore_batch_summary(
+            updated_batch,
+            batch_controller,
+            refresh_content=detail == _DUPLICATE_UPLOAD_MESSAGE,
+        )
         self._restored_upload_items.add((item.source_message_id, item.attachment_id))
 
     async def _flush_recovery_notifications(self) -> None:

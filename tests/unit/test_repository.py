@@ -78,6 +78,10 @@ async def test_initialize_migrates_status_message_column(tmp_path: Path) -> None
             "    discord_status_message_cleaned INTEGER NOT NULL DEFAULT 0,\n",
             "",
         )
+        legacy_schema = legacy_schema.replace(
+            "    duplicate_confirmed INTEGER NOT NULL DEFAULT 0,\n",
+            "",
+        )
         legacy_schema = legacy_schema.replace("    channel_id INTEGER,\n", "")
         for column in (
             "    title_message_id INTEGER,\n",
@@ -105,6 +109,7 @@ async def test_initialize_migrates_status_message_column(tmp_path: Path) -> None
     assert "discord_status_channel_id" in columns
     assert "discord_message_cleaned" in columns
     assert "discord_status_message_cleaned" in columns
+    assert "duplicate_confirmed" in columns
     connection = sqlite3.connect(database)
     try:
         question_columns = {
@@ -132,6 +137,25 @@ async def test_initialize_migrates_status_message_column(tmp_path: Path) -> None
     assert await repository.get_warning_state() == (90, warning_time)
     await repository.clear_warning_state()
     assert await repository.get_warning_state() is None
+
+
+@pytest.mark.asyncio
+async def test_duplicate_confirmation_round_trips(tmp_path: Path) -> None:
+    repository = SQLiteRepository(tmp_path / "db.sqlite3", lease_seconds=60)
+    await repository.initialize()
+    job = _job(tmp_path / "staged")
+    assert await repository.create_job(job)
+
+    assert await repository.transition_job(
+        job.id,
+        JobState.STAGED,
+        JobState.FAILED,
+        duplicate_confirmed=True,
+    )
+
+    loaded = await repository.get_job(job.id)
+    assert loaded is not None
+    assert loaded.duplicate_confirmed
 
 
 @pytest.mark.asyncio

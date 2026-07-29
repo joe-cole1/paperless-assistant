@@ -34,8 +34,10 @@ Configure two private Discord text channels:
   batch
   summary offers **Refresh All**, **Save All**, and **Close All**; Close All closes successes but
   never acknowledges failures. A failed item must be explicitly dismissed, while an uncertain
-  upload remains unresolved. The original upload and summary are deleted together only after all
-  successes are closed, all failures are dismissed, and no item remains active or uncertain.
+  upload remains unresolved. When Paperless explicitly identifies a duplicate, the failed item
+  explains that the uploader can check/empty Paperless trash or send a genuinely different file.
+  The original upload and summary are deleted together only after all successes are closed, all
+  failures are dismissed, and no item remains active or uncertain.
   Removing `CLEANUP_INBOX_TAG` (default `inbox`) closes the corresponding successful review and
   applies the same batch cleanup rule.
 
@@ -162,7 +164,8 @@ surface by editing its durable control-message IDs. An interrupted ambiguous upl
 `reconciliation_required` and is never automatically repeated. Nightly cleanup and `/clean`
 follow the durable batch graph, retry partially deleted resolved reviews, remove only strictly
 identified bot-owned orphans, and never delete active or reconciliation artifacts.
-Paperless HTTP and task errors remain generic in Discord. Server logs include a bounded,
+Paperless HTTP and task errors remain generic in Discord except for an explicit structured
+duplicate confirmation, which receives fixed privacy-safe guidance. Server logs include a bounded,
 control-character-safe, credential-redacted Paperless diagnostic plus operation and status code;
 they never include authorization headers.
 

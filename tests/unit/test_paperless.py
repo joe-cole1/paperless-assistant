@@ -16,6 +16,7 @@ from pydantic import SecretStr
 from paperless_assistant.config import Settings
 from paperless_assistant.errors import (
     AmbiguousSubmissionError,
+    DuplicateUploadError,
     PaperlessAIConfigurationError,
     PaperlessAIDisabledError,
     PaperlessAITimeoutError,
@@ -36,6 +37,7 @@ from paperless_assistant.models import (
 from paperless_assistant.paperless import (
     CHAT_METADATA_DELIMITER,
     HttpPaperlessGateway,
+    _confirmed_duplicate,
     _document,
     _integer_tuple,
     _operation,
@@ -86,6 +88,10 @@ def test_parse_chat_response_trailer_and_malformed_metadata() -> None:
     assert malformed.answer == "Partial"
     assert malformed.document_ids == ()
     assert parse_chat_response("No trailer").answer == "No trailer"
+
+
+def test_duplicate_marker_rejects_non_mapping_payload() -> None:
+    assert not _confirmed_duplicate(["duplicate_of", 91])
 
 
 def test_document_payload_validation_and_dates() -> None:
@@ -479,9 +485,110 @@ async def test_task_failure_and_legacy_shapes(
     third = await gateway.get_task(uuid4())
 
     assert first.state == TaskState.FAILURE
-    assert first.document_id == DocumentId(9)
+    assert first.document_id is None
+    assert first.duplicate_confirmed
     assert second.state == TaskState.STARTED
     assert third.state == TaskState.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_submit_document_recognizes_structured_duplicate(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    source = tmp_path / "source"
+    source.write_bytes(b"%PDF-1.7")
+    gateway = _gateway(
+        settings_factory,
+        lambda _: httpx.Response(
+            400,
+            json={
+                "result_data": {"duplicate_of": 91},
+                "message": "private upstream title",
+            },
+        ),
+    )
+
+    with pytest.raises(DuplicateUploadError) as raised:
+        await gateway.submit_document(
+            source,
+            "synthetic.pdf",
+            "application/pdf",
+            MetadataGuidance(),
+        )
+
+    assert str(raised.value) == "Paperless confirmed a duplicate upload"
+
+
+@pytest.mark.asyncio
+async def test_submit_document_keeps_ordinary_bad_request_generic(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    source = tmp_path / "source"
+    source.write_bytes(b"%PDF-1.7")
+    gateway = _gateway(
+        settings_factory,
+        lambda _: httpx.Response(
+            400,
+            json={"detail": "duplicate_of=91 private upstream title"},
+        ),
+    )
+
+    with pytest.raises(PaperlessUnavailableError) as raised:
+        await gateway.submit_document(
+            source,
+            "synthetic.pdf",
+            "application/pdf",
+            MetadataGuidance(),
+        )
+
+    assert str(raised.value) == "Paperless request failed"
+
+
+@pytest.mark.asyncio
+async def test_submit_document_keeps_malformed_bad_request_generic(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    source = tmp_path / "source"
+    source.write_bytes(b"%PDF-1.7")
+    gateway = _gateway(
+        settings_factory,
+        lambda _: httpx.Response(400, text='{"duplicate_of":'),
+    )
+
+    with pytest.raises(PaperlessUnavailableError):
+        await gateway.submit_document(
+            source,
+            "synthetic.pdf",
+            "application/pdf",
+            MetadataGuidance(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_task_duplicate_marker_must_be_a_positive_integer(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    gateway = _gateway(
+        settings_factory,
+        _json_response(
+            {
+                "results": [
+                    {
+                        "status": "failure",
+                        "result_data": {"duplicate_of": "private upstream title"},
+                    }
+                ]
+            }
+        ),
+    )
+
+    task = await gateway.get_task(uuid4())
+
+    assert task.state is TaskState.FAILURE
+    assert not task.duplicate_confirmed
 
 
 @pytest.mark.asyncio

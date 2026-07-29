@@ -15,6 +15,7 @@ from paperless_assistant.config import Settings
 from paperless_assistant.errors import (
     AmbiguousSubmissionError,
     ConfigurationUnavailableError,
+    DuplicateUploadError,
     PaperlessUnavailableError,
     RateLimitedError,
     StaleSuggestionError,
@@ -501,6 +502,76 @@ async def test_ingestion_success_note_and_duplicate_event(
 
 
 @pytest.mark.asyncio
+async def test_immediate_duplicate_is_durable_for_recovery(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / "data")
+    settings.staging_dir.mkdir(parents=True)
+    gateway = FakeGateway()
+    _, _, ingestion = await _services(settings, gateway)
+    await ingestion.create_upload_batch(
+        UploadBatch(10, 102, 30, 102, 201, 1),
+        (UploadItem(10, 20, 1, "synthetic.pdf"),),
+    )
+    staged = settings.staging_dir / "duplicate"
+    staged.write_bytes(b"%PDF-1.7")
+    job = await ingestion.stage(
+        discord_message_id=10,
+        discord_attachment_id=20,
+        principal_id=201,
+        staged_path=staged,
+        original_filename="synthetic.pdf",
+        caption="",
+    )
+    assert job is not None
+    gateway.submit_error = DuplicateUploadError("private upstream title")
+
+    outcome = await ingestion.submit(job)
+    recovered = await ingestion.active_upload_outcomes()
+
+    assert outcome.job.state is JobState.FAILED
+    assert outcome.job.duplicate_confirmed
+    assert not staged.exists()
+    assert recovered == (IngestionOutcome(outcome.job),)
+
+
+@pytest.mark.asyncio
+async def test_task_duplicate_does_not_expose_upstream_message(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path / "data")
+    settings.staging_dir.mkdir(parents=True)
+    gateway = FakeGateway()
+    _, _, ingestion = await _services(settings, gateway)
+    staged = settings.staging_dir / "duplicate-task"
+    staged.write_bytes(b"%PDF-1.7")
+    job = await ingestion.stage(
+        discord_message_id=10,
+        discord_attachment_id=20,
+        principal_id=201,
+        staged_path=staged,
+        original_filename="synthetic.pdf",
+        caption="",
+    )
+    assert job is not None
+    submitted = await ingestion.submit(job)
+    sensitive = "private upstream title and document 91"
+    gateway.task = PaperlessTask(
+        gateway.task_id,
+        TaskState.FAILURE,
+        message=sensitive,
+        duplicate_confirmed=True,
+    )
+
+    outcome = await ingestion.poll_once(submitted.job)
+
+    assert outcome.job.duplicate_confirmed
+    assert sensitive not in repr(outcome)
+
+
+@pytest.mark.asyncio
 async def test_ingestion_failures_and_recovery(
     tmp_path: Path,
     settings_factory: Callable[..., Settings],
@@ -534,6 +605,7 @@ async def test_ingestion_failures_and_recovery(
     gateway.submit_error = PaperlessUnavailableError("synthetic")
     outcome = await ingestion.submit(rejected)
     assert outcome.job.state == JobState.FAILED
+    assert not outcome.job.duplicate_confirmed
     assert not rejected.staged_path.exists()
 
     failed_task = await make_job(3)
@@ -544,6 +616,7 @@ async def test_ingestion_failures_and_recovery(
     gateway.task = PaperlessTask(gateway.task_id, TaskState.FAILURE, message="duplicate in trash")
     outcome = await ingestion.poll_once(submitted.job)
     assert outcome.job.state == JobState.FAILED
+    assert not outcome.job.duplicate_confirmed
     assert "paperless_task_failed" in caplog.messages
     diagnostic = next(
         record for record in caplog.records if record.message == "paperless_task_failed"
