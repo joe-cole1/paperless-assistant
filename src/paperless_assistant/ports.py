@@ -174,6 +174,10 @@ class IngestionRepository(Protocol):
         parent_message_id: int | None = None,
         parent_channel_id: int | None = None,
         thread_id: int | None = None,
+        title_message_id: int | None = None,
+        metadata_message_id: int | None = None,
+        actions_message_id: int | None = None,
+        controls_message_id: int | None = None,
         failure_reason: str | None = None,
     ) -> UploadBatchSnapshot: ...
 
@@ -182,6 +186,19 @@ class IngestionRepository(Protocol):
     async def active_upload_items(
         self,
     ) -> tuple[UploadItem, ...]: ...
+
+    async def tracked_upload_items(self) -> tuple[UploadItem, ...]: ...
+
+    async def resolved_upload_items_pending_cleanup(self) -> tuple[UploadItem, ...]: ...
+
+    async def confirm_upload_item_cleanup(
+        self,
+        source_message_id: int,
+        attachment_id: int,
+        *,
+        parent_cleaned: bool,
+        thread_cleaned: bool,
+    ) -> None: ...
 
     async def terminal_upload_cleanup_targets(
         self,

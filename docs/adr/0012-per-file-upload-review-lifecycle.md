@@ -1,6 +1,6 @@
 # ADR 0012: Use durable per-file upload reviews and explicit batch resolution
 
-Status: Accepted
+Status: Accepted; resolved-artifact retention superseded by ADR 0013
 
 Date: 2026-07-28
 
@@ -31,8 +31,8 @@ filename, Paperless ID/link when available, and current and pending title, date,
 document type, storage path, and tags. It never contains OCR text or document content.
 
 Each successful item owns its review controls and **Open Paperless** link. **Save** writes only that
-document and keeps its thread open. **Finish & Close** archives and locks only that thread while
-retaining and updating the rich parent. Terminal failures expose an uploader-only, confirmed
+document and keeps its thread open. ADR 0013 supersedes this record's original decision to archive
+and retain the parent after **Finish & Close**. Terminal failures expose an uploader-only, confirmed
 **Dismiss Failed Upload** action. Reconciliation-required or otherwise uncertain items cannot be
 dismissed or automatically resubmitted.
 
@@ -51,9 +51,9 @@ checks, idempotent creation, audit, and write verification.
 
 The source upload and batch summary are deleted together as soon as every successful item is
 closed, every terminal failure is manually dismissed, and no active or uncertain item remains.
-A dismissed failure is resolved for this predicate. Per-file rich parents and archived threads are
-retained. Cleanup is idempotent and records each shared artifact only after Discord confirms its
-deletion or absence.
+A dismissed failure is resolved for this predicate. ADR 0013 requires resolved per-file parents
+and threads to be deleted as independently confirmed, retryable artifacts. Shared cleanup remains
+idempotent and records each shared artifact only after Discord confirms its deletion or absence.
 
 SQLite stores the batch, ordered items, job/document links, per-file parent/thread identifiers,
 states, failure detail, and shared cleanup confirmations. Recovery rebuilds the appropriate
@@ -69,8 +69,8 @@ active or uncertain batch artifacts.
   checks.
 - Up to ten attachments create additional Discord messages and threads. Creation is serialized,
   names are sanitized and bounded, and progress is reported in the shared summary.
-- Rich parents intentionally retain metadata after closure. Operators must treat the uploads
-  channel as private document metadata.
+- While unresolved, rich parents expose private metadata in the uploads channel. ADR 0013 removes
+  them after closure or dismissal.
 - Existing active shared threads keep their legacy controls; the additive schema applies to new
   batches and recovered jobs linked to it.
 

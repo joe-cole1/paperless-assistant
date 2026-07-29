@@ -99,6 +99,12 @@ CREATE TABLE IF NOT EXISTS upload_items (
     parent_message_id INTEGER,
     parent_channel_id INTEGER,
     thread_id INTEGER,
+    title_message_id INTEGER,
+    metadata_message_id INTEGER,
+    actions_message_id INTEGER,
+    controls_message_id INTEGER,
+    parent_cleaned INTEGER NOT NULL DEFAULT 0,
+    thread_cleaned INTEGER NOT NULL DEFAULT 0,
     failure_reason TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -263,6 +269,20 @@ class SQLiteRepository:
             }
             if "channel_id" not in question_columns:
                 connection.execute("ALTER TABLE question_messages ADD COLUMN channel_id INTEGER")
+            upload_item_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(upload_items)").fetchall()
+            }
+            for name, definition in (
+                ("title_message_id", "INTEGER"),
+                ("metadata_message_id", "INTEGER"),
+                ("actions_message_id", "INTEGER"),
+                ("controls_message_id", "INTEGER"),
+                ("parent_cleaned", "INTEGER NOT NULL DEFAULT 0"),
+                ("thread_cleaned", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if name not in upload_item_columns:
+                    connection.execute(f"ALTER TABLE upload_items ADD COLUMN {name} {definition}")
             connection.commit()
         self._database_path.chmod(0o600)
 
@@ -424,8 +444,10 @@ class SQLiteRepository:
                 INSERT OR IGNORE INTO upload_items(
                     source_message_id, attachment_id, ordinal, original_filename,
                     state, job_id, document_id, parent_message_id, parent_channel_id,
-                    thread_id, failure_reason, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    thread_id, title_message_id, metadata_message_id, actions_message_id,
+                    controls_message_id, parent_cleaned, thread_cleaned, failure_reason,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     (
@@ -439,6 +461,12 @@ class SQLiteRepository:
                         item.parent_message_id,
                         item.parent_channel_id,
                         item.thread_id,
+                        item.title_message_id,
+                        item.metadata_message_id,
+                        item.actions_message_id,
+                        item.controls_message_id,
+                        int(item.parent_cleaned),
+                        int(item.thread_cleaned),
                         item.failure_reason,
                         _iso(item.created_at or now),
                         _iso(item.updated_at or now),
@@ -476,6 +504,12 @@ class SQLiteRepository:
             parent_message_id=row["parent_message_id"],
             parent_channel_id=row["parent_channel_id"],
             thread_id=row["thread_id"],
+            title_message_id=row["title_message_id"],
+            metadata_message_id=row["metadata_message_id"],
+            actions_message_id=row["actions_message_id"],
+            controls_message_id=row["controls_message_id"],
+            parent_cleaned=bool(row["parent_cleaned"]),
+            thread_cleaned=bool(row["thread_cleaned"]),
             failure_reason=row["failure_reason"],
             created_at=_parse_datetime(row["created_at"]),
             updated_at=_parse_datetime(row["updated_at"]),
@@ -514,6 +548,10 @@ class SQLiteRepository:
         parent_message_id: int | None = None,
         parent_channel_id: int | None = None,
         thread_id: int | None = None,
+        title_message_id: int | None = None,
+        metadata_message_id: int | None = None,
+        actions_message_id: int | None = None,
+        controls_message_id: int | None = None,
         failure_reason: str | None = None,
     ) -> UploadBatchSnapshot:
         """Update one item and return the batch snapshot used for cleanup decisions."""
@@ -528,6 +566,10 @@ class SQLiteRepository:
                     parent_message_id = COALESCE(?, parent_message_id),
                     parent_channel_id = COALESCE(?, parent_channel_id),
                     thread_id = COALESCE(?, thread_id),
+                    title_message_id = COALESCE(?, title_message_id),
+                    metadata_message_id = COALESCE(?, metadata_message_id),
+                    actions_message_id = COALESCE(?, actions_message_id),
+                    controls_message_id = COALESCE(?, controls_message_id),
                     failure_reason = COALESCE(?, failure_reason),
                     updated_at = ?
                 WHERE source_message_id = ? AND attachment_id = ?
@@ -539,6 +581,10 @@ class SQLiteRepository:
                     parent_message_id,
                     parent_channel_id,
                     thread_id,
+                    title_message_id,
+                    metadata_message_id,
+                    actions_message_id,
+                    controls_message_id,
                     failure_reason,
                     now,
                     source_message_id,
@@ -578,6 +624,64 @@ class SQLiteRepository:
                 (UploadItemState.CLOSED.value, UploadItemState.DISMISSED.value),
             ).fetchall()
         return tuple(self._upload_item_from_row(row) for row in rows)
+
+    async def tracked_upload_items(self) -> tuple[UploadItem, ...]:
+        """Return every durable per-file Discord artifact for reconciliation."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM upload_items
+                ORDER BY created_at, source_message_id, ordinal
+                """
+            ).fetchall()
+        return tuple(self._upload_item_from_row(row) for row in rows)
+
+    async def resolved_upload_items_pending_cleanup(self) -> tuple[UploadItem, ...]:
+        """Return resolved per-file artifacts whose Discord deletion is unconfirmed."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM upload_items
+                WHERE state IN (?, ?)
+                  AND (
+                    (parent_message_id IS NOT NULL AND parent_cleaned = 0)
+                    OR (thread_id IS NOT NULL AND thread_cleaned = 0)
+                  )
+                ORDER BY created_at, source_message_id, ordinal
+                """,
+                (UploadItemState.CLOSED.value, UploadItemState.DISMISSED.value),
+            ).fetchall()
+        return tuple(self._upload_item_from_row(row) for row in rows)
+
+    async def confirm_upload_item_cleanup(
+        self,
+        source_message_id: int,
+        attachment_id: int,
+        *,
+        parent_cleaned: bool,
+        thread_cleaned: bool,
+    ) -> None:
+        """Record only per-file Discord artifacts confirmed deleted or absent."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE upload_items
+                SET parent_cleaned = CASE WHEN ? THEN 1 ELSE parent_cleaned END,
+                    thread_cleaned = CASE WHEN ? THEN 1 ELSE thread_cleaned END,
+                    updated_at = ?
+                WHERE source_message_id = ? AND attachment_id = ?
+                """,
+                (
+                    int(parent_cleaned),
+                    int(thread_cleaned),
+                    _iso(_utc_now()),
+                    source_message_id,
+                    attachment_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("upload item does not exist")
+            connection.commit()
 
     async def terminal_upload_cleanup_targets(
         self,

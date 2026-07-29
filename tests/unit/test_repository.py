@@ -79,6 +79,15 @@ async def test_initialize_migrates_status_message_column(tmp_path: Path) -> None
             "",
         )
         legacy_schema = legacy_schema.replace("    channel_id INTEGER,\n", "")
+        for column in (
+            "    title_message_id INTEGER,\n",
+            "    metadata_message_id INTEGER,\n",
+            "    actions_message_id INTEGER,\n",
+            "    controls_message_id INTEGER,\n",
+            "    parent_cleaned INTEGER NOT NULL DEFAULT 0,\n",
+            "    thread_cleaned INTEGER NOT NULL DEFAULT 0,\n",
+        ):
+            legacy_schema = legacy_schema.replace(column, "")
         connection.executescript(legacy_schema)
     finally:
         connection.close()
@@ -104,6 +113,19 @@ async def test_initialize_migrates_status_message_column(tmp_path: Path) -> None
     finally:
         connection.close()
     assert "channel_id" in question_columns
+    connection = sqlite3.connect(database)
+    try:
+        upload_columns = {row[1] for row in connection.execute("PRAGMA table_info(upload_items)")}
+    finally:
+        connection.close()
+    assert {
+        "title_message_id",
+        "metadata_message_id",
+        "actions_message_id",
+        "controls_message_id",
+        "parent_cleaned",
+        "thread_cleaned",
+    } <= upload_columns
     assert await repository.get_warning_state() is None
     warning_time = datetime.now(tz=UTC)
     await repository.save_warning_state(90, warning_time)
@@ -382,11 +404,19 @@ async def test_upload_batch_lifecycle_cleanup_and_purge(  # noqa: PLR0915
         parent_message_id=300,
         parent_channel_id=102,
         thread_id=400,
+        title_message_id=401,
+        metadata_message_id=402,
+        actions_message_id=403,
+        controls_message_id=404,
         failure_reason="temporary",
     )
     assert snapshot.items[0].job_id == job.id
     assert snapshot.items[0].document_id == DocumentId(44)
     assert snapshot.items[0].parent_message_id == 300
+    assert snapshot.items[0].title_message_id == 401
+    assert snapshot.items[0].metadata_message_id == 402
+    assert snapshot.items[0].actions_message_id == 403
+    assert snapshot.items[0].controls_message_id == 404
     assert await repository.upload_item_for_job(job.id) == snapshot.items[0]
     assert await repository.upload_item_for_job(uuid4()) is None
     assert {item.attachment_id for item in await repository.active_upload_items()} == {
@@ -435,6 +465,33 @@ async def test_upload_batch_lifecycle_cleanup_and_purge(  # noqa: PLR0915
     resolved = await repository.update_upload_item(100, 12, UploadItemState.DISMISSED)
     assert resolved.cleanup_ready
     assert await repository.active_upload_items() == ()
+    assert len(await repository.tracked_upload_items()) == 2
+    pending_artifacts = await repository.resolved_upload_items_pending_cleanup()
+    assert tuple(item.attachment_id for item in pending_artifacts) == (11,)
+    await repository.confirm_upload_item_cleanup(
+        100,
+        11,
+        parent_cleaned=True,
+        thread_cleaned=False,
+    )
+    assert (await repository.resolved_upload_items_pending_cleanup())[0].parent_cleaned
+    await repository.confirm_upload_item_cleanup(
+        100,
+        11,
+        parent_cleaned=False,
+        thread_cleaned=True,
+    )
+    cleaned_item = (await repository.tracked_upload_items())[0]
+    assert cleaned_item.parent_cleaned
+    assert cleaned_item.thread_cleaned
+    assert await repository.resolved_upload_items_pending_cleanup() == ()
+    with pytest.raises(ValueError, match="does not exist"):
+        await repository.confirm_upload_item_cleanup(
+            100,
+            999,
+            parent_cleaned=True,
+            thread_cleaned=True,
+        )
     assert await repository.terminal_upload_cleanup_targets() == (
         DiscordMessageTarget(102, 200),
         DiscordMessageTarget(102, 100),
