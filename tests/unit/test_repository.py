@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -60,6 +64,124 @@ async def test_single_instance_lease_and_permissions(tmp_path: Path) -> None:
     assert await repository.acquire_instance(second)
     assert (tmp_path / "state").stat().st_mode & 0o777 == 0o700
     assert (tmp_path / "state" / "db.sqlite3").stat().st_mode & 0o777 == 0o600
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_slow_sqlite_operation_does_not_block_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = SQLiteRepository(tmp_path / "db.sqlite3", lease_seconds=60)
+    await repository.initialize()
+    operation_started = threading.Event()
+    release_operation = threading.Event()
+    original_connection = repository._connection
+
+    @contextmanager
+    def delayed_connection() -> Iterator[sqlite3.Connection]:
+        operation_started.set()
+        if not release_operation.wait(timeout=0.5):
+            raise TimeoutError("test did not release SQLite operation")
+        with original_connection() as connection:
+            yield connection
+
+    monkeypatch.setattr(repository, "_connection", delayed_connection)
+    database_call = asyncio.create_task(repository.get_warning_state())
+    await asyncio.sleep(0.02)
+
+    assert operation_started.is_set()
+    assert not database_call.done()
+    release_operation.set()
+    assert await database_call is None
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_repository_calls_use_one_database_thread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = SQLiteRepository(tmp_path / "db.sqlite3", lease_seconds=60)
+    connection_threads: list[int] = []
+    original_connection = repository._connection
+
+    @contextmanager
+    def observed_connection() -> Iterator[sqlite3.Connection]:
+        connection_threads.append(threading.get_ident())
+        with original_connection() as connection:
+            yield connection
+
+    monkeypatch.setattr(repository, "_connection", observed_connection)
+    await repository.initialize()
+    await asyncio.gather(
+        repository.get_warning_state(),
+        repository.save_warning_state(10, datetime.now(tz=UTC)),
+        repository.clear_warning_state(),
+    )
+
+    assert len(connection_threads) == 4
+    assert set(connection_threads) == {connection_threads[0]}
+    assert connection_threads[0] != threading.get_ident()
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_close_drains_queued_operations_and_rejects_new_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = SQLiteRepository(tmp_path / "db.sqlite3", lease_seconds=60)
+    await repository.initialize()
+    operation_started = threading.Event()
+    release_operation = threading.Event()
+    original_connection = repository._connection
+
+    @contextmanager
+    def delayed_connection() -> Iterator[sqlite3.Connection]:
+        operation_started.set()
+        if not release_operation.wait(timeout=0.5):
+            raise TimeoutError("test did not release SQLite operation")
+        with original_connection() as connection:
+            yield connection
+
+    monkeypatch.setattr(repository, "_connection", delayed_connection)
+    first_call = asyncio.create_task(repository.get_warning_state())
+    await asyncio.sleep(0.02)
+    second_call = asyncio.create_task(repository.save_warning_state(10, datetime.now(tz=UTC)))
+    close_call = asyncio.create_task(repository.close())
+    await asyncio.sleep(0.02)
+
+    assert operation_started.is_set()
+    assert not first_call.done()
+    assert not second_call.done()
+    assert not close_call.done()
+    release_operation.set()
+    await asyncio.gather(first_call, second_call, close_call)
+    with pytest.raises(RuntimeError, match="closed"):
+        await repository.get_warning_state()
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_job_transitions_preserve_compare_and_swap(
+    tmp_path: Path,
+) -> None:
+    repository = SQLiteRepository(tmp_path / "db.sqlite3", lease_seconds=60)
+    await repository.initialize()
+    job = _job(tmp_path / "staged")
+    assert await repository.create_job(job)
+
+    transitions = await asyncio.gather(
+        repository.transition_job(job.id, JobState.STAGED, JobState.SUBMITTING),
+        repository.transition_job(job.id, JobState.STAGED, JobState.SUBMITTING),
+    )
+    loaded = await repository.get_job(job.id)
+
+    assert transitions.count(True) == 1
+    assert transitions.count(False) == 1
+    assert loaded is not None
+    assert loaded.state is JobState.SUBMITTING
     await repository.close()
 
 
@@ -348,10 +470,10 @@ async def test_atomic_inbox_close_rejects_disappeared_batch(
         ),
     )
 
-    async def missing_batch(source_message_id: int) -> None:
+    def missing_batch(source_message_id: int) -> None:
         assert source_message_id == 100
 
-    monkeypatch.setattr(repository, "get_upload_batch", missing_batch)
+    monkeypatch.setattr(repository, "_get_upload_batch", missing_batch)
     with pytest.raises(ValueError, match="disappeared"):
         await repository.close_upload_item_if_cleanup_eligible(100, 101)
 
@@ -655,9 +777,9 @@ async def test_upload_batch_lifecycle_cleanup_and_purge(  # noqa: PLR0915
         (UploadItem(101, 13, 1, "three.pdf"),),
     )
 
-    async def missing_batch(_: int) -> None:
+    def missing_batch(_: int) -> None:
         return None
 
-    monkeypatch.setattr(repository, "get_upload_batch", missing_batch)
+    monkeypatch.setattr(repository, "_get_upload_batch", missing_batch)
     with pytest.raises(ValueError, match="disappeared"):
         await repository.update_upload_item(101, 13, UploadItemState.CLOSED)

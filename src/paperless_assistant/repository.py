@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
-from collections.abc import AsyncIterator, Iterator
+from asyncio import sleep as _sleep
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from functools import partial, wraps
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
+from weakref import finalize
 
 from cryptography.fernet import Fernet
 from pydantic import SecretStr
@@ -29,6 +34,22 @@ from paperless_assistant.models import (
     UploadItem,
     UploadItemState,
 )
+
+
+def _database_operation[**P, T](operation: Callable[P, T]) -> Callable[P, Coroutine[Any, Any, T]]:
+    """Run a repository operation on its serialized SQLite worker."""
+
+    @wraps(operation)
+    async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+        repository = cast("SQLiteRepository", args[0])
+        return await repository._run_database(partial(operation, *args, **kwargs))
+
+    return wrapper
+
+
+def _shutdown_executor(executor: ThreadPoolExecutor) -> None:
+    executor.shutdown(wait=False, cancel_futures=True)
+
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -188,8 +209,37 @@ class SQLiteRepository:
         self._database_path = database_path
         self._lease = timedelta(seconds=lease_seconds)
         self._fernet = _fernet_from_secret(encryption_key) if encryption_key else None
+        self._database_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="paperless-assistant-sqlite",
+        )
+        self._accepting_operations = True
+        self._closed = False
+        self._close_lock = asyncio.Lock()
+        self._executor_finalizer = finalize(
+            self,
+            _shutdown_executor,
+            self._database_executor,
+        )
 
-    async def save_user_token(self, principal_id: int, token: SecretStr) -> None:
+    async def _run_database[T](self, operation: Callable[[], T]) -> T:
+        if not self._accepting_operations:
+            raise RuntimeError("SQLite repository is closed")
+        future = self._database_executor.submit(operation)
+        return await self._await_worker(future)
+
+    @staticmethod
+    async def _await_worker[T](future: Future[T]) -> T:
+        while not future.done():  # noqa: ASYNC110
+            await _sleep(0.001)
+        return future.result()
+
+    @staticmethod
+    def _database_barrier() -> None:
+        """Mark the end of all database operations submitted before this call."""
+
+    @_database_operation
+    def save_user_token(self, principal_id: int, token: SecretStr) -> None:
         """Encrypt and persist a Discord user's Paperless API token."""
         if self._fernet is None:
             raise ValueError("encryption key is not configured")
@@ -208,7 +258,8 @@ class SQLiteRepository:
             )
             connection.commit()
 
-    async def get_user_token(self, principal_id: int) -> SecretStr | None:
+    @_database_operation
+    def get_user_token(self, principal_id: int) -> SecretStr | None:
         """Read and decrypt one user's Paperless API token."""
         if self._fernet is None:
             raise ValueError("encryption key is not configured")
@@ -225,7 +276,8 @@ class SQLiteRepository:
         except Exception:
             return None
 
-    async def delete_user_token(self, principal_id: int) -> bool:
+    @_database_operation
+    def delete_user_token(self, principal_id: int) -> bool:
         """Revoke and delete a mapped user credential."""
         with self._connection() as connection:
             cursor = connection.execute(
@@ -245,7 +297,8 @@ class SQLiteRepository:
         finally:
             connection.close()
 
-    async def initialize(self) -> None:
+    @_database_operation
+    def initialize(self) -> None:
         """Create restricted directories and migrate the schema forward."""
         self._database_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._database_path.parent.chmod(0o700)
@@ -300,9 +353,22 @@ class SQLiteRepository:
         self._database_path.chmod(0o600)
 
     async def close(self) -> None:
-        """Connections are operation-scoped, so no shared handle remains."""
+        """Drain queued work and stop the repository's database worker."""
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._accepting_operations = False
+            barrier = self._database_executor.submit(self._database_barrier)
+            await self._await_worker(barrier)
+            self._database_executor.shutdown(
+                wait=True,
+                cancel_futures=False,
+            )
+            self._executor_finalizer.detach()
+            self._closed = True
 
-    async def acquire_instance(self, instance_id: UUID) -> bool:
+    @_database_operation
+    def acquire_instance(self, instance_id: UUID) -> bool:
         """Acquire or refresh the single-worker lease atomically."""
         now = _utc_now()
         stale_before = now - self._lease
@@ -332,7 +398,8 @@ class SQLiteRepository:
             connection.commit()
             return True
 
-    async def release_instance(self, instance_id: UUID) -> None:
+    @_database_operation
+    def release_instance(self, instance_id: UUID) -> None:
         """Release only the caller's lease."""
         with self._connection() as connection:
             connection.execute(
@@ -341,7 +408,8 @@ class SQLiteRepository:
             )
             connection.commit()
 
-    async def create_job(self, job: IngestionJob) -> bool:
+    @_database_operation
+    def create_job(self, job: IngestionJob) -> bool:
         """Create an idempotent job for one Discord attachment event."""
         now = job.created_at or _utc_now()
         guidance = {
@@ -417,14 +485,16 @@ class SQLiteRepository:
             updated_at=_parse_datetime(row["updated_at"]),
         )
 
-    async def get_job(self, job_id: UUID) -> IngestionJob | None:
+    @_database_operation
+    def get_job(self, job_id: UUID) -> IngestionJob | None:
         """Read one job by its opaque application UUID."""
         with self._connection() as connection:
             cursor = connection.execute("SELECT * FROM ingestion_jobs WHERE id = ?", (str(job_id),))
             row = cursor.fetchone()
         return self._job_from_row(row) if row is not None else None
 
-    async def create_upload_batch(self, batch: UploadBatch, items: tuple[UploadItem, ...]) -> None:
+    @_database_operation
+    def create_upload_batch(self, batch: UploadBatch, items: tuple[UploadItem, ...]) -> None:
         """Persist the complete attachment list before ingestion begins."""
         if len(items) != batch.total_items:
             raise ValueError("upload batch item count does not match total_items")
@@ -532,8 +602,7 @@ class SQLiteRepository:
             updated_at=_parse_datetime(row["updated_at"]),
         )
 
-    async def get_upload_batch(self, source_message_id: int) -> UploadBatchSnapshot | None:
-        """Load one durable batch and its items in original attachment order."""
+    def _get_upload_batch(self, source_message_id: int) -> UploadBatchSnapshot | None:
         with self._connection() as connection:
             batch_row = connection.execute(
                 "SELECT * FROM upload_batches WHERE source_message_id = ?",
@@ -554,7 +623,13 @@ class SQLiteRepository:
             tuple(self._upload_item_from_row(row) for row in item_rows),
         )
 
-    async def update_upload_item(  # noqa: PLR0913
+    @_database_operation
+    def get_upload_batch(self, source_message_id: int) -> UploadBatchSnapshot | None:
+        """Load one durable batch and its items in original attachment order."""
+        return self._get_upload_batch(source_message_id)
+
+    @_database_operation
+    def update_upload_item(  # noqa: PLR0913
         self,
         source_message_id: int,
         attachment_id: int,
@@ -615,12 +690,13 @@ class SQLiteRepository:
                 (now, source_message_id),
             )
             connection.commit()
-        snapshot = await self.get_upload_batch(source_message_id)
+        snapshot = self._get_upload_batch(source_message_id)
         if snapshot is None:
             raise ValueError("upload batch disappeared")
         return snapshot
 
-    async def upload_item_for_job(self, job_id: UUID) -> UploadItem | None:
+    @_database_operation
+    def upload_item_for_job(self, job_id: UUID) -> UploadItem | None:
         """Load the batch item linked to one ingestion job."""
         with self._connection() as connection:
             row = connection.execute(
@@ -629,7 +705,8 @@ class SQLiteRepository:
             ).fetchone()
         return self._upload_item_from_row(row) if row is not None else None
 
-    async def set_review_finalization_state(
+    @_database_operation
+    def set_review_finalization_state(
         self,
         job_id: UUID,
         state: ReviewFinalizationState,
@@ -667,7 +744,8 @@ class SQLiteRepository:
             connection.commit()
         return item_cursor.rowcount == 1 or job_cursor.rowcount == 1
 
-    async def close_upload_item_if_cleanup_eligible(
+    @_database_operation
+    def close_upload_item_if_cleanup_eligible(
         self,
         source_message_id: int,
         attachment_id: int,
@@ -703,12 +781,13 @@ class SQLiteRepository:
                 (now, source_message_id),
             )
             connection.commit()
-        snapshot = await self.get_upload_batch(source_message_id)
+        snapshot = self._get_upload_batch(source_message_id)
         if snapshot is None:
             raise ValueError("upload batch disappeared")
         return snapshot
 
-    async def active_upload_items(self) -> tuple[UploadItem, ...]:
+    @_database_operation
+    def active_upload_items(self) -> tuple[UploadItem, ...]:
         """Return non-resolved new-model items for recovery and inbox cleanup."""
         with self._connection() as connection:
             rows = connection.execute(
@@ -721,7 +800,8 @@ class SQLiteRepository:
             ).fetchall()
         return tuple(self._upload_item_from_row(row) for row in rows)
 
-    async def tracked_upload_items(self) -> tuple[UploadItem, ...]:
+    @_database_operation
+    def tracked_upload_items(self) -> tuple[UploadItem, ...]:
         """Return every durable per-file Discord artifact for reconciliation."""
         with self._connection() as connection:
             rows = connection.execute(
@@ -732,7 +812,8 @@ class SQLiteRepository:
             ).fetchall()
         return tuple(self._upload_item_from_row(row) for row in rows)
 
-    async def resolved_upload_items_pending_cleanup(self) -> tuple[UploadItem, ...]:
+    @_database_operation
+    def resolved_upload_items_pending_cleanup(self) -> tuple[UploadItem, ...]:
         """Return resolved per-file artifacts whose Discord deletion is unconfirmed."""
         with self._connection() as connection:
             rows = connection.execute(
@@ -749,7 +830,8 @@ class SQLiteRepository:
             ).fetchall()
         return tuple(self._upload_item_from_row(row) for row in rows)
 
-    async def confirm_upload_item_cleanup(
+    @_database_operation
+    def confirm_upload_item_cleanup(
         self,
         source_message_id: int,
         attachment_id: int,
@@ -779,7 +861,8 @@ class SQLiteRepository:
                 raise ValueError("upload item does not exist")
             connection.commit()
 
-    async def terminal_upload_cleanup_targets(
+    @_database_operation
+    def terminal_upload_cleanup_targets(
         self,
     ) -> tuple[DiscordMessageTarget, ...]:
         """Return shared artifacts only for batches with no uncertain or active item."""
@@ -824,7 +907,8 @@ class SQLiteRepository:
                 )
         return tuple(targets)
 
-    async def transition_job(  # noqa: PLR0913
+    @_database_operation
+    def transition_job(  # noqa: PLR0913
         self,
         job_id: UUID,
         expected: JobState,
@@ -886,7 +970,8 @@ class SQLiteRepository:
             connection.commit()
             return cursor.rowcount == 1
 
-    async def recoverable_jobs(self) -> tuple[IngestionJob, ...]:
+    @_database_operation
+    def recoverable_jobs(self) -> tuple[IngestionJob, ...]:
         """Return jobs safe to resume without repeating an ambiguous POST."""
         with self._connection() as connection:
             cursor = connection.execute(
@@ -904,7 +989,8 @@ class SQLiteRepository:
             rows = cursor.fetchall()
         return tuple(self._job_from_row(row) for row in rows)
 
-    async def save_context(self, context: ReferenceContext) -> None:
+    @_database_operation
+    def save_context(self, context: ReferenceContext) -> None:
         """Replace one user's non-sensitive ordered reference context."""
         with self._connection() as connection:
             connection.execute(
@@ -939,7 +1025,8 @@ class SQLiteRepository:
             )
             connection.commit()
 
-    async def get_context(self, principal_id: int) -> ReferenceContext | None:
+    @_database_operation
+    def get_context(self, principal_id: int) -> ReferenceContext | None:
         """Return active context while retaining cleanup IDs after expiry."""
         with self._connection() as connection:
             cursor = connection.execute(
@@ -958,7 +1045,8 @@ class SQLiteRepository:
             expires_at=expires_at,
         )
 
-    async def record(self, event: AuditEvent) -> None:
+    @_database_operation
+    def record(self, event: AuditEvent) -> None:
         """Persist only explicitly allowlisted audit fields."""
         with self._connection() as connection:
             connection.execute(
@@ -982,7 +1070,8 @@ class SQLiteRepository:
             )
             connection.commit()
 
-    async def cleanup_message_ids(
+    @_database_operation
+    def cleanup_message_ids(
         self, *, context_before: str, succeeded_before: str, failed_before: str
     ) -> tuple[tuple[DiscordMessageTarget, ...], tuple[DiscordMessageTarget, ...]]:
         """Return exact old question and resolved-upload Discord targets."""
@@ -1115,7 +1204,8 @@ class SQLiteRepository:
                     )
         return context_targets, tuple(dict.fromkeys(upload_targets))
 
-    async def confirm_message_cleanup(self, targets: tuple[DiscordMessageTarget, ...]) -> None:
+    @_database_operation
+    def confirm_message_cleanup(self, targets: tuple[DiscordMessageTarget, ...]) -> None:
         """Forget cleanup evidence only after Discord confirms deletion or absence."""
         with self._connection() as connection:
             for target in targets:
@@ -1160,7 +1250,8 @@ class SQLiteRepository:
                 )
             connection.commit()
 
-    async def message_job_states(self, discord_message_id: int) -> tuple[JobState, ...]:
+    @_database_operation
+    def message_job_states(self, discord_message_id: int) -> tuple[JobState, ...]:
         """Return durable attachment states for recovery-time source cleanup."""
         with self._connection() as connection:
             cursor = connection.execute(
@@ -1174,7 +1265,8 @@ class SQLiteRepository:
             rows = cursor.fetchall()
         return tuple(JobState(row["state"]) for row in rows)
 
-    async def active_succeeded_uploads(
+    @_database_operation
+    def active_succeeded_uploads(
         self,
     ) -> tuple[tuple[tuple[DiscordMessageTarget, ...], int], ...]:
         """Return exact active Discord targets grouped by succeeded document."""
@@ -1236,13 +1328,15 @@ class SQLiteRepository:
             results.append((tuple(dict.fromkeys(targets)), int(row["paperless_document_id"])))
         return tuple(results)
 
-    async def protected_staged_paths(self) -> frozenset[Path]:
+    @_database_operation
+    def protected_staged_paths(self) -> frozenset[Path]:
         """Return every job-owned path, including reconciliation evidence."""
         with self._connection() as connection:
             rows = connection.execute("SELECT staged_path FROM ingestion_jobs").fetchall()
         return frozenset(Path(row["staged_path"]) for row in rows)
 
-    async def get_warning_state(self) -> tuple[int, datetime] | None:
+    @_database_operation
+    def get_warning_state(self) -> tuple[int, datetime] | None:
         """Return the persisted missing-tag warning identity and timestamp."""
         with self._connection() as connection:
             row = connection.execute(
@@ -1252,7 +1346,8 @@ class SQLiteRepository:
             return None
         return row["discord_message_id"], _parse_datetime(row["emitted_at"])
 
-    async def save_warning_state(self, message_id: int, emitted_at: datetime) -> None:
+    @_database_operation
+    def save_warning_state(self, message_id: int, emitted_at: datetime) -> None:
         """Persist only the message ID and timestamp needed to bound warnings."""
         with self._connection() as connection:
             connection.execute(
@@ -1267,12 +1362,14 @@ class SQLiteRepository:
             )
             connection.commit()
 
-    async def clear_warning_state(self) -> None:
+    @_database_operation
+    def clear_warning_state(self) -> None:
         """Forget the resolved warning after Discord cleanup."""
         with self._connection() as connection:
             connection.execute("DELETE FROM warning_state WHERE singleton = 1")
             connection.commit()
 
+    @_database_operation
     def _action_names(self) -> tuple[str, ...]:
         with self._connection() as connection:
             cursor = connection.execute("SELECT action FROM audit_events ORDER BY id")
@@ -1281,10 +1378,11 @@ class SQLiteRepository:
 
     async def actions(self) -> AsyncIterator[str]:
         """Yield action names for privacy-focused contract tests."""
-        for action in self._action_names():
+        for action in await self._action_names():
             yield action
 
-    async def purge(
+    @_database_operation
+    def purge(
         self,
         *,
         expired_before: str,
