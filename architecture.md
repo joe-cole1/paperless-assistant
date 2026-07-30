@@ -72,7 +72,8 @@ container-local listener.
   synchronous 3.0.4 AI suggestion trigger, native `more_like_id` search, and bounded diagnostic
   logging;
 - ingestion and audit repositories: durable SQLite implementations tracking exact message/channel
-  cleanup targets and confirmation state;
+  cleanup targets and confirmation state; one dedicated serialized worker keeps all SQLite
+  operations and connection lifetimes off the Discord event loop;
 - delivery adapter: stages and sends Discord files or returns authenticated Paperless links.
 
 Domain and application code do not import Discord or HTTP client implementations.
@@ -151,6 +152,10 @@ missing-tag warning ID/timestamp, per-item review-finalization cleanup gate, enc
 tokens, and privacy-minimized audit. Staged
 files use job UUID names and restrictive permissions.
 
+Each repository instance serializes migrations, queries, and transactions on one dedicated
+database thread. Operation-scoped connections are created and closed on that same thread. Shutdown
+stops new submissions and drains already-queued operations before joining the worker.
+
 The target state machine is:
 
 ```text
@@ -173,6 +178,8 @@ Liveness is independent of Discord, Paperless, or the AI provider. Readiness rep
 the worker can safely serve its configured capabilities. A missing required source tag disables
 ingestion and degrades readiness without disabling search/download. Transient Paperless or AI
 outages return bounded user-facing failures and must not cause destructive restart loops.
+SQLite latency does not run on the Discord event loop, so a busy database cannot directly stall
+heartbeats or unrelated interactions.
 
 ## 10. Deployment
 
@@ -203,6 +210,7 @@ SQLite job/audit state is included according to operator policy.
 - ADR 0013: idempotent per-file rendering and resolved-artifact deletion.
 - ADR 0014: owner-only native Paperless similarity from document results.
 - ADR 0015: confirmed AI review tag finalization and notification-gated cleanup.
+- ADR 0016: serialized SQLite execution off the Discord event loop.
 
 Issue #10 is the canonical Discord MVP. Issue #20 corrects its default storage deployment. Issue
 #65 is the July 2026 hardening and AI-suggestions correction. Issues #44 and #70 complete its
