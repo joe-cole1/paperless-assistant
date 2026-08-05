@@ -19,7 +19,7 @@ classifiers = [
 ]
 dependencies = [
   "anyio>=4.12.1,<5",
-  "cryptography>=49.0.0,<50",
+  "cryptography>=50.0.0,<51",
   "discord.py>=2.6.4,<3",
   "httpx>=0.28.1,<1",
   "pydantic>=2.13.4,<3",
