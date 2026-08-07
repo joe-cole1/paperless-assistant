@@ -4707,3 +4707,55 @@ async def test_bound_review_batch_controls_and_failure_dismissal(  # noqa: PLR09
     checked = AsyncMock(user=SimpleNamespace(id=201))
     await check_button.callback(checked)
     assert "will not be resubmitted" in checked.response.send_message.call_args.args[0]
+
+
+async def test_finish_and_dismiss_suppress_http_exception_on_followup_send() -> None:
+    http_error = discord.HTTPException(
+        cast(Any, SimpleNamespace(status=400, reason="Bad Request")),
+        "Unknown Channel",
+    )
+
+    ingestion = FakeIngestion()
+    await ingestion.create_upload_batch(
+        UploadBatch(1, 102, 50, 102, 201, 1),
+        (UploadItem(1, 2, 1, "test.pdf", state=UploadItemState.SUCCEEDED),),
+    )
+    cleanup = AsyncMock()
+    bound = _ReviewThreadController(
+        201,
+        900,
+        ingestion=cast(Any, ingestion),
+        source_message_id=1,
+        attachment_id=2,
+        thread=cast(discord.Thread, SimpleNamespace()),
+        cleanup_callback=cleanup,
+    )
+    interaction = AsyncMock(user=SimpleNamespace(id=201))
+    interaction.followup.send.side_effect = http_error
+    await bound.finish(interaction)
+    assert bound.closed
+    cleanup.assert_awaited_once()
+
+    failed_ingestion = FakeIngestion()
+    await failed_ingestion.create_upload_batch(
+        UploadBatch(2, 102, 51, 102, 201, 1),
+        (UploadItem(2, 3, 1, "fail.pdf", state=UploadItemState.FAILED),),
+    )
+    failed_cleanup = AsyncMock()
+    failure = _FailedUploadController(
+        principal_id=201,
+        ingestion=cast(Any, failed_ingestion),
+        source_message_id=2,
+        attachment_id=3,
+        parent_message=cast(
+            discord.Message,
+            FakeMessage(channel=FakeChannel(102), content="failed"),
+        ),
+        thread=cast(discord.Thread, SimpleNamespace()),
+        cleanup_callback=failed_cleanup,
+    )
+    failed_interaction = AsyncMock(user=SimpleNamespace(id=201))
+    failed_interaction.followup.send.side_effect = http_error
+    await failure.dismiss(failed_interaction)
+    assert failure.dismissed
+    failed_cleanup.assert_awaited_once()

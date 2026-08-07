@@ -1571,18 +1571,19 @@ class _ReviewThreadController:
                 self.attachment_id,
                 UploadItemState.CLOSED,
             )
+            self.closed = True
+            with suppress(discord.HTTPException):
+                await interaction.followup.send(
+                    "Document review closed.",
+                    ephemeral=True,
+                    allowed_mentions=NO_MENTIONS,
+                )
             if self.cleanup_callback is not None:
                 await self.cleanup_callback(
                     self.source_message_id,
                     self.attachment_id,
                     targets,
                 )
-            self.closed = True
-            await interaction.followup.send(
-                "Document review closed.",
-                ephemeral=True,
-                allowed_mentions=NO_MENTIONS,
-            )
             return
         delete = getattr(interaction.channel, "delete", None)
         if delete is None:
@@ -2004,16 +2005,17 @@ class _FailedUploadController:
             self.attachment_id,
             UploadItemState.DISMISSED,
         )
+        self.dismissed = True
+        with suppress(discord.HTTPException):
+            await interaction.followup.send(
+                "Failed upload dismissed.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
         await self.cleanup_callback(
             self.source_message_id,
             self.attachment_id,
             targets,
-        )
-        self.dismissed = True
-        await interaction.followup.send(
-            "Failed upload dismissed.",
-            ephemeral=True,
-            allowed_mentions=NO_MENTIONS,
         )
 
 
