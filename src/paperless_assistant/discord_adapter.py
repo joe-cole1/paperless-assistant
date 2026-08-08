@@ -81,6 +81,7 @@ _DUPLICATE_UPLOAD_MESSAGE = (
     "different file."
 )
 _SEARCH_PAGE_SIZE = 3
+_SEARCH_CARD_PLACEHOLDER = "\u200b"
 
 
 def _is_delivery_request(content: str) -> bool:
@@ -3123,7 +3124,12 @@ class DiscordAssistant(discord.Client):
                             allowed_mentions=NO_MENTIONS,
                         )
                     else:
-                        await card.edit(content=None, embed=None, view=None)
+                        await card.edit(
+                            content=_SEARCH_CARD_PLACEHOLDER,
+                            embed=None,
+                            view=None,
+                            allowed_mentions=NO_MENTIONS,
+                        )
                 if current_session.navigation_message_id is None:
                     raise ContextUnavailableError("search result controls are unavailable")
                 navigation = await channel.fetch_message(current_session.navigation_message_id)
