@@ -10,12 +10,16 @@ from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
+from cryptography.fernet import Fernet
+from pydantic import SecretStr
 
 from paperless_assistant.models import (
     AuditEvent,
+    ConversationTranscript,
+    ConversationTurn,
     DiscordMessageTarget,
     DocumentId,
     IngestionJob,
@@ -23,6 +27,8 @@ from paperless_assistant.models import (
     MetadataGuidance,
     ReferenceContext,
     ReviewFinalizationState,
+    SearchMode,
+    SearchSession,
     UploadBatch,
     UploadItem,
     UploadItemState,
@@ -45,6 +51,56 @@ def _job(path: Path, *, message_id: int = 10, attachment_id: int = 20) -> Ingest
         office_dependent=False,
         caption="private caption",
         guidance=MetadataGuidance((1, 2), 3, 4),
+    )
+
+
+def _encrypted_repository(database: Path) -> SQLiteRepository:
+    return SQLiteRepository(
+        database,
+        lease_seconds=60,
+        encryption_key=SecretStr(Fernet.generate_key().decode("ascii")),
+    )
+
+
+def _transcript(
+    *, guild_id: int = 1, thread_id: int = 2, expired: bool = False
+) -> ConversationTranscript:
+    expiry = datetime.now(tz=UTC) + timedelta(minutes=5)
+    if expired:
+        expiry = datetime.now(tz=UTC) - timedelta(seconds=1)
+    return ConversationTranscript(
+        guild_id,
+        thread_id,
+        (ConversationTurn("question-marker", "answer-marker"),),
+        expiry,
+    )
+
+
+def _session(
+    *,
+    session_id: UUID | None = None,
+    guild_id: int = 1,
+    thread_id: int = 2,
+    created_at: datetime | None = None,
+    expired: bool = False,
+) -> SearchSession:
+    created = created_at or datetime.now(tz=UTC)
+    expiry = created + timedelta(minutes=5)
+    if expired:
+        expiry = datetime.now(tz=UTC) - timedelta(seconds=1)
+    return SearchSession(
+        session_id if session_id is not None else uuid4(),
+        guild_id,
+        thread_id,
+        3,
+        (DocumentId(9), DocumentId(4)),
+        (101, 102, 103),
+        (DiscordMessageTarget(2, 201), DiscordMessageTarget(2, 202)),
+        104,
+        SearchMode.TITLE,
+        1,
+        created,
+        expiry,
     )
 
 
@@ -102,7 +158,7 @@ async def test_concurrent_repository_calls_use_one_database_thread(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repository = SQLiteRepository(tmp_path / "db.sqlite3", lease_seconds=60)
+    repository = _encrypted_repository(tmp_path / "db.sqlite3")
     connection_threads: list[int] = []
     original_connection = repository._connection
 
@@ -118,9 +174,11 @@ async def test_concurrent_repository_calls_use_one_database_thread(
         repository.get_warning_state(),
         repository.save_warning_state(10, datetime.now(tz=UTC)),
         repository.clear_warning_state(),
+        repository.save_transcript(_transcript()),
+        repository.save_search_session(_session()),
     )
 
-    assert len(connection_threads) == 4
+    assert len(connection_threads) == 6
     assert set(connection_threads) == {connection_threads[0]}
     assert connection_threads[0] != threading.get_ident()
     await repository.close()
@@ -783,3 +841,258 @@ async def test_upload_batch_lifecycle_cleanup_and_purge(  # noqa: PLR0915
     monkeypatch.setattr(repository, "_get_upload_batch", missing_batch)
     with pytest.raises(ValueError, match="disappeared"):
         await repository.update_upload_item(101, 13, UploadItemState.CLOSED)
+
+
+@pytest.mark.asyncio
+async def test_transcript_round_trip_is_encrypted_at_rest(tmp_path: Path) -> None:
+    database = tmp_path / "db.sqlite3"
+    repository = _encrypted_repository(database)
+    await repository.initialize()
+    transcript = _transcript()
+
+    await repository.save_transcript(transcript)
+
+    assert await repository.get_transcript(1, 2) == transcript
+    connection = sqlite3.connect(database)
+    try:
+        encrypted = connection.execute(
+            "SELECT encrypted_turns FROM conversation_transcripts"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert b"question-marker" not in encrypted
+    assert b"answer-marker" not in encrypted
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_transcripts_are_isolated_replaced_and_clear_preserves_session(
+    tmp_path: Path,
+) -> None:
+    repository = _encrypted_repository(tmp_path / "db.sqlite3")
+    await repository.initialize()
+    session = _session()
+    await repository.save_search_session(session)
+    await repository.save_transcript(_transcript())
+    replacement = ConversationTranscript(
+        1,
+        2,
+        (ConversationTurn("replacement-question", "replacement-answer"),),
+        datetime.now(tz=UTC) + timedelta(minutes=5),
+    )
+    await repository.save_transcript(replacement)
+    await repository.save_transcript(_transcript(guild_id=1, thread_id=3))
+
+    assert await repository.get_transcript(1, 2) == replacement
+    assert await repository.get_transcript(1, 3) is not None
+    assert await repository.clear_transcript(1, 2)
+    assert not await repository.clear_transcript(1, 2)
+    assert await repository.get_search_session(session.id) == session
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_transcript_expiry_and_corrupt_values_are_safely_absent(tmp_path: Path) -> None:
+    database = tmp_path / "db.sqlite3"
+    repository = _encrypted_repository(database)
+    await repository.initialize()
+    await repository.save_transcript(_transcript(expired=True))
+    assert await repository.get_transcript(1, 2) is None
+    future = (datetime.now(tz=UTC) + timedelta(minutes=5)).isoformat()
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE conversation_transcripts SET encrypted_turns = ?, expires_at = ?",
+            (b"not-a-token", future),
+        )
+        connection.commit()
+    assert await repository.get_transcript(1, 2) is None
+    assert repository._fernet is not None
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE conversation_transcripts SET encrypted_turns = ?, expires_at = ?",
+            (repository._fernet.encrypt(b"not-json"), future),
+        )
+        connection.commit()
+    assert await repository.get_transcript(1, 2) is None
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE conversation_transcripts SET encrypted_turns = ?, expires_at = ?",
+            (
+                repository._fernet.encrypt(b'{"question":"marker"}'),
+                future,
+            ),
+        )
+        connection.commit()
+    assert await repository.get_transcript(1, 2) is None
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_transcript_with_malformed_encrypted_turn_is_safely_absent(tmp_path: Path) -> None:
+    database = tmp_path / "db.sqlite3"
+    repository = _encrypted_repository(database)
+    await repository.initialize()
+    await repository.save_transcript(_transcript())
+    assert repository._fernet is not None
+    future = (datetime.now(tz=UTC) + timedelta(minutes=5)).isoformat()
+    malformed_turns = b'[{"question":"marker"}]'
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE conversation_transcripts SET encrypted_turns = ?, expires_at = ?",
+            (repository._fernet.encrypt(malformed_turns), future),
+        )
+        connection.commit()
+
+    assert await repository.get_transcript(1, 2) is None
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_transcript_requires_configured_encryption_key(tmp_path: Path) -> None:
+    repository = SQLiteRepository(tmp_path / "db.sqlite3", lease_seconds=60)
+    await repository.initialize()
+
+    with pytest.raises(ValueError, match="encryption key"):
+        await repository.save_transcript(_transcript())
+    with pytest.raises(ValueError, match="encryption key"):
+        await repository.get_transcript(1, 2)
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_search_session_round_trip_and_query_is_not_persisted(tmp_path: Path) -> None:
+    database = tmp_path / "db.sqlite3"
+    repository = SQLiteRepository(database, lease_seconds=60)
+    await repository.initialize()
+    session = _session()
+
+    await repository.save_search_session(session)
+
+    assert await repository.get_search_session(session.id) == session
+    with sqlite3.connect(database) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(search_sessions)")}
+        row = connection.execute("SELECT * FROM search_sessions").fetchone()
+    assert "query" not in columns
+    assert row is not None
+    assert "question-marker" not in repr(tuple(row))
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_search_sessions_select_latest_and_are_isolated(tmp_path: Path) -> None:
+    repository = SQLiteRepository(tmp_path / "db.sqlite3", lease_seconds=60)
+    await repository.initialize()
+    created = datetime.now(tz=UTC)
+    earlier = _session(session_id=UUID(int=1), created_at=created - timedelta(seconds=1))
+    latest = _session(session_id=UUID(int=2), created_at=created)
+    other = _session(guild_id=9, thread_id=9)
+    await repository.save_search_session(earlier)
+    await repository.save_search_session(latest)
+    await repository.save_search_session(other)
+
+    assert await repository.latest_search_session(1, 2) == latest
+    assert await repository.latest_search_session(9, 9) == other
+    assert await repository.latest_search_session(1, 9) is None
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_search_session_page_update_rejects_invalid_and_expired_state(tmp_path: Path) -> None:
+    repository = SQLiteRepository(tmp_path / "db.sqlite3", lease_seconds=60)
+    await repository.initialize()
+    session = _session()
+    await repository.save_search_session(session)
+
+    updated = await repository.set_search_session_page(session.id, 2)
+
+    assert updated is not None
+    assert updated.page == 2
+    with pytest.raises(ValueError, match="non-negative"):
+        await repository.set_search_session_page(session.id, -1)
+    assert await repository.set_search_session_page(uuid4(), 0) is None
+    expired = _session(expired=True)
+    await repository.save_search_session(expired)
+    assert await repository.get_search_session(expired.id) is None
+    assert await repository.set_search_session_page(expired.id, 0) is None
+    await repository.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("statement", "value"),
+    [
+        ("UPDATE search_sessions SET mode = ?", "unknown"),
+        ("UPDATE search_sessions SET document_ids_json = ?", "not-json"),
+        ("UPDATE search_sessions SET card_message_ids_json = ?", "[true]"),
+        (
+            "UPDATE search_sessions SET cleanup_targets_json = ?",
+            '[{"channel_id":true,"message_id":2}]',
+        ),
+        ("UPDATE search_sessions SET navigation_message_id = ?", "not-an-id"),
+    ],
+)
+async def test_malformed_search_session_row_is_safely_absent(
+    tmp_path: Path, statement: str, value: object
+) -> None:
+    database = tmp_path / "db.sqlite3"
+    repository = SQLiteRepository(database, lease_seconds=60)
+    await repository.initialize()
+    session = _session()
+    await repository.save_search_session(session)
+    with sqlite3.connect(database) as connection:
+        connection.execute(statement, (value,))
+        connection.commit()
+
+    assert await repository.get_search_session(session.id) is None
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_initialize_expires_legacy_reference_context_without_migration(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "db.sqlite3"
+    connection = sqlite3.connect(database)
+    try:
+        connection.executescript(SCHEMA)
+        connection.execute(
+            "INSERT INTO reference_context VALUES (?, ?, ?, ?)",
+            (1, "[1]", "[2]", (datetime.now(tz=UTC) + timedelta(minutes=5)).isoformat()),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    repository = SQLiteRepository(database, lease_seconds=60)
+
+    await repository.initialize()
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM reference_context").fetchone()[0] == 0
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_purge_removes_expired_transcripts_sessions_and_registers_cleanup_targets(
+    tmp_path: Path,
+) -> None:
+    repository = _encrypted_repository(tmp_path / "db.sqlite3")
+    await repository.initialize()
+    await repository.save_transcript(_transcript(expired=True))
+    session = _session(expired=True)
+    await repository.save_search_session(session)
+    future = (datetime.now(tz=UTC) + timedelta(days=1)).isoformat()
+
+    await repository.purge(
+        expired_before=future,
+        audit_before=future,
+        succeeded_before=future,
+        failed_before=future,
+    )
+
+    assert await repository.get_transcript(1, 2) is None
+    assert await repository.get_search_session(session.id) is None
+    question_targets, _ = await repository.cleanup_message_ids(
+        context_before=future, succeeded_before=future, failed_before=future
+    )
+    assert set(question_targets) == set(session.cleanup_targets)
+    await repository.close()

@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 from uuid import UUID, uuid4
 
 from pydantic import SecretStr
@@ -19,10 +20,14 @@ from paperless_assistant.errors import (
     AmbiguousPaperlessMutationError,
     AmbiguousSubmissionError,
     ConfigurationUnavailableError,
+    ContextUnavailableError,
     DuplicateUploadError,
     PaperlessAuthenticationError,
     PaperlessPermissionError,
+    PaperlessRAGUnavailableError,
+    PaperlessSearchValidationError,
     PaperlessUnavailableError,
+    QuestionTooLongError,
     RateLimitedError,
     StaleSuggestionError,
     UnlinkedUserError,
@@ -30,6 +35,8 @@ from paperless_assistant.errors import (
 from paperless_assistant.models import (
     AuditEvent,
     ChatResult,
+    ConversationTranscript,
+    ConversationTurn,
     DeliveryPlan,
     DiscordMessageTarget,
     Document,
@@ -40,6 +47,8 @@ from paperless_assistant.models import (
     MetadataGuidance,
     ReferenceContext,
     ReviewFinalizationState,
+    SearchMode,
+    SearchSession,
     SuggestionApplyResult,
     SuggestionReview,
     SuggestionSelection,
@@ -53,6 +62,7 @@ from paperless_assistant.models import (
     UploadItemState,
 )
 from paperless_assistant.paperless import (
+    CHAT_METADATA_DELIMITER,
     PAPERLESS_CHAT_ERROR,
     PAPERLESS_NO_CONTENT,
     sanitize_paperless_error,
@@ -68,6 +78,15 @@ from paperless_assistant.ports import (
     CredentialRepository,
     IngestionRepository,
     PaperlessGateway,
+    QueryRepository,
+)
+
+RAG_PROMPT_MAX_CHARACTERS = 4_000
+STORED_ANSWER_MAX_CHARACTERS = 1_500
+DETERMINISTIC_SEARCH_MAX_RESULTS = 30
+RAG_UNAVAILABLE_MESSAGE = "Paperless RAG is unavailable. Please try again later."
+SEARCH_FALLBACK_MESSAGE = (
+    "Paperless chat was unavailable; these are basic full-text search results."
 )
 
 
@@ -86,6 +105,48 @@ class QueryResponse:
     documents: tuple[Document, ...]
     used_search_fallback: bool
     correlation_id: UUID
+    mode: SearchMode | None = None
+    pending_turn: ConversationTurn | None = None
+    transcript_generation: int | None = None
+
+
+def _format_turn(turn: ConversationTurn) -> str:
+    """Format one privacy-minimized history turn for a native RAG prompt."""
+    return f"Participant: {turn.question}\nPaperless: {turn.answer}"
+
+
+def normalize_stored_answer(answer: str) -> str:
+    """Remove native-chat metadata and cap retained context safely."""
+    return answer.split(CHAT_METADATA_DELIMITER, maxsplit=1)[0][:STORED_ANSWER_MAX_CHARACTERS]
+
+
+def bound_transcript_turns(turns: tuple[ConversationTurn, ...]) -> tuple[ConversationTurn, ...]:
+    """Keep newest complete turns that fit the context budget without splitting one."""
+    retained: deque[ConversationTurn] = deque(turns)
+    while (
+        retained
+        and len("\n\n".join(_format_turn(turn) for turn in retained)) > RAG_PROMPT_MAX_CHARACTERS
+    ):
+        retained.popleft()
+    return tuple(retained)
+
+
+def build_rag_prompt(question: str, turns: tuple[ConversationTurn, ...]) -> str:
+    """Build a bounded native-chat prompt without Discord identities."""
+    if len(question) > RAG_PROMPT_MAX_CHARACTERS:
+        raise QuestionTooLongError("question exceeds 4000 characters")
+    if not turns:
+        return question
+    framing = "Conversation context:\n{history}\n\nCurrent question:\nParticipant: {question}"
+    retained = list(turns)
+    while retained:
+        prompt = framing.format(
+            history="\n\n".join(_format_turn(turn) for turn in retained), question=question
+        )
+        if len(prompt) <= RAG_PROMPT_MAX_CHARACTERS:
+            return prompt
+        retained.pop(0)
+    return question
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,7 +159,7 @@ class _ReviewTagFinalization:
 
 
 class QuestionRateLimiter:
-    """In-memory per-user sliding window around native AI calls."""
+    """In-memory per-user sliding window shared by all query modes."""
 
     def __init__(self, limit: int, window: timedelta) -> None:
         self._limit = limit
@@ -115,7 +176,7 @@ class QuestionRateLimiter:
             while calls and calls[0] <= cutoff:
                 calls.popleft()
             if len(calls) >= self._limit:
-                raise RateLimitedError("native chat rate exceeded")
+                raise RateLimitedError("query rate exceeded")
             calls.append(current)
 
 
@@ -133,6 +194,7 @@ class QueryService:
         self._settings = settings
         self._gateway = gateway
         self._repository = repository
+        self._query_repository = cast(QueryRepository, repository)
         self._audit = audit
         self._credentials = credentials
         self._semaphore = asyncio.Semaphore(settings.question_global_concurrency)
@@ -140,6 +202,10 @@ class QueryService:
             settings.question_user_rate_limit,
             timedelta(seconds=settings.question_user_rate_window_seconds),
         )
+        self._transcript_locks: defaultdict[tuple[int, int], asyncio.Lock] = defaultdict(
+            asyncio.Lock
+        )
+        self._transcript_generations: defaultdict[tuple[int, int], int] = defaultdict(int)
 
     async def ask(
         self,
@@ -149,7 +215,59 @@ class QueryService:
         document_id: int | None = None,
         context_id: int | None = None,
     ) -> QueryResponse:
-        """Ask Paperless unchanged and fetch only its ordered references."""
+        """Backward-compatible implicit-RAG request for existing Discord callers."""
+        target_context_id = context_id if context_id is not None else principal_id
+        response = await self.search(
+            principal_id,
+            question,
+            mode=SearchMode.RAG,
+            guild_id=self._settings.discord_guild_id,
+            thread_id=context_id if context_id is not None else principal_id,
+            explicit_mode=False,
+            document_id=document_id,
+        )
+        if response.documents:
+            await self._repository.save_context(
+                ReferenceContext(
+                    principal_id=target_context_id,
+                    document_ids=tuple(document.id for document in response.documents[:3]),
+                    expires_at=_now() + self._settings.context_ttl,
+                )
+            )
+        return response
+
+    async def search(  # noqa: PLR0913
+        self,
+        principal_id: int,
+        question: str,
+        *,
+        mode: SearchMode,
+        guild_id: int,
+        thread_id: int,
+        explicit_mode: bool = True,
+        document_id: int | None = None,
+    ) -> QueryResponse:
+        """Execute one mode without persisting RAG history before Discord renders it."""
+        user_token = await self._linked_token(principal_id)
+        await self._rate.acquire(principal_id)
+        self._validate_question(question)
+        correlation_id = uuid4()
+        if mode is not SearchMode.RAG:
+            return await self._deterministic_search(
+                principal_id, question, mode, user_token, correlation_id
+            )
+        return await self._rag_search(
+            principal_id,
+            question,
+            guild_id,
+            thread_id,
+            explicit_mode,
+            document_id,
+            user_token,
+            correlation_id,
+        )
+
+    async def _linked_token(self, principal_id: int) -> SecretStr | None:
         user_token = (
             await self._credentials.get_user_token(principal_id)
             if self._credentials is not None
@@ -157,48 +275,185 @@ class QueryService:
         )
         if self._credentials is not None and user_token is None:
             raise UnlinkedUserError("Paperless account is not linked")
-        await self._rate.acquire(principal_id)
-        correlation_id = uuid4()
-        used_fallback = False
-        target_context_id = context_id if context_id is not None else principal_id
+        return user_token
+
+    @staticmethod
+    def _validate_question(question: str) -> None:
+        if len(question) > RAG_PROMPT_MAX_CHARACTERS:
+            raise QuestionTooLongError("question exceeds 4000 characters")
+
+    async def _deterministic_search(
+        self,
+        principal_id: int,
+        question: str,
+        mode: SearchMode,
+        user_token: SecretStr | None,
+        correlation_id: UUID,
+    ) -> QueryResponse:
         try:
             async with self._semaphore:
-                result = await self._gateway.chat(question, document_id, token=user_token)
+                documents = await self._gateway.search_documents(
+                    question,
+                    DETERMINISTIC_SEARCH_MAX_RESULTS,
+                    mode=mode,
+                    token=user_token,
+                )
+        except PaperlessSearchValidationError:
+            raise
+        outcome = "empty" if not documents else "found"
+        await self._record_query(principal_id, f"search_{mode.value}", outcome, correlation_id)
+        answer = (
+            f"No {mode.value} search results were found."
+            if not documents
+            else f"Paperless {mode.value} search results:"
+        )
+        return QueryResponse(
+            answer, documents[:DETERMINISTIC_SEARCH_MAX_RESULTS], False, correlation_id, mode
+        )
+
+    async def _rag_search(  # noqa: PLR0913, PLR0917
+        self,
+        principal_id: int,
+        question: str,
+        guild_id: int,
+        thread_id: int,
+        explicit_mode: bool,
+        document_id: int | None,
+        user_token: SecretStr | None,
+        correlation_id: UUID,
+    ) -> QueryResponse:
+        transcript_key = (guild_id, thread_id)
+        async with self._transcript_locks[transcript_key]:
+            transcript = await self._query_repository.get_transcript(guild_id, thread_id)
+            generation = self._transcript_generations[transcript_key]
+        prompt = build_rag_prompt(question, transcript.turns if transcript is not None else ())
+        try:
+            async with self._semaphore:
+                result = await self._gateway.chat(prompt, document_id, token=user_token)
+        except PaperlessAuthenticationError, PaperlessPermissionError:
+            raise
         except PaperlessUnavailableError:
             result = ChatResult("", ())
         if not result.answer.strip() or result.answer.strip() in {
             PAPERLESS_NO_CONTENT,
             PAPERLESS_CHAT_ERROR,
         }:
-            used_fallback = True
-            documents = await self._gateway.search_documents(question, 3, token=user_token)
-            answer = "Paperless chat was unavailable; these are basic full-text search results."
-        else:
-            answer = result.answer
+            if explicit_mode:
+                await self._record_query(principal_id, "question", "unavailable", correlation_id)
+                raise PaperlessRAGUnavailableError(RAG_UNAVAILABLE_MESSAGE)
+            async with self._semaphore:
+                documents = await self._gateway.search_documents(
+                    question, 3, mode=SearchMode.TEXT, token=user_token
+                )
+            await self._record_query(principal_id, "question", "search_fallback", correlation_id)
+            return QueryResponse(
+                SEARCH_FALLBACK_MESSAGE,
+                documents[:3],
+                True,
+                correlation_id,
+                SearchMode.RAG,
+            )
+        async with self._semaphore:
             documents = tuple(
                 [
                     await self._gateway.get_document(int(identifier), token=user_token)
-                    for identifier in result.document_ids
+                    for identifier in result.document_ids[:3]
                 ]
             )
-        if documents:
-            await self._repository.save_context(
-                ReferenceContext(
-                    principal_id=target_context_id,
-                    document_ids=tuple(document.id for document in documents[:3]),
-                    expires_at=_now() + self._settings.context_ttl,
-                )
-            )
+        pending_turn = ConversationTurn(question, normalize_stored_answer(result.answer))
+        await self._record_query(principal_id, "question", "answered", correlation_id)
+        return QueryResponse(
+            result.answer,
+            documents,
+            False,
+            correlation_id,
+            SearchMode.RAG,
+            pending_turn,
+            generation,
+        )
+
+    async def _record_query(
+        self, principal_id: int, action: str, outcome: str, correlation_id: UUID
+    ) -> None:
         await self._audit.record(
             AuditEvent(
                 principal_id=principal_id,
-                action="question",
-                outcome="search_fallback" if used_fallback else "answered",
+                action=action,
+                outcome=outcome,
                 occurred_at=_now(),
                 correlation_id=correlation_id,
             )
         )
-        return QueryResponse(answer, documents[:3], used_fallback, correlation_id)
+
+    async def commit_rendered_turn(
+        self, guild_id: int, thread_id: int, turn: ConversationTurn, expected_generation: int
+    ) -> bool:
+        """Persist a completed RAG turn only after its response was rendered."""
+        transcript_key = (guild_id, thread_id)
+        async with self._transcript_locks[transcript_key]:
+            if self._transcript_generations[transcript_key] != expected_generation:
+                return False
+            transcript = await self._query_repository.get_transcript(guild_id, thread_id)
+            turns = (transcript.turns if transcript is not None else ()) + (turn,)
+            bounded = bound_transcript_turns(turns)
+            if not bounded:
+                await self._query_repository.clear_transcript(guild_id, thread_id)
+                return True
+            await self._query_repository.save_transcript(
+                ConversationTranscript(
+                    guild_id, thread_id, bounded, _now() + self._settings.context_ttl
+                )
+            )
+            return True
+
+    async def reset_transcript(self, guild_id: int, thread_id: int) -> bool:
+        """Clear only the thread's shared RAG history."""
+        transcript_key = (guild_id, thread_id)
+        async with self._transcript_locks[transcript_key]:
+            cleared = await self._query_repository.clear_transcript(guild_id, thread_id)
+            self._transcript_generations[transcript_key] += 1
+            return cleared
+
+    async def save_search_session(self, session: SearchSession) -> None:
+        await self._query_repository.save_search_session(session)
+
+    async def get_search_session(self, session_id: UUID) -> SearchSession | None:
+        return await self._query_repository.get_search_session(session_id)
+
+    async def latest_search_session(self, guild_id: int, thread_id: int) -> SearchSession | None:
+        return await self._query_repository.latest_search_session(guild_id, thread_id)
+
+    async def set_search_session_page(self, session_id: UUID, page: int) -> SearchSession | None:
+        return await self._query_repository.set_search_session_page(session_id, page)
+
+    async def session_page_documents(
+        self,
+        principal_id: int,
+        session_id: UUID,
+        page: int,
+        page_size: int = 3,
+        *,
+        require_owner: bool = True,
+    ) -> tuple[SearchSession, tuple[Document, ...]]:
+        """Reauthorize one persisted result page with the current asking user's token."""
+        session = await self._query_repository.get_search_session(session_id)
+        if session is None or page < 0 or page_size <= 0:
+            raise ContextUnavailableError("search result context is unavailable")
+        if require_owner and session.requester_id != principal_id:
+            raise ContextUnavailableError("search result context is unavailable")
+        start = page * page_size
+        identifiers = session.document_ids[start : start + page_size]
+        if not identifiers:
+            raise ContextUnavailableError("search result context is unavailable")
+        user_token = await self._linked_token(principal_id)
+        async with self._semaphore:
+            documents = tuple(
+                [
+                    await self._gateway.get_document(int(identifier), token=user_token)
+                    for identifier in identifiers
+                ]
+            )
+        return session, documents
 
     async def context(self, principal_id: int) -> ReferenceContext | None:
         """Read one user's unexpired ordinal context."""
@@ -208,8 +463,6 @@ class QueryService:
         self,
         principal_id: int,
         document_id: int,
-        *,
-        context_id: int | None = None,
     ) -> QueryResponse:
         """Find native Paperless matches for one visible source document."""
         user_token = (
@@ -226,15 +479,6 @@ class QueryService:
                 document_id,
                 3,
                 token=user_token,
-            )
-        target_context_id = context_id if context_id is not None else principal_id
-        if documents:
-            await self._repository.save_context(
-                ReferenceContext(
-                    principal_id=target_context_id,
-                    document_ids=tuple(document.id for document in documents),
-                    expires_at=_now() + self._settings.context_ttl,
-                )
             )
         outcome = "found" if documents else "empty"
         await self._audit.record(

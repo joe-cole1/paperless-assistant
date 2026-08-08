@@ -271,6 +271,51 @@ class ChatResult:
     document_ids: tuple[DocumentId, ...]
 
 
+class SearchMode(StrEnum):
+    """Supported Paperless search modes."""
+
+    RAG = "rag"
+    TEXT = "text"
+    TITLE = "title"
+    ADVANCED = "advanced"
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationTurn:
+    """One privacy-minimized RAG question and answer."""
+
+    question: str
+    answer: str
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationTranscript:
+    """Short-lived shared RAG history for a guild thread."""
+
+    guild_id: int
+    thread_id: int
+    turns: tuple[ConversationTurn, ...]
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class SearchSession:
+    """Short-lived requester-owned query result set."""
+
+    id: UUID
+    guild_id: int
+    thread_id: int
+    requester_id: int
+    document_ids: tuple[DocumentId, ...]
+    card_message_ids: tuple[int, ...]
+    cleanup_targets: tuple[DiscordMessageTarget, ...]
+    navigation_message_id: int | None
+    mode: SearchMode
+    page: int
+    created_at: datetime
+    expires_at: datetime
+
+
 class TaskState(StrEnum):
     """Paperless task state normalized for application policy."""
 

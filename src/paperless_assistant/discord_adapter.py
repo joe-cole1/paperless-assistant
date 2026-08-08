@@ -19,9 +19,14 @@ from pydantic import SecretStr
 
 from paperless_assistant.config import Settings
 from paperless_assistant.errors import (
+    ContextUnavailableError,
     InvalidAttachmentError,
+    PaperlessAuthenticationError,
     PaperlessPermissionError,
+    PaperlessRAGUnavailableError,
+    PaperlessSearchValidationError,
     PaperlessUnavailableError,
+    QuestionTooLongError,
     RateLimitedError,
     StaleSuggestionError,
     UnlinkedUserError,
@@ -30,11 +35,11 @@ from paperless_assistant.models import (
     AISuggestions,
     DiscordMessageTarget,
     Document,
-    DocumentId,
     DocumentUpdate,
     IngestionJob,
     JobState,
-    ReferenceContext,
+    SearchMode,
+    SearchSession,
     SuggestionReview,
     SuggestionSelection,
     Taxonomy,
@@ -75,6 +80,7 @@ _DUPLICATE_UPLOAD_MESSAGE = (
     "Paperless identified a duplicate. Check/empty Paperless trash or upload a genuinely "
     "different file."
 )
+_SEARCH_PAGE_SIZE = 3
 
 
 def _is_delivery_request(content: str) -> bool:
@@ -154,7 +160,7 @@ def _upload_outcome_view(
 
 
 def _result_view(
-    principal_id: int,
+    session_id: UUID,
     document_id: int,
     public_url: str,
 ) -> discord.ui.View:
@@ -170,7 +176,7 @@ def _result_view(
         discord.ui.Button(
             label="Send File",
             style=discord.ButtonStyle.primary,
-            custom_id=f"paperless:send:{principal_id}:{document_id}",
+            custom_id=f"paperless:send:{session_id}:{document_id}",
         )
     )
     view.add_item(
@@ -178,10 +184,51 @@ def _result_view(
             label="Similar",
             style=discord.ButtonStyle.secondary,
             emoji="🔎",
-            custom_id=f"paperless:similar:{principal_id}:{document_id}",
+            custom_id=f"paperless:similar:{session_id}:{document_id}",
         )
     )
     return view
+
+
+def _navigation_view(
+    session: SearchSession,
+    *,
+    page: int,
+    include_reset: bool,
+) -> discord.ui.View:
+    """Build restart-safe page controls without placing private data in IDs."""
+    view = discord.ui.View(timeout=None)
+    page_count = (len(session.document_ids) + _SEARCH_PAGE_SIZE - 1) // _SEARCH_PAGE_SIZE
+    if page > 0:
+        view.add_item(
+            discord.ui.Button(
+                label="Previous",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"paperless:page:{session.id}:{page - 1}",
+            )
+        )
+    if page + 1 < page_count:
+        view.add_item(
+            discord.ui.Button(
+                label="Next",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"paperless:page:{session.id}:{page + 1}",
+            )
+        )
+    if include_reset:
+        view.add_item(
+            discord.ui.Button(
+                label="Reset Context",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"paperless:reset:{session.thread_id}",
+            )
+        )
+    return view
+
+
+def _navigation_content(session: SearchSession, page: int) -> str:
+    page_count = (len(session.document_ids) + _SEARCH_PAGE_SIZE - 1) // _SEARCH_PAGE_SIZE
+    return f"Page {page + 1}/{page_count} · {len(session.document_ids)} results"
 
 
 class AISuggestionsTitleModal(discord.ui.Modal, title="Edit Document Title"):
@@ -2122,6 +2169,7 @@ class DiscordAssistant(discord.Client):
         self._restored_upload_items: set[tuple[int, int]] = set()
         self._upload_review_locks: dict[tuple[int, int], asyncio.Lock] = {}
         self._upload_batch_controllers: dict[int, _UploadBatchController] = {}
+        self._search_page_locks: dict[UUID, asyncio.Lock] = {}
         self._staging_lock = asyncio.Lock()
         self.tree = discord.app_commands.CommandTree(self)
         self._register_commands()
@@ -2196,6 +2244,7 @@ class DiscordAssistant(discord.Client):
             await interaction.followup.send(f"Cleaned {cleaned} message(s).", ephemeral=True)
 
         self._register_auth_commands()
+        self._register_search_commands()
 
     def _register_auth_commands(self) -> None:
         auth_group = discord.app_commands.Group(
@@ -2294,6 +2343,266 @@ class DiscordAssistant(discord.Client):
                 )
 
         self.tree.add_command(auth_group)
+
+    def _register_search_commands(self) -> None:
+        """Register explicit native-search commands on the questions surface."""
+        search_group = discord.app_commands.Group(
+            name="search",
+            description="Search your Paperless documents.",
+        )
+
+        @search_group.command(name="rag", description="Ask Paperless a question.")
+        @discord.app_commands.describe(query="Question for Paperless")
+        async def search_rag(interaction: discord.Interaction, query: str) -> None:
+            await self._run_search_command(interaction, query, SearchMode.RAG)
+
+        @search_group.command(name="text", description="Search document text.")
+        @discord.app_commands.describe(query="Text to search for")
+        async def search_text(interaction: discord.Interaction, query: str) -> None:
+            await self._run_search_command(interaction, query, SearchMode.TEXT)
+
+        @search_group.command(name="title", description="Search document titles.")
+        @discord.app_commands.describe(query="Title to search for")
+        async def search_title(interaction: discord.Interaction, query: str) -> None:
+            await self._run_search_command(interaction, query, SearchMode.TITLE)
+
+        @search_group.command(name="advanced", description="Run an advanced Paperless query.")
+        @discord.app_commands.describe(query="Paperless advanced query")
+        async def search_advanced(interaction: discord.Interaction, query: str) -> None:
+            await self._run_search_command(interaction, query, SearchMode.ADVANCED)
+
+        @search_group.command(name="reset", description="Clear this thread's search context.")
+        async def search_reset(interaction: discord.Interaction) -> None:
+            await self._reset_search_context(interaction)
+
+        self.tree.add_command(search_group)
+
+    @staticmethod
+    def _search_thread_name(query: str) -> str:
+        """Return a bounded, display-safe thread title without preserving formatting."""
+        normalized = unicodedata.normalize("NFKC", query)
+        sanitized = "".join(
+            character if character.isalnum() or character in " -_" else " "
+            for character in normalized
+            if character.isprintable()
+        )
+        snippet = " ".join(sanitized.split())[:40].strip()
+        return f"Search: {snippet or 'Question'}"
+
+    def _is_questions_interaction(self, interaction: discord.Interaction) -> bool:
+        """Require the exact configured guild and questions channel/thread."""
+        if interaction.guild_id != self._settings.discord_guild_id or not self._authorized_user_id(
+            interaction.user.id
+        ):
+            return False
+        channel = interaction.channel
+        if isinstance(channel, discord.Thread):
+            return channel.parent_id == self._settings.discord_questions_channel_id
+        return (
+            isinstance(channel, discord.TextChannel)
+            and channel.id == self._settings.discord_questions_channel_id
+        )
+
+    async def _search_command_target(
+        self, interaction: discord.Interaction, query: str
+    ) -> tuple[discord.Thread, discord.Message, discord.Message | None] | None:
+        """Get a questions thread and visible status, returning its cleanup parent when new."""
+        channel = interaction.channel
+        starter: discord.Message | None = None
+        try:
+            if isinstance(channel, discord.Thread):
+                status = await channel.send("Searching Paperless…", allowed_mentions=NO_MENTIONS)
+                return channel, status, None
+            if not isinstance(channel, discord.TextChannel):
+                return None
+            starter = await channel.send("Paperless search started.", allowed_mentions=NO_MENTIONS)
+            thread = await starter.create_thread(
+                name=self._search_thread_name(query), auto_archive_duration=1440
+            )
+            status = await thread.send("Searching Paperless…", allowed_mentions=NO_MENTIONS)
+            return thread, status, starter
+        except discord.HTTPException:
+            if starter is not None:
+                with suppress(discord.HTTPException):
+                    await starter.delete()
+            return None
+
+    async def _run_search_command(
+        self, interaction: discord.Interaction, query: str, mode: SearchMode
+    ) -> None:
+        """Dispatch an explicit search after safely selecting its thread target."""
+        if not self._is_questions_interaction(interaction):
+            await interaction.response.send_message(
+                "Search commands can only be used by authorized users in the questions channel.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        target = await self._search_command_target(interaction, query)
+        if target is None:
+            await interaction.followup.send(
+                "Discord could not start this search. Please try again later.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        thread, status, starter = target
+        response, error_message = await self._search_command_response(
+            interaction, query, mode, thread.id
+        )
+        if error_message is not None:
+            await self._render_search_error(
+                status,
+                error_message,
+                interaction.user.id,
+                thread.id,
+                starter,
+                mode=mode,
+            )
+            await interaction.followup.send(
+                error_message, ephemeral=True, allowed_mentions=NO_MENTIONS
+            )
+            return
+        if response is None:
+            await interaction.followup.send(
+                "Paperless is unavailable right now. Please try again shortly.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        try:
+            cleanup_targets = (
+                (DiscordMessageTarget(starter.channel.id, starter.id),)
+                if starter is not None
+                else ()
+            )
+            await self._render_query(
+                status,
+                response,
+                interaction.user.id,
+                context_id=thread.id,
+                guild_id=interaction.guild_id,
+                cleanup_targets=cleanup_targets,
+            )
+        except discord.HTTPException:
+            await interaction.followup.send(
+                "Discord could not post these results. Please try again later.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        await interaction.followup.send(
+            "Search results were posted in the thread.",
+            ephemeral=True,
+            allowed_mentions=NO_MENTIONS,
+        )
+
+    async def _render_search_error(  # noqa: PLR0913
+        self,
+        status: discord.Message,
+        message: str,
+        requester_id: int,
+        thread_id: int,
+        starter: discord.Message | None = None,
+        *,
+        source_prompt: DiscordMessageTarget | None = None,
+        mode: SearchMode = SearchMode.RAG,
+    ) -> None:
+        """Render a safe empty result set so cleanup and ordinal state stay coherent."""
+        response = QueryResponse(message, (), False, uuid4(), mode)
+        targets: tuple[DiscordMessageTarget, ...] = ()
+        if starter is not None:
+            targets += (DiscordMessageTarget(starter.channel.id, starter.id),)
+        if source_prompt is not None:
+            targets += (source_prompt,)
+        with suppress(discord.HTTPException):
+            await self._render_query(
+                status,
+                response,
+                requester_id,
+                context_id=thread_id,
+                guild_id=self._settings.discord_guild_id,
+                cleanup_targets=targets,
+            )
+
+    async def _search_command_response(
+        self,
+        interaction: discord.Interaction,
+        query: str,
+        mode: SearchMode,
+        thread_id: int,
+    ) -> tuple[QueryResponse | None, str | None]:
+        """Run the service and reduce failures to fixed public search messages."""
+        try:
+            response = await self._query.search(
+                interaction.user.id,
+                query,
+                mode=mode,
+                guild_id=self._settings.discord_guild_id,
+                thread_id=thread_id,
+                explicit_mode=True,
+            )
+        except PaperlessSearchValidationError as error:
+            return None, error.user_message
+        except (
+            RateLimitedError,
+            UnlinkedUserError,
+            PaperlessAuthenticationError,
+            PaperlessPermissionError,
+            PaperlessRAGUnavailableError,
+            QuestionTooLongError,
+            PaperlessUnavailableError,
+        ) as error:
+            messages = {
+                RateLimitedError: (
+                    "You've asked several questions quickly. Please try again in a few minutes."
+                ),
+                UnlinkedUserError: (
+                    "You have not linked your Paperless account. Use `/auth link <token>`."
+                ),
+                PaperlessAuthenticationError: (
+                    "Your linked Paperless token was rejected. Use `/auth link <token>`."
+                ),
+                PaperlessPermissionError: (
+                    "Your Paperless account cannot access these search results."
+                ),
+                PaperlessRAGUnavailableError: (
+                    "Paperless RAG is unavailable. Please try again later."
+                ),
+                QuestionTooLongError: (
+                    "This question is too long. Please keep it at most 4,000 characters."
+                ),
+            }
+            return None, messages.get(
+                type(error), "Paperless is unavailable right now. Please try again shortly."
+            )
+        except Exception as error:
+            logger.error(
+                "discord_search_command_failed", extra={"error_type": type(error).__name__}
+            )
+            return None, "Paperless is unavailable right now. Please try again shortly."
+        return response, None
+
+    async def _reset_search_context(self, interaction: discord.Interaction) -> None:
+        """Clear only shared RAG transcript data for an authorized question thread."""
+        if not self._is_questions_interaction(interaction) or not isinstance(
+            interaction.channel, discord.Thread
+        ):
+            await interaction.response.send_message(
+                "Context can only be reset by authorized users in a questions thread.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        cleared = await self._query.reset_transcript(
+            self._settings.discord_guild_id, interaction.channel.id
+        )
+        await interaction.response.send_message(
+            "Search context cleared." if cleared else "Search context is already empty.",
+            ephemeral=True,
+            allowed_mentions=NO_MENTIONS,
+        )
 
     async def setup_hook(self) -> None:
         """Initialize downstream policy before accepting messages."""
@@ -2413,16 +2722,15 @@ class DiscordAssistant(discord.Client):
         if isinstance(message.channel, discord.Thread):
             thread = message.channel
         else:
-            clean_prompt = " ".join(question.strip().split())
-            snippet = clean_prompt[:40] if clean_prompt else "Question"
             thread = await message.create_thread(
-                name=f"Q: {snippet}",
+                name=self._search_thread_name(question),
                 auto_archive_duration=1440,
             )
-        context_id = thread.id
-        context = await self._query.context(context_id)
-        if context and _is_delivery_request(question):
-            selected = select_ordinal(question, [int(item) for item in context.document_ids])
+        session = await self._query.latest_search_session(
+            self._settings.discord_guild_id, thread.id
+        )
+        if session and _is_delivery_request(question):
+            selected = select_ordinal(question, [int(item) for item in session.document_ids])
             if selected is not None:
                 if not selected:
                     await thread.send(
@@ -2433,96 +2741,192 @@ class DiscordAssistant(discord.Client):
                     await self._deliver_to_message(message, selected, target=thread)
                 return
 
-        should_continue, target_document = await self._reply_target(message, context)
+        should_continue, target_document = await self._reply_target(message, session)
         if not should_continue:
             return
-        if target_document is None and context and _is_follow_up(question):
-            if len(context.document_ids) == 1:
-                target_document = int(context.document_ids[0])
-            else:
+        if target_document is None and session and _is_follow_up(question):
+            if len(session.document_ids) == 1:
+                target_document = int(session.document_ids[0])
+            elif len(session.document_ids) > 1:
                 await thread.send(
-                    "Which result do you mean—first, second, or third?",
+                    "Which result number do you mean, or reply to a result card?",
                     allowed_mentions=NO_MENTIONS,
                 )
                 return
         status = await thread.send("Searching Paperless…", allowed_mentions=NO_MENTIONS)
         try:
-            response = await self._query.ask(
+            response = await self._query.search(
                 message.author.id,
                 question,
+                mode=SearchMode.RAG,
+                guild_id=self._settings.discord_guild_id,
+                thread_id=thread.id,
+                explicit_mode=False,
                 document_id=target_document,
-                context_id=context_id,
             )
-        except RateLimitedError:
-            await status.edit(
-                content=(
+        except (
+            RateLimitedError,
+            UnlinkedUserError,
+            PaperlessAuthenticationError,
+            PaperlessPermissionError,
+            QuestionTooLongError,
+            PaperlessUnavailableError,
+        ) as error:
+            error_messages = {
+                RateLimitedError: (
                     "You've asked several questions quickly. Please try again in a few minutes."
                 ),
-                allowed_mentions=NO_MENTIONS,
-            )
-            return
-        except UnlinkedUserError:
-            await status.edit(
-                content=(
-                    "You have not linked your Paperless account yet. "
-                    "Please run `/auth link <token>` to connect."
+                UnlinkedUserError: (
+                    "You have not linked your Paperless account. Use `/auth link <token>`."
                 ),
-                allowed_mentions=NO_MENTIONS,
+                PaperlessAuthenticationError: (
+                    "Your linked Paperless token was rejected. Use `/auth link <token>`."
+                ),
+                PaperlessPermissionError: (
+                    "Your Paperless account cannot access these search results."
+                ),
+                QuestionTooLongError: (
+                    "This question is too long. Please keep it at most 4,000 characters."
+                ),
+            }
+            await self._render_search_error(
+                status,
+                error_messages.get(
+                    type(error), "Paperless is unavailable right now. Please try again shortly."
+                ),
+                message.author.id,
+                thread.id,
+                source_prompt=DiscordMessageTarget(message.channel.id, message.id),
             )
             return
-        except PaperlessUnavailableError:
-            await status.edit(
-                content="Paperless is unavailable right now. Please try again shortly.",
-                allowed_mentions=NO_MENTIONS,
+        except Exception as error:
+            logger.error(
+                "discord_implicit_search_failed", extra={"error_type": type(error).__name__}
+            )
+            await self._render_search_error(
+                status,
+                "Paperless is unavailable right now. Please try again shortly.",
+                message.author.id,
+                thread.id,
+                source_prompt=DiscordMessageTarget(message.channel.id, message.id),
             )
             return
-        await self._render_query(status, response, message.author.id, context_id=context_id)
+        await self._render_query(
+            status,
+            response,
+            message.author.id,
+            context_id=thread.id,
+            guild_id=message.guild.id if message.guild is not None else None,
+            cleanup_targets=(DiscordMessageTarget(message.channel.id, message.id),),
+        )
 
     async def _reply_target(
-        self, message: discord.Message, context: ReferenceContext | None
+        self, message: discord.Message, session: SearchSession | None
     ) -> tuple[bool, int | None]:
         if (
-            context is None
+            session is None
             or message.reference is None
-            or message.reference.message_id not in context.source_message_ids
+            or message.reference.message_id not in session.card_message_ids
         ):
             return True, None
-        index = context.source_message_ids.index(message.reference.message_id)
-        if index < len(context.document_ids):
-            return True, int(context.document_ids[index])
+        slot = session.card_message_ids.index(message.reference.message_id)
+        index = session.page * _SEARCH_PAGE_SIZE + slot
+        if index < len(session.document_ids):
+            return True, int(session.document_ids[index])
         return False, None
 
-    async def _render_query(
+    async def _render_query(  # noqa: PLR0913
         self,
         status: discord.Message,
         response: QueryResponse,
         principal_id: int,
         context_id: int | None = None,
-    ) -> None:
+        *,
+        guild_id: int | None = None,
+        cleanup_targets: Sequence[DiscordMessageTarget] = (),
+    ) -> SearchSession | None:
+        """Render one result set and persist it only after Discord accepts every message."""
         chunks = discord_safe_chunks(response.answer)
         first = chunks[0] if chunks else "Paperless returned no answer."
-        target_context_id = context_id if context_id is not None else principal_id
+        channel = status.channel
+        thread = channel if isinstance(channel, discord.Thread) else None
+        rendered_targets = list(cleanup_targets)
+        rendered_targets.append(DiscordMessageTarget(channel.id, status.id))
         try:
             await status.edit(content=first, allowed_mentions=NO_MENTIONS)
         except discord.HTTPException:
-            await status.channel.send(first, allowed_mentions=NO_MENTIONS)
+            fallback = await channel.send(first, allowed_mentions=NO_MENTIONS)
+            rendered_targets.append(DiscordMessageTarget(channel.id, fallback.id))
         for chunk in chunks[1:]:
-            await status.channel.send(chunk, allowed_mentions=NO_MENTIONS)
+            message = await channel.send(chunk, allowed_mentions=NO_MENTIONS)
+            rendered_targets.append(DiscordMessageTarget(channel.id, message.id))
+        if thread is None:
+            for document in response.documents:
+                url = self._delivery_url(int(document.id))
+                message = await channel.send(
+                    embed=_document_embed(document, url),
+                    view=_result_view(uuid4(), int(document.id), url),
+                    allowed_mentions=NO_MENTIONS,
+                )
+                rendered_targets.append(DiscordMessageTarget(channel.id, message.id))
+            return None
+
+        target_guild_id = guild_id if guild_id is not None else self._settings.discord_guild_id
+        now = datetime.now(UTC)
+        session = SearchSession(
+            id=uuid4(),
+            guild_id=target_guild_id,
+            thread_id=thread.id,
+            requester_id=principal_id,
+            document_ids=tuple(document.id for document in response.documents[:30]),
+            card_message_ids=(),
+            cleanup_targets=(),
+            navigation_message_id=None,
+            mode=response.mode if response.mode is not None else SearchMode.TEXT,
+            page=0,
+            created_at=now,
+            expires_at=now + self._settings.context_ttl,
+        )
+        card_count = min(len(session.document_ids), _SEARCH_PAGE_SIZE)
         result_message_ids: list[int] = []
-        for document in response.documents:
+        for document in response.documents[:card_count]:
             url = self._delivery_url(int(document.id))
-            result_message = await status.channel.send(
+            result_message = await channel.send(
                 embed=_document_embed(document, url),
-                view=_result_view(principal_id, int(document.id), url),
+                view=_result_view(session.id, int(document.id), url),
                 allowed_mentions=NO_MENTIONS,
             )
             result_message_ids.append(result_message.id)
-        if response.documents:
-            await self._query.save_rendered_context(
-                target_context_id,
-                tuple(document.id for document in response.documents),
-                tuple(result_message_ids),
+            rendered_targets.append(DiscordMessageTarget(channel.id, result_message.id))
+        navigation_message_id: int | None = None
+        if session.document_ids or response.pending_turn is not None:
+            navigation = await channel.send(
+                _navigation_content(session, 0) if session.document_ids else "Search context",
+                view=_navigation_view(
+                    session,
+                    page=0,
+                    include_reset=response.pending_turn is not None,
+                ),
+                allowed_mentions=NO_MENTIONS,
             )
+            navigation_message_id = navigation.id
+            rendered_targets.append(DiscordMessageTarget(channel.id, navigation.id))
+        unique_targets = tuple(dict.fromkeys(rendered_targets))
+        session = replace(
+            session,
+            card_message_ids=tuple(result_message_ids),
+            cleanup_targets=unique_targets,
+            navigation_message_id=navigation_message_id,
+        )
+        await self._query.save_search_session(session)
+        if response.pending_turn is not None and response.transcript_generation is not None:
+            await self._query.commit_rendered_turn(
+                target_guild_id,
+                thread.id,
+                response.pending_turn,
+                response.transcript_generation,
+            )
+        return session
 
     def _delivery_url(self, document_id: int) -> str:
         base = str(self._settings.paperless_public_url).rstrip("/")
@@ -2591,33 +2995,199 @@ class DiscordAssistant(discord.Client):
                 allowed_mentions=NO_MENTIONS,
             )
             return
+        if custom_id.startswith("paperless:reset:"):
+            await self._reset_interaction(interaction, custom_id)
+            return
+        if custom_id.startswith("paperless:page:"):
+            await self._page_interaction(interaction, custom_id)
+            return
         if custom_id.startswith("paperless:similar:"):
             await self._similar_interaction(interaction, custom_id)
             return
         if custom_id.startswith("paperless:send:"):
             await self._send_file_interaction(interaction, custom_id)
 
-    async def _result_context_id(
+    async def _reset_interaction(self, interaction: discord.Interaction, custom_id: str) -> None:
+        """Clear shared history only for an allowlisted participant in this exact thread."""
+        try:
+            _, _, thread_raw = custom_id.split(":")
+            if not thread_raw.isdecimal():
+                raise ValueError("invalid thread")
+            thread_id = int(thread_raw)
+        except TypeError, ValueError:
+            await interaction.response.send_message(
+                "That reset request has expired or is unavailable.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        channel = interaction.channel
+        if (
+            not isinstance(channel, discord.Thread)
+            or interaction.guild_id != self._settings.discord_guild_id
+            or channel.parent_id != self._settings.discord_questions_channel_id
+            or channel.id != thread_id
+            or not self._authorized_user_id(interaction.user.id)
+        ):
+            await interaction.response.send_message(
+                "That reset request has expired or is unavailable.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        cleared = await self._query.reset_transcript(interaction.guild_id, channel.id)
+        await interaction.response.send_message(
+            "Search context cleared." if cleared else "Search context is already empty.",
+            ephemeral=True,
+            allowed_mentions=NO_MENTIONS,
+        )
+
+    async def _page_interaction(
         self,
         interaction: discord.Interaction,
-        principal_id: int,
+        custom_id: str,
+    ) -> None:
+        """Replace durable card slots in place for one owner-authorized result page."""
+        try:
+            _, _, session_raw, page_raw = custom_id.split(":")
+            if not page_raw.isdecimal():
+                raise ValueError("invalid page")
+            session_id = UUID(session_raw)
+            target_page = int(page_raw)
+            if str(session_id) != session_raw:
+                raise ValueError("invalid session")
+        except AttributeError, TypeError, ValueError:
+            await interaction.response.send_message(
+                "That page request has expired or is unavailable.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        channel = interaction.channel
+        if (
+            not isinstance(channel, discord.Thread)
+            or interaction.guild_id != self._settings.discord_guild_id
+            or channel.parent_id != self._settings.discord_questions_channel_id
+            or not self._authorized_user_id(interaction.user.id)
+        ):
+            await interaction.response.send_message(
+                "That page request has expired or is unavailable.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        lock = self._search_page_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            session = await self._query.get_search_session(session_id)
+            page_count = (
+                (len(session.document_ids) + _SEARCH_PAGE_SIZE - 1) // _SEARCH_PAGE_SIZE
+                if session is not None
+                else 0
+            )
+            if (
+                session is None
+                or session.guild_id != interaction.guild_id
+                or session.thread_id != channel.id
+                or session.requester_id != interaction.user.id
+                or target_page < 0
+                or target_page >= page_count
+            ):
+                await interaction.response.send_message(
+                    "That page request has expired or is unavailable.",
+                    ephemeral=True,
+                    allowed_mentions=NO_MENTIONS,
+                )
+                return
+            await interaction.response.defer(ephemeral=True)
+            try:
+                current_session, documents = await self._query.session_page_documents(
+                    interaction.user.id,
+                    session.id,
+                    target_page,
+                    page_size=_SEARCH_PAGE_SIZE,
+                )
+                cards = [
+                    await channel.fetch_message(message_id)
+                    for message_id in current_session.card_message_ids
+                ]
+                if len(cards) != _SEARCH_PAGE_SIZE:
+                    raise ContextUnavailableError("search result cards are unavailable")
+                for index, card in enumerate(cards):
+                    if index < len(documents):
+                        document = documents[index]
+                        url = self._delivery_url(int(document.id))
+                        await card.edit(
+                            content=None,
+                            embed=_document_embed(document, url),
+                            view=_result_view(current_session.id, int(document.id), url),
+                            allowed_mentions=NO_MENTIONS,
+                        )
+                    else:
+                        await card.edit(content=None, embed=None, view=None)
+                if current_session.navigation_message_id is None:
+                    raise ContextUnavailableError("search result controls are unavailable")
+                navigation = await channel.fetch_message(current_session.navigation_message_id)
+                await navigation.edit(
+                    content=_navigation_content(current_session, target_page),
+                    view=_navigation_view(
+                        current_session,
+                        page=target_page,
+                        include_reset=current_session.mode is SearchMode.RAG,
+                    ),
+                    allowed_mentions=NO_MENTIONS,
+                )
+                updated_session = await self._query.set_search_session_page(
+                    current_session.id, target_page
+                )
+                if updated_session is None:
+                    raise ContextUnavailableError("search result context is unavailable")
+                await interaction.followup.send(
+                    "Page updated.", ephemeral=True, allowed_mentions=NO_MENTIONS
+                )
+            except (
+                ContextUnavailableError,
+                PaperlessAuthenticationError,
+                PaperlessPermissionError,
+                PaperlessUnavailableError,
+                UnlinkedUserError,
+                discord.HTTPException,
+            ):
+                await interaction.followup.send(
+                    "That page request has expired or is unavailable.",
+                    ephemeral=True,
+                    allowed_mentions=NO_MENTIONS,
+                )
+
+    async def _result_session_document(
+        self,
+        interaction: discord.Interaction,
+        session_id: UUID,
         document_id: int,
-    ) -> int | None:
-        channel = getattr(interaction, "channel", None)
-        channel_id = (
-            channel.parent_id if isinstance(channel, discord.Thread) else interaction.channel_id
-        )
-        authorized = bool(
-            interaction.guild_id == self._settings.discord_guild_id
-            and channel_id == self._settings.discord_questions_channel_id
-            and interaction.user.id == principal_id
-            and self._authorized_user_id(principal_id)
-        )
-        target_context_id = channel.id if isinstance(channel, discord.Thread) else principal_id
-        context = await self._query.context(target_context_id) if authorized else None
-        if context is None or DocumentId(document_id) not in context.document_ids:
+    ) -> SearchSession | None:
+        """Resolve a card action from persisted session state, never button content."""
+        channel = interaction.channel
+        if (
+            not isinstance(channel, discord.Thread)
+            or interaction.guild_id != self._settings.discord_guild_id
+            or channel.parent_id != self._settings.discord_questions_channel_id
+            or not self._authorized_user_id(interaction.user.id)
+        ):
             return None
-        return target_context_id
+        session = await self._query.get_search_session(session_id)
+        if (
+            session is None
+            or session.guild_id != interaction.guild_id
+            or session.thread_id != channel.id
+            or session.requester_id != interaction.user.id
+            or interaction.message is None
+            or interaction.message.id not in session.card_message_ids
+        ):
+            return None
+        slot = session.card_message_ids.index(interaction.message.id)
+        index = session.page * _SEARCH_PAGE_SIZE + slot
+        if index >= len(session.document_ids) or int(session.document_ids[index]) != document_id:
+            return None
+        return session
 
     async def _send_file_interaction(
         self,
@@ -2625,12 +3195,22 @@ class DiscordAssistant(discord.Client):
         custom_id: str,
     ) -> None:
         try:
-            _, _, principal_raw, document_raw = custom_id.split(":")
-            principal_id = int(principal_raw)
+            _, _, session_raw, document_raw = custom_id.split(":")
+            session_id = UUID(session_raw)
+            if str(session_id) != session_raw:
+                raise ValueError("invalid session")
+            if not document_raw.isdecimal() or int(document_raw) <= 0:
+                raise ValueError("invalid document")
             document_id = int(document_raw)
-        except TypeError, ValueError:
+        except AttributeError, TypeError, ValueError:
+            await interaction.response.send_message(
+                "That file request has expired or is unavailable.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
             return
-        if await self._result_context_id(interaction, principal_id, document_id) is None:
+        session = await self._result_session_document(interaction, session_id, document_id)
+        if session is None:
             await interaction.response.send_message(
                 "That file request has expired or is unavailable.",
                 ephemeral=True,
@@ -2640,7 +3220,7 @@ class DiscordAssistant(discord.Client):
         await interaction.response.defer(ephemeral=True)
         limit = getattr(interaction, "filesize_limit", self._attachment_limit(interaction.guild))
         try:
-            plan = await self._delivery.prepare(principal_id, document_id, limit)
+            plan = await self._delivery.prepare(session.requester_id, document_id, limit)
             if plan.attachment is None:
                 await interaction.followup.send(
                     f"Too large for Discord. [Download original]({plan.original_url})",
@@ -2682,19 +3262,23 @@ class DiscordAssistant(discord.Client):
         custom_id: str,
     ) -> None:
         try:
-            _, _, principal_raw, document_raw = custom_id.split(":")
-            principal_id = int(principal_raw)
+            _, _, session_raw, document_raw = custom_id.split(":")
+            session_id = UUID(session_raw)
+            if str(session_id) != session_raw:
+                raise ValueError("invalid session")
+            if not document_raw.isdecimal() or int(document_raw) <= 0:
+                raise ValueError("invalid document")
             document_id = int(document_raw)
-        except TypeError, ValueError:
+        except AttributeError, TypeError, ValueError:
             await interaction.response.send_message(
                 "That Similar request is invalid or has expired.",
                 ephemeral=True,
                 allowed_mentions=NO_MENTIONS,
             )
             return
-        context_id = await self._result_context_id(interaction, principal_id, document_id)
+        session = await self._result_session_document(interaction, session_id, document_id)
         channel = getattr(interaction, "channel", None)
-        if context_id is None or not isinstance(channel, discord.Thread):
+        if session is None or not isinstance(channel, discord.Thread):
             await interaction.response.send_message(
                 "That Similar request has expired or is unavailable.",
                 ephemeral=True,
@@ -2702,21 +3286,18 @@ class DiscordAssistant(discord.Client):
             )
             return
         await interaction.response.defer(ephemeral=True)
+        status: discord.Message | None = None
         try:
-            response = await self._query.find_similar(
-                principal_id,
-                document_id,
-                context_id=context_id,
-            )
             status = await channel.send(
                 f"Finding documents similar to Paperless document #{document_id}…",
                 allowed_mentions=NO_MENTIONS,
             )
+            response = await self._query.find_similar(session.requester_id, document_id)
             await self._render_query(
                 status,
                 response,
-                principal_id,
-                context_id=context_id,
+                session.requester_id,
+                context_id=channel.id,
             )
             await interaction.followup.send(
                 "Similar results were posted in this thread.",
@@ -2724,30 +3305,89 @@ class DiscordAssistant(discord.Client):
                 allowed_mentions=NO_MENTIONS,
             )
         except RateLimitedError:
+            await self._render_similar_error(
+                status,
+                "You've searched several times quickly. Please try again in a few minutes.",
+                session.requester_id,
+                channel.id,
+            )
             await interaction.followup.send(
                 "You've searched several times quickly. Please try again in a few minutes.",
                 ephemeral=True,
                 allowed_mentions=NO_MENTIONS,
             )
         except UnlinkedUserError:
+            await self._render_similar_error(
+                status,
+                "You have not linked your Paperless account. Use `/auth link <token>`.",
+                session.requester_id,
+                channel.id,
+            )
             await interaction.followup.send(
-                "You have not linked your Paperless account yet. "
-                "Please run `/auth link <token>` to connect.",
+                "You have not linked your Paperless account. Use `/auth link <token>`.",
                 ephemeral=True,
                 allowed_mentions=NO_MENTIONS,
             )
         except PaperlessPermissionError:
+            await self._render_similar_error(
+                status,
+                "Paperless did not allow access to that source document.",
+                session.requester_id,
+                channel.id,
+            )
             await interaction.followup.send(
                 "Paperless did not allow access to that source document.",
                 ephemeral=True,
                 allowed_mentions=NO_MENTIONS,
             )
+        except PaperlessAuthenticationError:
+            await self._render_similar_error(
+                status,
+                "Your linked Paperless token was rejected. Use `/auth link <token>`.",
+                session.requester_id,
+                channel.id,
+            )
+            await interaction.followup.send(
+                "Your linked Paperless token was rejected. Use `/auth link <token>`.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
         except PaperlessUnavailableError:
+            await self._render_similar_error(
+                status,
+                "That source document is unavailable, or Paperless could not complete the search.",
+                session.requester_id,
+                channel.id,
+            )
             await interaction.followup.send(
                 "That source document is unavailable, or Paperless could not complete the search.",
                 ephemeral=True,
                 allowed_mentions=NO_MENTIONS,
             )
+        except discord.HTTPException:
+            if status is not None:
+                await self._render_similar_error(
+                    status,
+                    "Paperless is unavailable right now. Please try again shortly.",
+                    session.requester_id,
+                    channel.id,
+                )
+            await interaction.followup.send(
+                "Paperless is unavailable right now. Please try again shortly.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+
+    async def _render_similar_error(
+        self,
+        status: discord.Message | None,
+        message: str,
+        requester_id: int,
+        thread_id: int,
+    ) -> None:
+        """Replace a visible Similar status with a durable empty result session."""
+        if status is not None:
+            await self._render_search_error(status, message, requester_id, thread_id)
 
     @staticmethod
     def _safe_upload_filename(filename: str, limit: int = 120) -> str:

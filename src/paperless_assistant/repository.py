@@ -22,6 +22,8 @@ from pydantic import SecretStr
 from paperless_assistant.models import (
     ALLOWED_JOB_TRANSITIONS,
     AuditEvent,
+    ConversationTranscript,
+    ConversationTurn,
     DiscordMessageTarget,
     DocumentId,
     IngestionJob,
@@ -29,6 +31,8 @@ from paperless_assistant.models import (
     MetadataGuidance,
     ReferenceContext,
     ReviewFinalizationState,
+    SearchMode,
+    SearchSession,
     UploadBatch,
     UploadBatchSnapshot,
     UploadItem,
@@ -147,6 +151,36 @@ CREATE TABLE IF NOT EXISTS reference_context (
     source_message_ids_json TEXT NOT NULL,
     expires_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS conversation_transcripts (
+    guild_id INTEGER NOT NULL,
+    thread_id INTEGER NOT NULL,
+    encrypted_turns BLOB NOT NULL,
+    expires_at TEXT NOT NULL,
+    PRIMARY KEY (guild_id, thread_id)
+);
+
+CREATE INDEX IF NOT EXISTS conversation_transcripts_expiry_idx
+    ON conversation_transcripts(expires_at);
+
+CREATE TABLE IF NOT EXISTS search_sessions (
+    id TEXT PRIMARY KEY,
+    guild_id INTEGER NOT NULL,
+    thread_id INTEGER NOT NULL,
+    requester_id INTEGER NOT NULL,
+    document_ids_json TEXT NOT NULL,
+    card_message_ids_json TEXT NOT NULL,
+    cleanup_targets_json TEXT NOT NULL,
+    navigation_message_id INTEGER,
+    mode TEXT NOT NULL,
+    page INTEGER NOT NULL CHECK(page >= 0),
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS search_sessions_expiry_idx ON search_sessions(expires_at);
+CREATE INDEX IF NOT EXISTS search_sessions_thread_created_idx
+    ON search_sessions(guild_id, thread_id, created_at, id);
 
 CREATE TABLE IF NOT EXISTS question_messages (
     discord_message_id INTEGER PRIMARY KEY,
@@ -349,6 +383,9 @@ class SQLiteRepository:
             ):
                 if name not in upload_item_columns:
                     connection.execute(f"ALTER TABLE upload_items ADD COLUMN {name} {definition}")
+            # Legacy contexts cannot be safely assigned to a guild/thread and must
+            # therefore expire rather than be guessed at during this upgrade.
+            connection.execute("DELETE FROM reference_context")
             connection.commit()
         self._database_path.chmod(0o600)
 
@@ -990,6 +1027,255 @@ class SQLiteRepository:
         return tuple(self._job_from_row(row) for row in rows)
 
     @_database_operation
+    def save_transcript(self, transcript: ConversationTranscript) -> None:
+        """Encrypt and replace the shared RAG history for one Discord thread."""
+        if self._fernet is None:
+            raise ValueError("encryption key is not configured")
+        turns = json.dumps(
+            [{"question": turn.question, "answer": turn.answer} for turn in transcript.turns],
+            separators=(",", ":"),
+        ).encode("utf-8")
+        encrypted_turns = self._fernet.encrypt(turns)
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO conversation_transcripts(
+                    guild_id, thread_id, encrypted_turns, expires_at
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id, thread_id) DO UPDATE SET
+                    encrypted_turns=excluded.encrypted_turns,
+                    expires_at=excluded.expires_at
+                """,
+                (
+                    transcript.guild_id,
+                    transcript.thread_id,
+                    encrypted_turns,
+                    _iso(transcript.expires_at),
+                ),
+            )
+            connection.commit()
+
+    @_database_operation
+    def get_transcript(self, guild_id: int, thread_id: int) -> ConversationTranscript | None:
+        """Return a valid unexpired transcript without exposing corrupt contents."""
+        if self._fernet is None:
+            raise ValueError("encryption key is not configured")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT encrypted_turns, expires_at FROM conversation_transcripts
+                WHERE guild_id = ? AND thread_id = ?
+                """,
+                (guild_id, thread_id),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            expires_at = _parse_datetime(row["expires_at"])
+            if expires_at <= _utc_now():
+                return None
+            raw_turns = json.loads(self._fernet.decrypt(row["encrypted_turns"]).decode("utf-8"))
+            if not isinstance(raw_turns, list):
+                return None
+            turns: list[ConversationTurn] = []
+            for raw_turn in raw_turns:
+                if (
+                    not isinstance(raw_turn, dict)
+                    or set(raw_turn) != {"question", "answer"}
+                    or not isinstance(raw_turn["question"], str)
+                    or not isinstance(raw_turn["answer"], str)
+                ):
+                    return None
+                turns.append(ConversationTurn(raw_turn["question"], raw_turn["answer"]))
+        except Exception:
+            return None
+        return ConversationTranscript(guild_id, thread_id, tuple(turns), expires_at)
+
+    @_database_operation
+    def clear_transcript(self, guild_id: int, thread_id: int) -> bool:
+        """Clear only the shared history for the requested guild/thread."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "DELETE FROM conversation_transcripts WHERE guild_id = ? AND thread_id = ?",
+                (guild_id, thread_id),
+            )
+            connection.commit()
+            return cursor.rowcount == 1
+
+    @staticmethod
+    def _search_session_from_row(row: sqlite3.Row) -> SearchSession | None:
+        """Parse persistent session state defensively at the trust boundary."""
+
+        def integer(value: object) -> int | None:
+            return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+        try:
+            session_id = UUID(row["id"])
+            guild_id = integer(row["guild_id"])
+            thread_id = integer(row["thread_id"])
+            requester_id = integer(row["requester_id"])
+            page = integer(row["page"])
+            navigation_message_id = row["navigation_message_id"]
+            if navigation_message_id is not None:
+                navigation_message_id = integer(navigation_message_id)
+            mode = SearchMode(row["mode"])
+            created_at = _parse_datetime(row["created_at"])
+            expires_at = _parse_datetime(row["expires_at"])
+            document_ids = json.loads(row["document_ids_json"])
+            card_message_ids = json.loads(row["card_message_ids_json"])
+            cleanup_targets = json.loads(row["cleanup_targets_json"])
+            if (
+                guild_id is None
+                or thread_id is None
+                or requester_id is None
+                or page is None
+                or page < 0
+                or (row["navigation_message_id"] is not None and navigation_message_id is None)
+                or not isinstance(document_ids, list)
+                or not isinstance(card_message_ids, list)
+                or not isinstance(cleanup_targets, list)
+            ):
+                return None
+            if any(integer(value) is None for value in document_ids + card_message_ids):
+                return None
+            targets: list[DiscordMessageTarget] = []
+            for target in cleanup_targets:
+                if (
+                    not isinstance(target, dict)
+                    or set(target) != {"channel_id", "message_id"}
+                    or integer(target["channel_id"]) is None
+                    or integer(target["message_id"]) is None
+                ):
+                    return None
+                targets.append(DiscordMessageTarget(target["channel_id"], target["message_id"]))
+        except AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError:
+            return None
+        return SearchSession(
+            session_id,
+            guild_id,
+            thread_id,
+            requester_id,
+            tuple(DocumentId(value) for value in document_ids),
+            tuple(card_message_ids),
+            tuple(targets),
+            navigation_message_id,
+            mode,
+            page,
+            created_at,
+            expires_at,
+        )
+
+    @_database_operation
+    def save_search_session(self, session: SearchSession) -> None:
+        """Persist one result set and its exact Discord cleanup targets."""
+        document_ids = json.dumps(
+            [int(value) for value in session.document_ids], separators=(",", ":")
+        )
+        card_message_ids = json.dumps(list(session.card_message_ids), separators=(",", ":"))
+        cleanup_targets = json.dumps(
+            [
+                {"channel_id": target.channel_id, "message_id": target.message_id}
+                for target in session.cleanup_targets
+            ],
+            separators=(",", ":"),
+        )
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO search_sessions(
+                    id, guild_id, thread_id, requester_id, document_ids_json,
+                    card_message_ids_json, cleanup_targets_json, navigation_message_id,
+                    mode, page, created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    guild_id=excluded.guild_id,
+                    thread_id=excluded.thread_id,
+                    requester_id=excluded.requester_id,
+                    document_ids_json=excluded.document_ids_json,
+                    card_message_ids_json=excluded.card_message_ids_json,
+                    cleanup_targets_json=excluded.cleanup_targets_json,
+                    navigation_message_id=excluded.navigation_message_id,
+                    mode=excluded.mode,
+                    page=excluded.page,
+                    created_at=excluded.created_at,
+                    expires_at=excluded.expires_at
+                """,
+                (
+                    str(session.id),
+                    session.guild_id,
+                    session.thread_id,
+                    session.requester_id,
+                    document_ids,
+                    card_message_ids,
+                    cleanup_targets,
+                    session.navigation_message_id,
+                    session.mode.value,
+                    session.page,
+                    _iso(session.created_at),
+                    _iso(session.expires_at),
+                ),
+            )
+            created_at = _iso(_utc_now())
+            connection.executemany(
+                """
+                INSERT INTO question_messages(discord_message_id, channel_id, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(discord_message_id) DO UPDATE SET
+                    channel_id=excluded.channel_id
+                """,
+                (
+                    (target.message_id, target.channel_id, created_at)
+                    for target in session.cleanup_targets
+                ),
+            )
+            connection.commit()
+
+    @_database_operation
+    def get_search_session(self, session_id: UUID) -> SearchSession | None:
+        """Load one unexpired durable result set."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM search_sessions WHERE id = ? AND expires_at > ?",
+                (str(session_id), _iso(_utc_now())),
+            ).fetchone()
+        return self._search_session_from_row(row) if row is not None else None
+
+    @_database_operation
+    def latest_search_session(self, guild_id: int, thread_id: int) -> SearchSession | None:
+        """Load the newest unexpired result set associated with a thread."""
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM search_sessions
+                WHERE guild_id = ? AND thread_id = ? AND expires_at > ?
+                ORDER BY created_at DESC, id DESC LIMIT 1
+                """,
+                (guild_id, thread_id, _iso(_utc_now())),
+            ).fetchone()
+        return self._search_session_from_row(row) if row is not None else None
+
+    @_database_operation
+    def set_search_session_page(self, session_id: UUID, page: int) -> SearchSession | None:
+        """Set one active result page without reviving expired sessions."""
+        if isinstance(page, bool) or page < 0:
+            raise ValueError("search session page must be non-negative")
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE search_sessions SET page = ? WHERE id = ? AND expires_at > ?",
+                (page, str(session_id), _iso(_utc_now())),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                return None
+            row = connection.execute(
+                "SELECT * FROM search_sessions WHERE id = ?", (str(session_id),)
+            ).fetchone()
+            connection.commit()
+        return self._search_session_from_row(row) if row is not None else None
+
+    @_database_operation
     def save_context(self, context: ReferenceContext) -> None:
         """Replace one user's non-sensitive ordered reference context."""
         with self._connection() as connection:
@@ -1394,6 +1680,12 @@ class SQLiteRepository:
         with self._connection() as connection:
             connection.execute(
                 "DELETE FROM reference_context WHERE expires_at < ?", (expired_before,)
+            )
+            connection.execute(
+                "DELETE FROM conversation_transcripts WHERE expires_at < ?", (expired_before,)
+            )
+            connection.execute(
+                "DELETE FROM search_sessions WHERE expires_at < ?", (expired_before,)
             )
             connection.execute("DELETE FROM audit_events WHERE occurred_at < ?", (audit_before,))
             connection.execute(

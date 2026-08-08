@@ -18,11 +18,16 @@ testing—follow [docs/INSTALL.md](docs/INSTALL.md).
 Configure two private Discord text channels:
 
 - **questions** — ask “give me John's vaccine records from 2024” or “find the receipts from our
-  Venice trip.” The bot auto-creates a dedicated public thread for each query. Paperless native
-  chat returns up to three references rendered as rich Discord embed cards inside the thread with
-  Open, Send File, and owner-only Similar controls. Similar uses Paperless's native document
-  similarity with the requester's linked token and returns at most three visible results.
-  Follow-up and component actions use short-lived thread-scoped context.
+  Venice trip.” A question in the channel creates a dedicated public thread; a question in that
+  thread stays there. Free-form questions use native Paperless RAG and fall back to full-text
+  search only when that implicit RAG request is unavailable. `/search rag`, `/search text`,
+  `/search title`, and `/search advanced` make the mode explicit; explicit RAG never falls back.
+  Result sessions can contain up to 30 documents, shown as three reusable rich cards per page.
+  **Prev**, **Next**, **Send File**, and **Similar** are requester-only; Similar uses Paperless's
+  native document similarity with that requester's linked token. An allowlisted participant can
+  use `/search reset` to clear the shared thread conversation without invalidating result cards.
+  The short-lived session and transcript survive a bot restart for their configured retention
+  period.
 - **uploads** — attach up to ten documents. The bot posts an immediate batch summary and creates
   one rich metadata parent and public review thread per attachment. Each success has its own
   Paperless link and review of title, correspondent, document type, storage path, date, and tags;
@@ -48,6 +53,8 @@ Slash commands available to users:
 - `/auth link <token>` — Ephemerally test and store your Paperless API token.
 - `/auth unlink` — Remove your linked Paperless API token.
 - `/auth status` — Check whether your Paperless account token is linked and valid.
+- `/search rag|text|title|advanced <question>` — Start a query with a selected Paperless search
+  mode; `/search reset` clears the current thread's shared conversation.
 - `/clean [count]` — Retry resolved upload cleanup and remove strictly identified bot-owned
   orphan messages/threads; in the questions channel, purge recent unpinned messages.
 

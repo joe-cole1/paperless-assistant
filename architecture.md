@@ -1,7 +1,7 @@
 # Paperless Assistant architecture
 
-Status: Discord-first MVP with durable per-file AI review
-Last updated: 2026-07-29
+Status: Discord-first MVP with durable per-file AI review and search sessions
+Last updated: 2026-08-08
 
 ## 1. Purpose
 
@@ -25,6 +25,8 @@ artifacts.
 Issue #43 replaces document-result dismissal with owner-only native Paperless similarity search.
 Issue #83 couples explicit, confirmed AI review saves to exact Paperless tag finalization while
 preserving a durable Discord-notification cleanup gate.
+Issues #41 and #42 add selectable Paperless search modes, bounded result pagination, and a shared
+encrypted conversation transcript per questions thread.
 
 ## 2. System context
 
@@ -63,17 +65,21 @@ container-local listener.
 
 ## 4. Ports and adapters
 
-- inbound Discord adapter: validates transport identity, posts one bounded metadata parent and
-  public review thread per upload attachment, renders references, owner-only similarity actions,
-  and AI review controls, and enforces uploader ownership on every metadata-write interaction;
-- application services: authorize users and enforce query, delivery, ingestion, suggestion
+- inbound Discord adapter: validates transport identity, creates or reuses public question
+  threads, renders bounded answer and result-card pages, enforces requester ownership of result
+  actions, lets any allowlisted participant reset a conversation, posts one bounded metadata
+  parent and public review thread per upload attachment, and enforces uploader ownership on every
+  metadata-write interaction;
+- application services: authorize users and enforce search-mode selection, encrypted shared
+  conversation bounds, durable result-session ownership, query, delivery, ingestion, suggestion
   similarity, freshness/tag merging, batch inbox polling, and confirmed cleanup policy;
 - Paperless gateway: the only component that performs Paperless HTTP calls, including the
   synchronous 3.0.4 AI suggestion trigger, native `more_like_id` search, and bounded diagnostic
   logging;
 - ingestion and audit repositories: durable SQLite implementations tracking exact message/channel
-  cleanup targets and confirmation state; one dedicated serialized worker keeps all SQLite
-  operations and connection lifetimes off the Discord event loop;
+  cleanup targets, short-lived encrypted thread transcripts, and restart-safe result sessions;
+  one dedicated serialized worker keeps all SQLite operations and connection lifetimes off the
+  Discord event loop;
 - delivery adapter: stages and sends Discord files or returns authenticated Paperless links.
 
 Domain and application code do not import Discord or HTTP client implementations.
@@ -106,8 +112,18 @@ Domain and application code do not import Discord or HTTP client implementations
   `duplicate_of` field definitively confirms a duplicate. Restricted server logs may contain a
   bounded, JSON-escaped, credential-redacted Paperless error body for operator diagnosis.
 - Similar controls require the original requester's active thread context, use that requester's
-  linked Paperless token, return at most three permission-filtered documents, and never repeat the
-  source document.
+  linked Paperless token, return permission-filtered documents, and never repeat the source
+  document. Search navigation, Send File, and Similar also require the stored session's exact
+  requester, guild, thread, card slot, and unexpired state.
+- A questions-thread transcript is shared only among allowlisted participants and labels prior
+  speakers generically. Each request uses its current asker's encrypted linked Paperless token.
+  The transcript and prior answer excerpts are bounded, encrypted at rest, and a turn is stored
+  only after Discord rendering succeeds. Current questions are rejected above 4,000 characters;
+  they are never silently truncated.
+- Durable result sessions retain only identifiers needed to authorize and render controls
+  (document IDs and Discord message IDs), never raw query text or document content. Advanced
+  Paperless queries return only fixed validation guidance and neither Discord nor logs receive raw
+  query or response-body data.
 - AI metadata writes require the original uploader, an enabled field, a fresh document-state
   check, serialized apply, bounded controls, and preservation of existing tags. Unmatched taxonomy
   names require an exact-name race check and a fresh Paperless `add_*` permission check; deployment
@@ -146,11 +162,16 @@ placed in source, image layers, tests, documentation examples, issues, or pull r
 
 SQLite WAL storage holds ingestion jobs, a durable upload-batch graph with ordered item,
 parent/thread/control-message, state, per-file cleanup, and shared-cleanup identifiers, Discord
-event idempotency, short-lived
-document-reference context, exact cleanup channel/message targets and confirmations, the
+event idempotency, short-lived encrypted questions-thread transcripts and result sessions, exact
+cleanup channel/message targets and confirmations, the
 missing-tag warning ID/timestamp, per-item review-finalization cleanup gate, encrypted per-user
 tokens, and privacy-minimized audit. Staged
 files use job UUID names and restrictive permissions.
+
+Question transcripts and result sessions use the existing context TTL (15 minutes by default).
+The transcript is keyed by guild and thread; reset clears only that transcript, leaving the
+requester-owned result session valid. Legacy document-reference contexts are not migrated and are
+cleared or allowed to expire.
 
 Each repository instance serializes migrations, queries, and transactions on one dedicated
 database thread. Operation-scoped connections are created and closed on that same thread. Shutdown
@@ -211,6 +232,7 @@ SQLite job/audit state is included according to operator policy.
 - ADR 0014: owner-only native Paperless similarity from document results.
 - ADR 0015: confirmed AI review tag finalization and notification-gated cleanup.
 - ADR 0016: serialized SQLite execution off the Discord event loop.
+- ADR 0017: shared encrypted question-thread transcripts and restart-safe result sessions.
 
 Issue #10 is the canonical Discord MVP. Issue #20 corrects its default storage deployment. Issue
 #65 is the July 2026 hardening and AI-suggestions correction. Issues #44 and #70 complete its

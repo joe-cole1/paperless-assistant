@@ -54,14 +54,19 @@ from paperless_assistant.discord_adapter import (
 )
 from paperless_assistant.errors import (
     InvalidAttachmentError,
+    PaperlessAuthenticationError,
     PaperlessPermissionError,
+    PaperlessRAGUnavailableError,
+    PaperlessSearchValidationError,
     PaperlessUnavailableError,
+    QuestionTooLongError,
     RateLimitedError,
     StaleSuggestionError,
     UnlinkedUserError,
 )
 from paperless_assistant.models import (
     AISuggestions,
+    ConversationTurn,
     DeliveryPlan,
     DiscordMessageTarget,
     Document,
@@ -72,6 +77,8 @@ from paperless_assistant.models import (
     JobState,
     MetadataGuidance,
     ReferenceContext,
+    SearchMode,
+    SearchSession,
     SuggestedDate,
     SuggestionApplyResult,
     SuggestionReview,
@@ -97,10 +104,10 @@ class FakeChannel:
         self.archived: list[FakeThread] = []
         self.history_factory: Callable[[int], Any] | None = None
 
-    async def send(self, content: str, **kwargs: Any) -> FakeMessage:
+    async def send(self, content: str | None = None, **kwargs: Any) -> FakeMessage:
         message = FakeMessage(
             channel=self,
-            content=content,
+            content=content or "",
             identifier=1000 + len(self.sent),
         )
         message.send_kwargs = kwargs
@@ -235,6 +242,9 @@ class FakeThread(discord.Thread):
         self.sent.append(message)
         return message
 
+    async def fetch_message(self, identifier: int) -> FakeMessage:  # type: ignore[override]
+        return self.get_partial_message(identifier)
+
     def history(self, limit: int = 100) -> Any:  # type: ignore[override]
         del limit
 
@@ -294,6 +304,14 @@ class FakeQuery:
         self.asked: list[tuple[int, str, int | None]] = []
         self.similar_requests: list[tuple[int, int, int | None]] = []
         self.saved: tuple[int, tuple[DocumentId, ...], tuple[int, ...]] | None = None
+        self.search_requests: list[dict[str, Any]] = []
+        self.sessions: dict[UUID, SearchSession] = {}
+        self.thread_sessions: dict[tuple[int, int], list[UUID]] = {}
+        self.committed_turns: list[tuple[int, int, Any, int]] = []
+        self.reset_requests: list[tuple[int, int]] = []
+        self.reset_result = True
+        self.session_page_error: Exception | None = None
+        self.missing_page_update = False
 
     async def context(self, principal_id: int) -> ReferenceContext | None:
         return self.current_context
@@ -310,6 +328,79 @@ class FakeQuery:
         if self.error:
             raise self.error
         return self.response
+
+    async def search(  # noqa: PLR0913
+        self,
+        principal_id: int,
+        question: str,
+        *,
+        mode: SearchMode,
+        guild_id: int,
+        thread_id: int,
+        explicit_mode: bool,
+        document_id: int | None = None,
+    ) -> QueryResponse:
+        self.search_requests.append(
+            {
+                "principal_id": principal_id,
+                "question": question,
+                "mode": mode,
+                "guild_id": guild_id,
+                "thread_id": thread_id,
+                "explicit_mode": explicit_mode,
+                "document_id": document_id,
+            }
+        )
+        if self.error:
+            raise self.error
+        return replace(self.response, mode=mode)
+
+    async def save_search_session(self, session: SearchSession) -> None:
+        self.sessions[session.id] = session
+        self.thread_sessions.setdefault((session.guild_id, session.thread_id), []).append(
+            session.id
+        )
+
+    async def get_search_session(self, session_id: UUID) -> SearchSession | None:
+        return self.sessions.get(session_id)
+
+    async def latest_search_session(self, guild_id: int, thread_id: int) -> SearchSession | None:
+        identifiers = self.thread_sessions.get((guild_id, thread_id), [])
+        return self.sessions[identifiers[-1]] if identifiers else None
+
+    async def set_search_session_page(self, session_id: UUID, page: int) -> SearchSession | None:
+        if self.missing_page_update:
+            return None
+        session = self.sessions.get(session_id)
+        if session is None:
+            return None
+        updated = replace(session, page=page)
+        self.sessions[session_id] = updated
+        return updated
+
+    async def session_page_documents(
+        self, requester_id: int, session_id: UUID, page: int, *, page_size: int
+    ) -> tuple[SearchSession, tuple[Document, ...]]:
+        if self.session_page_error is not None:
+            raise self.session_page_error
+        session = self.sessions[session_id]
+        assert requester_id == session.requester_id
+        start = page * 3
+        documents = tuple(
+            Document(document_id, f"Document {document_id}", date(2024, 1, 2))
+            for document_id in session.document_ids[start : start + page_size]
+        )
+        return session, documents
+
+    async def reset_transcript(self, guild_id: int, thread_id: int) -> bool:
+        self.reset_requests.append((guild_id, thread_id))
+        return self.reset_result
+
+    async def commit_rendered_turn(
+        self, guild_id: int, thread_id: int, turn: Any, generation: int
+    ) -> bool:
+        self.committed_turns.append((guild_id, thread_id, turn, generation))
+        return True
 
     async def save_rendered_context(
         self,
@@ -718,6 +809,37 @@ def _context(*documents: int, message_ids: tuple[int, ...] = ()) -> ReferenceCon
     )
 
 
+async def _saved_session(
+    query: FakeQuery,
+    thread: FakeThread,
+    *document_ids: int,
+    requester_id: int = 201,
+    page: int = 0,
+) -> SearchSession:
+    card_ids = tuple(8100 + index for index in range(min(3, len(document_ids))))
+    for card_id in card_ids:
+        thread.sent.append(FakeMessage(channel=cast(Any, thread), identifier=card_id))
+    navigation = FakeMessage(channel=cast(Any, thread), identifier=8199)
+    thread.sent.append(navigation)
+    now = datetime.now(UTC)
+    session = SearchSession(
+        id=uuid4(),
+        guild_id=100,
+        thread_id=thread.id,
+        requester_id=requester_id,
+        document_ids=tuple(DocumentId(identifier) for identifier in document_ids),
+        card_message_ids=card_ids,
+        cleanup_targets=(),
+        navigation_message_id=navigation.id,
+        mode=SearchMode.RAG,
+        page=page,
+        created_at=now,
+        expires_at=now + timedelta(minutes=15),
+    )
+    await query.save_search_session(session)
+    return session
+
+
 def _latest_upload_summary(channel: FakeChannel) -> FakeMessage:
     return next(
         message
@@ -779,14 +901,15 @@ async def test_view_and_exact_message_routing(
         FakeDelivery(tmp_path),
         FakeTaxonomy(),
     )
-    view = _result_view(201, 7, "https://paperless.example.test/doc")
+    session_id = uuid4()
+    view = _result_view(session_id, 7, "https://paperless.example.test/doc")
     assert len(view.children) == 3
     assert [getattr(child, "label", None) for child in view.children] == [
         "Open in Paperless",
         "Send File",
         "Similar",
     ]
-    assert getattr(view.children[-1], "custom_id", None) == "paperless:similar:201:7"
+    assert getattr(view.children[-1], "custom_id", None) == f"paperless:similar:{session_id}:7"
 
     questions = AsyncMock()
     uploads = AsyncMock()
@@ -848,35 +971,36 @@ async def test_questions_guidance_answer_followup_and_errors(
     question = FakeMessage(channel=channel, content="Find my record")
     await assistant._questions_message(cast(discord.Message, question))
     assert question.thread.sent[0].content == "Native answer"
-    assert query.asked[-1] == (201, "Find my record", None)
-    assert query.saved is not None
+    assert query.search_requests[-1]["question"] == "Find my record"
+    assert query.search_requests[-1]["mode"] is SearchMode.RAG
+    assert query.sessions
     assert question.thread.sent[1].send_kwargs["embed"].title.startswith("📄 ")
 
-    query.current_context = _context(7, message_ids=(1234,))
-    followup = FakeMessage(channel=channel, content="What about its date?")
-    followup.reference = SimpleNamespace(message_id=1234)
+    session = await _saved_session(query, question.thread, 7)
+    followup = FakeMessage(channel=cast(Any, question.thread), content="What about its date?")
+    followup.reference = SimpleNamespace(message_id=session.card_message_ids[0])
     await assistant._questions_message(cast(discord.Message, followup))
-    assert query.asked[-1][2] == 7
+    assert query.search_requests[-1]["document_id"] == 7
 
-    query.current_context = _context(7, 8)
-    ambiguous = FakeMessage(channel=channel, content="What about the date?")
+    await _saved_session(query, question.thread, 7, 8)
+    ambiguous = FakeMessage(channel=cast(Any, question.thread), content="What about the date?")
     await assistant._questions_message(cast(discord.Message, ambiguous))
-    assert "Which result" in ambiguous.thread.sent[0].content
+    assert "Which result" in question.thread.sent[-1].content
 
-    query.current_context = _context(7)
-    single = FakeMessage(channel=channel, content="Tell me more")
+    await _saved_session(query, question.thread, 7)
+    single = FakeMessage(channel=cast(Any, question.thread), content="Tell me more")
     await assistant._questions_message(cast(discord.Message, single))
-    assert query.asked[-1][2] == 7
+    assert query.search_requests[-1]["document_id"] == 7
 
     delivery_without_ordinal = FakeMessage(channel=channel, content="send it please")
     await assistant._questions_message(cast(discord.Message, delivery_without_ordinal))
-    assert query.asked[-1] == (201, "send it please", None)
+    assert query.search_requests[-1]["question"] == "send it please"
 
     query.current_context = _context(message_ids=(1234,))
     invalid_reply = FakeMessage(channel=channel, content="Tell me more")
     invalid_reply.reference = SimpleNamespace(message_id=1234)
     await assistant._questions_message(cast(discord.Message, invalid_reply))
-    assert not hasattr(invalid_reply, "thread") or not invalid_reply.thread.sent
+    assert invalid_reply.thread.sent[0].content == "Native answer"
 
     query.current_context = None
     query.error = RateLimitedError("synthetic")
@@ -898,14 +1022,14 @@ async def test_conversational_and_direct_delivery(
 ) -> None:
     settings = settings_factory(data_dir=tmp_path)
     query = FakeQuery()
-    query.current_context = _context(7, 8)
     delivery = FakeDelivery(tmp_path)
     assistant = _assistant(settings, query, FakeIngestion(), delivery, FakeTaxonomy())
-    channel = FakeChannel(settings.discord_questions_channel_id)
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    await _saved_session(query, thread, 7, 8)
 
-    send_second = FakeMessage(channel=channel, content="send me the second one")
+    send_second = FakeMessage(channel=cast(Any, thread), content="send me the second one")
     await assistant._questions_message(cast(discord.Message, send_second))
-    assert send_second.thread.sent[-1].send_kwargs["file"].filename == "Formatted.pdf"
+    assert thread.sent[-1].send_kwargs["file"].filename == "Formatted.pdf"
     assert delivery.cleaned
 
     delivery.mode = "link"
@@ -920,9 +1044,9 @@ async def test_conversational_and_direct_delivery(
     await assistant._deliver_to_message(cast(discord.Message, send_second), (7,))
     assert "unavailable" in send_second.replies[-1].content
 
-    unavailable_number = FakeMessage(channel=channel, content="send me the third one")
+    unavailable_number = FakeMessage(channel=cast(Any, thread), content="send me the third one")
     await assistant._questions_message(cast(discord.Message, unavailable_number))
-    assert "not available" in unavailable_number.thread.sent[-1].content
+    assert "not available" in thread.sent[-1].content
     await assistant.close()
 
 
@@ -946,6 +1070,27 @@ class FakeFollowup:
         self.sent.append({"content": content, **kwargs})
 
 
+def _component_interaction(
+    settings: Settings,
+    channel: Any,
+    custom_id: str,
+    *,
+    user_id: int = 201,
+    message: Any = None,
+) -> Any:
+    return SimpleNamespace(
+        data={"custom_id": custom_id},
+        guild_id=settings.discord_guild_id,
+        channel_id=channel.id,
+        channel=channel,
+        message=message,
+        user=SimpleNamespace(id=user_id),
+        response=FakeInteractionResponse(),
+        followup=FakeFollowup(),
+        guild=SimpleNamespace(id=settings.discord_guild_id, filesize_limit=10 * 1024 * 1024),
+    )
+
+
 @pytest.mark.asyncio
 async def test_persistent_delivery_interaction(
     tmp_path: Path,
@@ -967,11 +1112,15 @@ async def test_persistent_delivery_interaction(
     await assistant.on_interaction(cast(discord.Interaction, expired))
     assert "expired" in expired.response.sent[0]
 
-    query.current_context = _context(7)
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    session = await _saved_session(query, thread, 7)
+    card = thread.sent[0]
     valid = SimpleNamespace(
-        data={"custom_id": "paperless:send:201:7"},
+        data={"custom_id": f"paperless:send:{session.id}:7"},
         guild_id=settings.discord_guild_id,
-        channel_id=settings.discord_questions_channel_id,
+        channel_id=thread.id,
+        channel=thread,
+        message=card,
         user=SimpleNamespace(id=201),
         response=FakeInteractionResponse(),
         followup=FakeFollowup(),
@@ -982,9 +1131,11 @@ async def test_persistent_delivery_interaction(
 
     delivery.mode = "link"
     link_valid = SimpleNamespace(
-        data={"custom_id": "paperless:send:201:7"},
+        data={"custom_id": f"paperless:send:{session.id}:7"},
         guild_id=settings.discord_guild_id,
-        channel_id=settings.discord_questions_channel_id,
+        channel_id=thread.id,
+        channel=thread,
+        message=card,
         user=SimpleNamespace(id=201),
         response=FakeInteractionResponse(),
         followup=FakeFollowup(),
@@ -995,9 +1146,11 @@ async def test_persistent_delivery_interaction(
 
     delivery.mode = "archived"
     archived_valid = SimpleNamespace(
-        data={"custom_id": "paperless:send:201:7"},
+        data={"custom_id": f"paperless:send:{session.id}:7"},
         guild_id=settings.discord_guild_id,
-        channel_id=settings.discord_questions_channel_id,
+        channel_id=thread.id,
+        channel=thread,
+        message=card,
         user=SimpleNamespace(id=201),
         response=FakeInteractionResponse(),
         followup=FakeFollowup(),
@@ -1008,9 +1161,11 @@ async def test_persistent_delivery_interaction(
 
     delivery.mode = "error"
     err_valid = SimpleNamespace(
-        data={"custom_id": "paperless:send:201:7"},
+        data={"custom_id": f"paperless:send:{session.id}:7"},
         guild_id=settings.discord_guild_id,
-        channel_id=settings.discord_questions_channel_id,
+        channel_id=thread.id,
+        channel=thread,
+        message=card,
         user=SimpleNamespace(id=201),
         response=FakeInteractionResponse(),
         followup=FakeFollowup(),
@@ -1035,7 +1190,6 @@ async def test_similar_interaction_renders_owner_scoped_results(
 ) -> None:
     settings = settings_factory(data_dir=tmp_path)
     query = FakeQuery()
-    query.current_context = _context(7)
     assistant = _assistant(
         settings,
         query,
@@ -1044,11 +1198,13 @@ async def test_similar_interaction_renders_owner_scoped_results(
         FakeTaxonomy(),
     )
     thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    session = await _saved_session(query, thread, 7)
     interaction = SimpleNamespace(
-        data={"custom_id": "paperless:similar:201:7"},
+        data={"custom_id": f"paperless:similar:{session.id}:7"},
         guild_id=settings.discord_guild_id,
         channel_id=thread.id,
         channel=thread,
+        message=thread.sent[0],
         user=SimpleNamespace(id=201),
         response=FakeInteractionResponse(),
         followup=FakeFollowup(),
@@ -1057,12 +1213,11 @@ async def test_similar_interaction_renders_owner_scoped_results(
     await assistant.on_interaction(cast(discord.Interaction, interaction))
 
     assert interaction.response.deferred
-    assert query.similar_requests == [(201, 7, 5001)]
-    assert thread.sent[0].content == "Documents similar to Paperless document #7:"
-    result_view = thread.sent[1].send_kwargs["view"]
-    assert getattr(result_view.children[-1], "custom_id", None) == "paperless:similar:201:8"
-    assert query.saved is not None
-    assert query.saved[0] == 5001
+    assert query.similar_requests == [(201, 7, None)]
+    assert thread.sent[2].content == "Documents similar to Paperless document #7:"
+    result_view = thread.sent[3].send_kwargs["view"]
+    assert "paperless:similar:" in getattr(result_view.children[-1], "custom_id", "")
+    assert len(query.sessions) == 2
     assert interaction.followup.sent[0]["content"] == "Similar results were posted in this thread."
     await assistant.close()
 
@@ -1074,7 +1229,6 @@ async def test_similar_interaction_empty_result(
 ) -> None:
     settings = settings_factory(data_dir=tmp_path)
     query = FakeQuery()
-    query.current_context = _context(7)
     query.similar_response = QueryResponse(
         "No similar documents were found for Paperless document #7.",
         (),
@@ -1089,11 +1243,13 @@ async def test_similar_interaction_empty_result(
         FakeTaxonomy(),
     )
     thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    session = await _saved_session(query, thread, 7)
     interaction = SimpleNamespace(
-        data={"custom_id": "paperless:similar:201:7"},
+        data={"custom_id": f"paperless:similar:{session.id}:7"},
         guild_id=settings.discord_guild_id,
         channel_id=thread.id,
         channel=thread,
+        message=thread.sent[0],
         user=SimpleNamespace(id=201),
         response=FakeInteractionResponse(),
         followup=FakeFollowup(),
@@ -1101,8 +1257,8 @@ async def test_similar_interaction_empty_result(
 
     await assistant.on_interaction(cast(discord.Interaction, interaction))
 
-    assert len(thread.sent) == 1
-    assert thread.sent[0].content == ("No similar documents were found for Paperless document #7.")
+    assert len(thread.sent) == 3
+    assert thread.sent[2].content == ("No similar documents were found for Paperless document #7.")
     await assistant.close()
 
 
@@ -1110,8 +1266,8 @@ async def test_similar_interaction_empty_result(
 @pytest.mark.parametrize(
     "case",
     [
-        ("paperless:similar:201:7", 202, True, "expired or is unavailable"),
-        ("paperless:similar:201:7", 201, False, "expired or is unavailable"),
+        ("paperless:similar:not-a-uuid:7", 202, True, "invalid or has expired"),
+        ("paperless:similar:not-a-uuid:7", 201, False, "invalid or has expired"),
         ("paperless:similar:invalid", 201, True, "invalid or has expired"),
     ],
 )
@@ -1180,7 +1336,6 @@ async def test_similar_interaction_requires_thread(
 ) -> None:
     settings = settings_factory(data_dir=tmp_path)
     query = FakeQuery()
-    query.current_context = _context(7)
     assistant = _assistant(
         settings,
         query,
@@ -1190,7 +1345,7 @@ async def test_similar_interaction_requires_thread(
     )
     channel = FakeChannel(settings.discord_questions_channel_id)
     outside_thread = SimpleNamespace(
-        data={"custom_id": "paperless:similar:201:7"},
+        data={"custom_id": f"paperless:similar:{uuid4()}:7"},
         guild_id=settings.discord_guild_id,
         channel_id=channel.id,
         channel=channel,
@@ -1245,7 +1400,6 @@ async def test_similar_interaction_maps_safe_errors(
 ) -> None:
     settings = settings_factory(data_dir=tmp_path)
     query = FakeQuery()
-    query.current_context = _context(7)
     query.error = error
     assistant = _assistant(
         settings,
@@ -1255,11 +1409,13 @@ async def test_similar_interaction_maps_safe_errors(
         FakeTaxonomy(),
     )
     thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    session = await _saved_session(query, thread, 7)
     interaction = SimpleNamespace(
-        data={"custom_id": "paperless:similar:201:7"},
+        data={"custom_id": f"paperless:similar:{session.id}:7"},
         guild_id=settings.discord_guild_id,
         channel_id=thread.id,
         channel=thread,
+        message=thread.sent[0],
         user=SimpleNamespace(id=201),
         response=FakeInteractionResponse(),
         followup=FakeFollowup(),
@@ -1268,7 +1424,7 @@ async def test_similar_interaction_maps_safe_errors(
     await assistant.on_interaction(cast(discord.Interaction, interaction))
 
     assert expected in interaction.followup.sent[0]["content"]
-    assert thread.sent == []
+    assert len(thread.sent) == 3
     await assistant.close()
 
 
@@ -2966,6 +3122,108 @@ async def test_gateway_lifecycle_hooks(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command_name", "mode"),
+    [
+        ("rag", SearchMode.RAG),
+        ("text", SearchMode.TEXT),
+        ("title", SearchMode.TITLE),
+        ("advanced", SearchMode.ADVANCED),
+    ],
+)
+async def test_search_command_dispatches_selected_mode(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+    command_name: str,
+    mode: SearchMode,
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    assistant = _assistant(settings, query, FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy())
+    channel = FakeChannel(settings.discord_questions_channel_id)
+    monkeypatch.setattr(discord, "TextChannel", FakeChannel)
+    group = assistant.tree.get_command("search")
+    assert isinstance(group, discord.app_commands.Group)
+    command = group.get_command(command_name)
+    assert isinstance(command, discord.app_commands.Command)
+    interaction = SimpleNamespace(
+        guild_id=settings.discord_guild_id,
+        channel=channel,
+        channel_id=channel.id,
+        user=SimpleNamespace(id=201),
+        response=FakeInteractionResponse(),
+        followup=FakeFollowup(),
+    )
+
+    await cast(Any, command.callback)(cast(discord.Interaction, interaction), "synthetic query")
+
+    assert query.search_requests[-1]["mode"] is mode
+    assert query.search_requests[-1]["explicit_mode"] is True
+    assert channel.threads[0].sent[0].content == "Native answer"
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_page_interaction_edits_persisted_cards_for_last_partial_page(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    assistant = _assistant(settings, query, FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy())
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    session = await _saved_session(query, thread, 1, 2, 3, 4)
+    interaction = SimpleNamespace(
+        data={"custom_id": f"paperless:page:{session.id}:1"},
+        guild_id=settings.discord_guild_id,
+        channel=thread,
+        channel_id=thread.id,
+        user=SimpleNamespace(id=201),
+        response=FakeInteractionResponse(),
+        followup=FakeFollowup(),
+    )
+
+    await assistant.on_interaction(cast(discord.Interaction, interaction))
+
+    updated = query.sessions[session.id]
+    cards = [thread.get_partial_message(identifier) for identifier in session.card_message_ids]
+    assert interaction.response.deferred
+    assert updated.page == 1
+    assert cards[0].edits[-1]["embed"].title.endswith("Document 4")
+    assert cards[1].edits[-1] == {"content": None, "embed": None, "view": None}
+    assert cards[2].edits[-1] == {"content": None, "embed": None, "view": None}
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_page_interaction_rejects_non_owner_without_editing_cards(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    assistant = _assistant(settings, query, FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy())
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    session = await _saved_session(query, thread, 1, 2, 3, 4)
+    interaction = SimpleNamespace(
+        data={"custom_id": f"paperless:page:{session.id}:1"},
+        guild_id=settings.discord_guild_id,
+        channel=thread,
+        channel_id=thread.id,
+        user=SimpleNamespace(id=202),
+        response=FakeInteractionResponse(),
+        followup=FakeFollowup(),
+    )
+
+    await assistant.on_interaction(cast(discord.Interaction, interaction))
+
+    assert "expired" in interaction.response.sent[0]
+    assert not thread.get_partial_message(session.card_message_ids[0]).edits
+    await assistant.close()
+
+
+@pytest.mark.asyncio
 async def test_upload_dismiss_button_callback(
     tmp_path: Path,
     settings_factory: Callable[..., Settings],
@@ -3156,8 +3414,8 @@ async def test_thread_routing_and_render_query_error_handling(
         principal_id=201,
         context_id=5001,
     )
-    assert query.saved is not None
-    assert query.saved[0] == 5001
+    assert query.sessions
+    assert any(session.thread_id == 5001 for session in query.sessions.values())
 
     dummy_msg = FakeMessage(channel=FakeChannel(settings.discord_questions_channel_id))
     delivery.mode = "link"
@@ -3172,6 +3430,7 @@ async def test_thread_routing_and_render_query_error_handling(
         data={"custom_id": "paperless:send:invalid"},
         guild_id=settings.discord_guild_id,
         user=SimpleNamespace(id=201),
+        response=FakeInteractionResponse(),
     )
     await assistant.on_interaction(cast(discord.Interaction, malformed))
     await assistant.close()
@@ -3442,7 +3701,7 @@ async def test_unlinked_user_responses(
 
     q_channel = FakeChannel(settings.discord_questions_channel_id)
     msg_unlinked_q = FakeMessage(channel=q_channel, content="What is this?", user_id=201)
-    query.ask = raise_unlinked  # type: ignore[method-assign]
+    query.search = raise_unlinked  # type: ignore[method-assign]
     await assistant.on_message(cast(discord.Message, msg_unlinked_q))
     assert "have not linked your Paperless account" in msg_unlinked_q.thread.sent[0].content
 
@@ -3459,11 +3718,13 @@ async def test_unlinked_user_responses(
     interaction_button = AsyncMock()
     interaction_button.guild_id = settings.discord_guild_id
     interaction_button.user = SimpleNamespace(id=201)
-    interaction_button.channel = q_channel
-    interaction_button.channel_id = settings.discord_questions_channel_id
-    interaction_button.data = {"custom_id": "paperless:send:201:7"}
+    interaction_thread = FakeThread(settings.discord_questions_channel_id, thread_id=5100)
+    session = await _saved_session(query, interaction_thread, 7)
+    interaction_button.channel = interaction_thread
+    interaction_button.channel_id = interaction_thread.id
+    interaction_button.message = interaction_thread.sent[0]
+    interaction_button.data = {"custom_id": f"paperless:send:{session.id}:7"}
     delivery.prepare = raise_unlinked  # type: ignore[method-assign]
-    query.context = AsyncMock(return_value=SimpleNamespace(document_ids=(7,)))  # type: ignore[method-assign]
     await assistant.on_interaction(cast(discord.Interaction, interaction_button))
     assert (
         "have not linked your Paperless account" in interaction_button.followup.send.call_args[0][0]
@@ -4759,3 +5020,633 @@ async def test_finish_and_dismiss_suppress_http_exception_on_followup_send() -> 
     await failure.dismiss(failed_interaction)
     assert failure.dismissed
     failed_cleanup.assert_awaited_once()
+
+
+def _synthetic_http_error() -> discord.HTTPException:
+    return discord.HTTPException(
+        cast(Any, SimpleNamespace(status=500, reason="synthetic")),
+        "synthetic",
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_reset_command_reports_empty_context(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    query.reset_result = False
+    assistant = _assistant(settings, query, FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy())
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    interaction = _component_interaction(settings, thread, "unused")
+    group = assistant.tree.get_command("search")
+    assert isinstance(group, discord.app_commands.Group)
+    command = group.get_command("reset")
+    assert isinstance(command, discord.app_commands.Command)
+    await cast(Any, command.callback)(cast(discord.Interaction, interaction))
+    assert query.reset_requests == [(settings.discord_guild_id, thread.id)]
+    assert "already empty" in interaction.response.sent[0]
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_search_command_rejects_wrong_guild(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    assistant = _assistant(
+        settings, FakeQuery(), FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy()
+    )
+    interaction = _component_interaction(settings, SimpleNamespace(id=99), "unused")
+    interaction.guild_id = 999
+    await assistant._run_search_command(
+        cast(discord.Interaction, interaction), "query", SearchMode.TEXT
+    )
+    assert "authorized users" in interaction.response.sent[0]
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_search_command_reuses_question_thread(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    assistant = _assistant(settings, query, FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy())
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    interaction = _component_interaction(settings, thread, "unused")
+    await assistant._run_search_command(
+        cast(discord.Interaction, interaction), "query", SearchMode.TITLE
+    )
+    assert query.search_requests[-1]["thread_id"] == thread.id
+    assert interaction.followup.sent[-1]["content"] == "Search results were posted in the thread."
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_search_command_reports_target_and_render_failures(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    assistant = _assistant(
+        settings, FakeQuery(), FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy()
+    )
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    interaction = _component_interaction(settings, thread, "unused")
+    assistant._search_command_target = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    await assistant._run_search_command(
+        cast(discord.Interaction, interaction), "query", SearchMode.TEXT
+    )
+    assert "could not start" in interaction.followup.sent[-1]["content"]
+    status = FakeMessage(channel=cast(Any, thread))
+    assistant._search_command_target = AsyncMock(  # type: ignore[method-assign]
+        return_value=(thread, status, None)
+    )
+    assistant._search_command_response = AsyncMock(  # type: ignore[method-assign]
+        return_value=(QueryResponse("answer", (), False, uuid4(), SearchMode.TEXT), None)
+    )
+    assistant._render_query = AsyncMock(side_effect=_synthetic_http_error())  # type: ignore[method-assign]
+    await assistant._run_search_command(
+        cast(discord.Interaction, interaction), "query", SearchMode.TEXT
+    )
+    assert "could not post" in interaction.followup.sent[-1]["content"]
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_search_command_handles_safe_error_and_empty_response(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    assistant = _assistant(
+        settings, FakeQuery(), FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy()
+    )
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    status = FakeMessage(channel=cast(Any, thread))
+    starter = FakeMessage(channel=FakeChannel(settings.discord_questions_channel_id))
+    interaction = _component_interaction(settings, thread, "unused")
+    assistant._search_command_target = AsyncMock(  # type: ignore[method-assign]
+        return_value=(thread, status, starter)
+    )
+    assistant._search_command_response = AsyncMock(  # type: ignore[method-assign]
+        return_value=(None, "safe error")
+    )
+    assistant._render_search_error = AsyncMock()  # type: ignore[method-assign]
+    await assistant._run_search_command(
+        cast(discord.Interaction, interaction), "query", SearchMode.ADVANCED
+    )
+    assert interaction.followup.sent[-1]["content"] == "safe error"
+    assistant._search_command_response.return_value = (None, None)
+    await assistant._run_search_command(
+        cast(discord.Interaction, interaction), "query", SearchMode.ADVANCED
+    )
+    assert "unavailable" in interaction.followup.sent[-1]["content"]
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (PaperlessSearchValidationError("query"), "advanced query syntax"),
+        (RateLimitedError("x"), "quickly"),
+        (UnlinkedUserError("x"), "not linked"),
+        (PaperlessAuthenticationError("x"), "token was rejected"),
+        (PaperlessPermissionError("x"), "cannot access"),
+        (PaperlessRAGUnavailableError("x"), "RAG is unavailable"),
+        (QuestionTooLongError("x"), "4,000"),
+        (PaperlessUnavailableError("x"), "unavailable"),
+        (RuntimeError("private"), "unavailable"),
+    ],
+)
+async def test_search_command_response_maps_errors(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+    error: Exception,
+    expected: str,
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    query.error = error
+    assistant = _assistant(settings, query, FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy())
+    interaction = SimpleNamespace(user=SimpleNamespace(id=201))
+    response, message = await assistant._search_command_response(
+        cast(discord.Interaction, interaction), "secret", SearchMode.ADVANCED, 5001
+    )
+    assert response is None
+    assert message is not None
+    assert expected in message
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_search_command_target_cleans_starter_after_discord_failure(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    assistant = _assistant(
+        settings, FakeQuery(), FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy()
+    )
+    channel = FakeChannel(settings.discord_questions_channel_id)
+    monkeypatch.setattr(discord, "TextChannel", FakeChannel)
+    starter = await channel.send("starter")
+    starter.create_thread = AsyncMock(side_effect=_synthetic_http_error())  # type: ignore[method-assign]
+    channel.send = AsyncMock(return_value=starter)  # type: ignore[method-assign]
+    interaction = SimpleNamespace(channel=channel)
+    target = await assistant._search_command_target(cast(discord.Interaction, interaction), "q")
+    assert target is None
+    assert starter.deleted
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_render_query_fallback_chunks_non_thread_and_commit(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    assistant = _assistant(settings, query, FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy())
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    status = FakeMessage(channel=cast(Any, thread), identifier=600)
+    status.edit = AsyncMock(side_effect=_synthetic_http_error())  # type: ignore[method-assign]
+    response = QueryResponse(
+        "x" * 2100,
+        tuple(Document(DocumentId(item), f"Doc {item}", date(2024, 1, 2)) for item in range(1, 5)),
+        False,
+        uuid4(),
+        SearchMode.RAG,
+        ConversationTurn("question", "answer"),
+        4,
+    )
+    session = await assistant._render_query(
+        cast(discord.Message, status), response, 201, context_id=thread.id
+    )
+    assert session is not None
+    assert len(session.card_message_ids) == 3
+    assert len(query.committed_turns) == 1
+    assert any(
+        getattr(item, "label", None) == "Next"
+        for item in thread.sent[-1].send_kwargs["view"].children
+    )
+    channel = FakeChannel(settings.discord_questions_channel_id)
+    plain_status = FakeMessage(channel=channel)
+    assert await assistant._render_query(cast(discord.Message, plain_status), response, 201) is None
+    assert len(channel.sent) == 5
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_render_query_empty_result_has_no_navigation(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    assistant = _assistant(settings, query, FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy())
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    status = FakeMessage(channel=cast(Any, thread), identifier=600)
+    session = await assistant._render_query(
+        cast(discord.Message, status), QueryResponse("", (), False, uuid4()), 201
+    )
+    assert session is not None
+    assert session.navigation_message_id is None
+    assert not thread.sent
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_reply_target_rejects_unused_last_page_slot(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    assistant = _assistant(settings, query, FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy())
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    session = await _saved_session(query, thread, 1, 2, 3, 4, page=1)
+    message = FakeMessage(channel=cast(Any, thread))
+    message.reference = SimpleNamespace(message_id=session.card_message_ids[1])
+    assert await assistant._reply_target(cast(discord.Message, message), session) == (False, None)
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_search_target_rejects_non_channel_and_handles_thread_send_failure(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    assistant = _assistant(
+        settings, FakeQuery(), FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy()
+    )
+    invalid = SimpleNamespace(channel=SimpleNamespace(id=1))
+    assert (
+        await assistant._search_command_target(cast(discord.Interaction, invalid), "query") is None
+    )
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    thread.send = AsyncMock(side_effect=_synthetic_http_error())  # type: ignore[method-assign]
+    interaction = SimpleNamespace(channel=thread)
+    assert (
+        await assistant._search_command_target(cast(discord.Interaction, interaction), "query")
+        is None
+    )
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_render_search_error_tracks_starter_and_prompt(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    assistant = _assistant(settings, query, FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy())
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    status = FakeMessage(channel=cast(Any, thread), identifier=600)
+    parent = FakeChannel(settings.discord_questions_channel_id)
+    starter = FakeMessage(channel=parent, identifier=601)
+    prompt = DiscordMessageTarget(thread.id, 602)
+    await assistant._render_search_error(
+        cast(discord.Message, status),
+        "safe",
+        201,
+        thread.id,
+        cast(discord.Message, starter),
+        source_prompt=prompt,
+    )
+    session = await query.latest_search_session(settings.discord_guild_id, thread.id)
+    assert session is not None
+    assert DiscordMessageTarget(parent.id, starter.id) in session.cleanup_targets
+    assert prompt in session.cleanup_targets
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_reset_command_and_component_reject_invalid_contexts(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    assistant = _assistant(settings, query, FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy())
+    channel = SimpleNamespace(id=settings.discord_questions_channel_id)
+    command_interaction = _component_interaction(settings, channel, "unused")
+    await assistant._reset_search_context(cast(discord.Interaction, command_interaction))
+    assert "questions thread" in command_interaction.response.sent[0]
+    malformed = _component_interaction(settings, channel, "paperless:reset:bad")
+    await assistant.on_interaction(cast(discord.Interaction, malformed))
+    assert "expired" in malformed.response.sent[0]
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_reset_component_accepts_allowlisted_participant(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    assistant = _assistant(settings, query, FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy())
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    interaction = _component_interaction(settings, thread, f"paperless:reset:{thread.id}")
+    await assistant.on_interaction(cast(discord.Interaction, interaction))
+    assert query.reset_requests == [(settings.discord_guild_id, thread.id)]
+    assert "cleared" in interaction.response.sent[0]
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_questions_message_handles_unexpected_search_error(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    query.error = RuntimeError("private")
+    assistant = _assistant(settings, query, FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy())
+    channel = FakeChannel(settings.discord_questions_channel_id)
+    message = FakeMessage(channel=channel, content="question")
+    await assistant._questions_message(cast(discord.Message, message))
+    assert "unavailable" in message.thread.sent[0].content
+    assert query.sessions
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "custom_id",
+    [
+        "paperless:page:not-a-uuid:1",
+        "paperless:page:00000000-0000-0000-0000-000000000000:x",
+        "paperless:page:00000000-0000-0000-0000-000000000000:1:extra",
+    ],
+)
+async def test_page_component_rejects_malformed_ids(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+    custom_id: str,
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    assistant = _assistant(
+        settings, FakeQuery(), FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy()
+    )
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    interaction = _component_interaction(settings, thread, custom_id)
+    await assistant.on_interaction(cast(discord.Interaction, interaction))
+    assert "expired" in interaction.response.sent[0]
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_page_component_rejects_wrong_context_and_missing_session(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    assistant = _assistant(
+        settings, FakeQuery(), FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy()
+    )
+    channel = SimpleNamespace(id=settings.discord_questions_channel_id)
+    session_id = uuid4()
+    interaction = _component_interaction(settings, channel, f"paperless:page:{session_id}:0")
+    await assistant.on_interaction(cast(discord.Interaction, interaction))
+    assert "expired" in interaction.response.sent[0]
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    missing = _component_interaction(settings, thread, f"paperless:page:{session_id}:0")
+    await assistant.on_interaction(cast(discord.Interaction, missing))
+    assert "expired" in missing.response.sent[0]
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["cards", "navigation", "update", "gateway"])
+async def test_page_component_maps_durable_failures(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+    failure: str,
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    assistant = _assistant(settings, query, FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy())
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    documents = (1,) if failure == "cards" else (1, 2, 3, 4)
+    session = await _saved_session(query, thread, *documents)
+    if failure == "navigation":
+        query.sessions[session.id] = replace(session, navigation_message_id=None)
+    elif failure == "update":
+        query.missing_page_update = True
+    elif failure == "gateway":
+        query.session_page_error = PaperlessUnavailableError("synthetic")
+    page = 0 if failure == "cards" else 1
+    interaction = _component_interaction(settings, thread, f"paperless:page:{session.id}:{page}")
+    await assistant.on_interaction(cast(discord.Interaction, interaction))
+    assert "expired" in interaction.followup.sent[-1]["content"]
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_result_session_rejects_stale_card_and_tampered_document(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    assistant = _assistant(settings, query, FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy())
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    session = await _saved_session(query, thread, 7)
+    stale = _component_interaction(
+        settings,
+        thread,
+        f"paperless:send:{session.id}:7",
+        message=FakeMessage(channel=cast(Any, thread), identifier=999),
+    )
+    await assistant.on_interaction(cast(discord.Interaction, stale))
+    assert "expired" in stale.response.sent[0]
+    tampered = _component_interaction(
+        settings,
+        thread,
+        f"paperless:send:{session.id}:8",
+        message=thread.sent[0],
+    )
+    await assistant.on_interaction(cast(discord.Interaction, tampered))
+    assert "expired" in tampered.response.sent[0]
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "custom_id",
+    [
+        "paperless:send:not-a-uuid:7",
+        "paperless:send:00000000-0000-0000-0000-000000000000:0",
+        "paperless:similar:not-a-uuid:7",
+        "paperless:similar:00000000-0000-0000-0000-000000000000:0",
+    ],
+)
+async def test_result_actions_reject_malformed_ids(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+    custom_id: str,
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    assistant = _assistant(
+        settings, FakeQuery(), FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy()
+    )
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    interaction = _component_interaction(settings, thread, custom_id)
+    await assistant.on_interaction(cast(discord.Interaction, interaction))
+    assert interaction.response.sent
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_similar_maps_authentication_and_discord_failures(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    assistant = _assistant(settings, query, FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy())
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    session = await _saved_session(query, thread, 7)
+    query.error = PaperlessAuthenticationError("synthetic")
+    auth = _component_interaction(
+        settings,
+        thread,
+        f"paperless:similar:{session.id}:7",
+        message=thread.sent[0],
+    )
+    await assistant.on_interaction(cast(discord.Interaction, auth))
+    assert "token was rejected" in auth.followup.sent[-1]["content"]
+    query.error = None
+    thread.send = AsyncMock(side_effect=_synthetic_http_error())  # type: ignore[method-assign]
+    failed = _component_interaction(
+        settings,
+        thread,
+        f"paperless:similar:{session.id}:7",
+        message=thread.sent[0],
+    )
+    await assistant.on_interaction(cast(discord.Interaction, failed))
+    assert "unavailable" in failed.followup.sent[-1]["content"]
+    await assistant._render_similar_error(None, "safe", 201, thread.id)
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_questions_message_ignores_reply_to_empty_last_page_slot(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    assistant = _assistant(settings, query, FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy())
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    session = await _saved_session(query, thread, 1, 2, 3, 4, page=1)
+    message = FakeMessage(channel=cast(Any, thread), content="Tell me more")
+    message.reference = SimpleNamespace(message_id=session.card_message_ids[1])
+    sent_before = len(thread.sent)
+    await assistant._questions_message(cast(discord.Message, message))
+    assert len(thread.sent) == sent_before
+    assert not query.search_requests
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_questions_message_non_followup_with_multiple_results_searches(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    assistant = _assistant(settings, query, FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy())
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    await _saved_session(query, thread, 1, 2)
+    message = FakeMessage(channel=cast(Any, thread), content="new unrelated question")
+    await assistant._questions_message(cast(discord.Message, message))
+    assert query.search_requests[-1]["document_id"] is None
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_questions_followup_after_empty_session_searches_without_document(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    assistant = _assistant(settings, query, FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy())
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    await _saved_session(query, thread)
+    message = FakeMessage(channel=cast(Any, thread), content="Tell me more")
+    await assistant._questions_message(cast(discord.Message, message))
+    assert query.search_requests[-1]["document_id"] is None
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_reset_component_rejects_wrong_thread(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    assistant = _assistant(settings, query, FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy())
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    interaction = _component_interaction(settings, thread, "paperless:reset:5002")
+    await assistant.on_interaction(cast(discord.Interaction, interaction))
+    assert "expired" in interaction.response.sent[0]
+    assert not query.reset_requests
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["page", "send", "similar"])
+async def test_session_components_reject_noncanonical_uuid(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+    action: str,
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    assistant = _assistant(
+        settings, FakeQuery(), FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy()
+    )
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    noncanonical = str(uuid4()).upper()
+    suffix = "1" if action == "page" else "7"
+    interaction = _component_interaction(
+        settings, thread, f"paperless:{action}:{noncanonical}:{suffix}"
+    )
+    await assistant.on_interaction(cast(discord.Interaction, interaction))
+    assert interaction.response.sent
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_similar_discord_failure_after_status_renders_empty_session(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    query.error = _synthetic_http_error()
+    assistant = _assistant(settings, query, FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy())
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    session = await _saved_session(query, thread, 7)
+    interaction = _component_interaction(
+        settings,
+        thread,
+        f"paperless:similar:{session.id}:7",
+        message=thread.sent[0],
+    )
+    await assistant.on_interaction(cast(discord.Interaction, interaction))
+    assert "unavailable" in interaction.followup.sent[-1]["content"]
+    assert len(query.sessions) == 2
+    await assistant.close()

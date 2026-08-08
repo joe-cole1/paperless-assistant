@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
@@ -18,10 +20,14 @@ from paperless_assistant.errors import (
     AmbiguousPaperlessMutationError,
     AmbiguousSubmissionError,
     ConfigurationUnavailableError,
+    ContextUnavailableError,
     DuplicateUploadError,
     PaperlessAuthenticationError,
     PaperlessPermissionError,
+    PaperlessRAGUnavailableError,
+    PaperlessSearchValidationError,
     PaperlessUnavailableError,
+    QuestionTooLongError,
     RateLimitedError,
     StaleSuggestionError,
     UnlinkedUserError,
@@ -29,6 +35,7 @@ from paperless_assistant.errors import (
 from paperless_assistant.models import (
     AISuggestions,
     ChatResult,
+    ConversationTurn,
     DiscordMessageTarget,
     Document,
     DocumentId,
@@ -39,6 +46,8 @@ from paperless_assistant.models import (
     MetadataGuidance,
     PaperlessTask,
     ReviewFinalizationState,
+    SearchMode,
+    SearchSession,
     SuggestedDate,
     SuggestionApplyResult,
     SuggestionReview,
@@ -51,6 +60,8 @@ from paperless_assistant.models import (
     UploadItem,
     UploadItemState,
 )
+from paperless_assistant.paperless import CHAT_METADATA_DELIMITER, PAPERLESS_NO_CONTENT
+from paperless_assistant.ports import CredentialRepository
 from paperless_assistant.repository import SQLiteRepository
 from paperless_assistant.services import (
     DeliveryService,
@@ -59,6 +70,9 @@ from paperless_assistant.services import (
     QueryService,
     QuestionRateLimiter,
     TaxonomyCache,
+    bound_transcript_turns,
+    build_rag_prompt,
+    normalize_stored_answer,
 )
 
 
@@ -68,6 +82,7 @@ class FakeGateway:
     def __init__(self) -> None:
         self.chat_result = ChatResult("Native answer", (DocumentId(7),))
         self.chat_error = False
+        self.chat_exception: Exception | None = None
         self.search = (Document(DocumentId(8), "Search result", date(2024, 1, 1)),)
         self.similar: tuple[Document, ...] = (
             Document(DocumentId(9), "Similar result", date(2024, 1, 2)),
@@ -84,6 +99,7 @@ class FakeGateway:
             8: self.search[0],
             44: Document(DocumentId(44), "Consumed", date(2024, 3, 3)),
         }
+        self.document_exception: Exception | None = None
         self.taxonomy = Taxonomy(
             (TaxonomyItem(1, "Discord"), TaxonomyItem(10, "inbox")),
             (),
@@ -116,7 +132,9 @@ class FakeGateway:
         self.notes: list[str] = []
         self.download_sizes = {"original": 4, "archived": 3}
         self.download_error_archived = False
-        self.last_question: tuple[str, int | None] | None = None
+        self.last_question: tuple[str, int | None, object] | None = None
+        self.search_calls: list[tuple[str, int, SearchMode, object]] = []
+        self.search_exception: Exception | None = None
         self.doc_tags: dict[int, tuple[int, ...] | None] = {}
         self.batch_tags_error = False
         self.batch_tag_calls: list[tuple[int, ...]] = []
@@ -222,15 +240,25 @@ class FakeGateway:
     async def chat(
         self, question: str, document_id: int | None = None, *, token: object = None
     ) -> ChatResult:
-        self.last_question = (question, document_id)
+        self.last_question = (question, document_id, token)
+        if self.chat_exception is not None:
+            raise self.chat_exception
         if self.chat_error:
             raise PaperlessUnavailableError("synthetic")
         return self.chat_result
 
     async def search_documents(
-        self, query: str, limit: int = 3, *, token: object = None
+        self,
+        query: str,
+        limit: int = 3,
+        *,
+        mode: SearchMode = SearchMode.TEXT,
+        token: object = None,
     ) -> tuple[Document, ...]:
         assert query
+        self.search_calls.append((query, limit, mode, token))
+        if self.search_exception is not None:
+            raise self.search_exception
         return self.search[:limit]
 
     async def find_similar_documents(
@@ -245,6 +273,8 @@ class FakeGateway:
 
     async def get_document(self, document_id: int, *, token: object = None) -> Document:
         self.document_tokens.append(token)
+        if self.document_exception is not None:
+            raise self.document_exception
         return self.documents[document_id]
 
     async def get_taxonomy(self, *, token: object = None) -> Taxonomy:
@@ -344,6 +374,34 @@ class _Credentials:
         return existed
 
 
+class _CredentialMap:
+    def __init__(self, tokens: dict[int, SecretStr | None]) -> None:
+        self.tokens = tokens
+
+    async def get_user_token(self, principal_id: int) -> SecretStr | None:
+        return self.tokens.get(principal_id)
+
+
+async def _query_service(
+    settings: Settings,
+    gateway: FakeGateway,
+    credentials: _CredentialMap | None = None,
+) -> tuple[SQLiteRepository, QueryService]:
+    repository = SQLiteRepository(
+        settings.database_path,
+        lease_seconds=60,
+        encryption_key=settings.encryption_key,
+    )
+    await repository.initialize()
+    return repository, QueryService(
+        settings,
+        gateway,
+        repository,
+        repository,
+        credentials=cast(CredentialRepository | None, credentials),
+    )
+
+
 def _review_job() -> IngestionJob:
     return IngestionJob(
         id=uuid4(),
@@ -404,15 +462,14 @@ async def test_query_native_context_and_search_fallback(
 ) -> None:
     settings = settings_factory()
     gateway = FakeGateway()
-    repository = SQLiteRepository(settings.database_path, lease_seconds=60)
-    await repository.initialize()
-    query = QueryService(settings, gateway, repository, repository)
+    repository, query = await _query_service(settings, gateway)
 
     response = await query.ask(201, "unchanged", document_id=7)
     context = await query.context(201)
     assert response.answer == "Native answer"
     assert response.documents[0].id == DocumentId(7)
-    assert gateway.last_question == ("unchanged", 7)
+    assert gateway.last_question is not None
+    assert gateway.last_question[1:] == (7, None)
     assert context is not None
     assert context.source_message_ids == ()
     await query.save_rendered_context(201, (DocumentId(7),), (100,))
@@ -441,8 +498,461 @@ async def test_query_native_context_and_search_fallback(
     assert await query.context(204) is None
 
 
+def test_build_rag_prompt_preserves_raw_question_without_history() -> None:
+    assert build_rag_prompt("raw question", ()) == "raw question"
+
+
+def test_build_rag_prompt_uses_generic_shared_history() -> None:
+    prompt = build_rag_prompt("current", (ConversationTurn("prior", "answer"),))
+
+    assert "Participant: prior" in prompt
+    assert "Paperless: answer" in prompt
+    assert "Discord" not in prompt
+    assert "201" not in prompt
+    assert len(prompt) <= 4_000
+
+
+def test_build_rag_prompt_discards_oldest_complete_turns() -> None:
+    old = ConversationTurn("old", "x" * 3_900)
+    latest = ConversationTurn("latest", "answer")
+
+    prompt = build_rag_prompt("current", (old, latest))
+
+    assert "old" not in prompt
+    assert "latest" in prompt
+    assert "current" in prompt
+
+
+def test_build_rag_prompt_rejects_oversized_current_question() -> None:
+    with pytest.raises(QuestionTooLongError):
+        build_rag_prompt("q" * 4_001, ())
+
+
+def test_build_rag_prompt_falls_back_when_empty_framing_does_not_fit() -> None:
+    question = "q" * 3_990
+
+    assert build_rag_prompt(question, ()) == question
+
+
+def test_build_rag_prompt_returns_raw_question_after_pruning_all_history() -> None:
+    question = "q" * 3_990
+
+    assert build_rag_prompt(question, (ConversationTurn("prior", "answer"),)) == question
+
+
+def test_normalize_stored_answer_removes_metadata_and_bounds_content() -> None:
+    answer = "answer" * 400 + CHAT_METADATA_DELIMITER + "private metadata"
+
+    assert normalize_stored_answer(answer) == ("answer" * 400)[:1_500]
+
+
+def test_bound_transcript_turns_keeps_newest_whole_turns() -> None:
+    oversized = ConversationTurn("old", "x" * 4_000)
+    latest = ConversationTurn("latest", "answer")
+
+    assert bound_transcript_turns((oversized, latest)) == (latest,)
+
+
 @pytest.mark.asyncio
-async def test_query_similar_uses_linked_token_context_and_audit(
+@pytest.mark.parametrize("mode", [SearchMode.TEXT, SearchMode.TITLE, SearchMode.ADVANCED])
+async def test_deterministic_search_dispatches_exact_mode_with_linked_token(
+    settings_factory: Callable[..., Settings], mode: SearchMode
+) -> None:
+    settings = settings_factory()
+    gateway = FakeGateway()
+    credentials = _CredentialMap({201: SecretStr("token-201")})
+    repository, query = await _query_service(settings, gateway, credentials)
+
+    response = await query.search(201, "exact query", mode=mode, guild_id=100, thread_id=700)
+
+    assert gateway.search_calls == [("exact query", 30, mode, SecretStr("token-201"))]
+    assert response.mode is mode
+    assert response.pending_turn is None
+    assert await repository.get_transcript(100, 700) is None
+
+
+@pytest.mark.asyncio
+async def test_deterministic_search_rejects_an_oversized_question_before_gateway_call(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory()
+    gateway = FakeGateway()
+    _, query = await _query_service(settings, gateway)
+
+    with pytest.raises(QuestionTooLongError):
+        await query.search(201, "q" * 4_001, mode=SearchMode.TEXT, guild_id=100, thread_id=700)
+
+    assert gateway.search_calls == []
+
+
+@pytest.mark.asyncio
+async def test_advanced_search_propagates_safe_validation_error(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory()
+    gateway = FakeGateway()
+    gateway.search_exception = PaperlessSearchValidationError("invalid query")
+    _, query = await _query_service(settings, gateway)
+
+    with pytest.raises(PaperlessSearchValidationError):
+        await query.search(201, "invalid", mode=SearchMode.ADVANCED, guild_id=100, thread_id=700)
+
+    assert gateway.search_calls == [("invalid", 30, SearchMode.ADVANCED, None)]
+
+
+@pytest.mark.asyncio
+async def test_explicit_rag_unavailable_never_uses_deterministic_search(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory()
+    gateway = FakeGateway()
+    gateway.chat_result = ChatResult(PAPERLESS_NO_CONTENT, ())
+    _, query = await _query_service(settings, gateway)
+
+    with pytest.raises(PaperlessRAGUnavailableError):
+        await query.search(201, "question", mode=SearchMode.RAG, guild_id=100, thread_id=700)
+
+    assert gateway.search_calls == []
+
+
+@pytest.mark.asyncio
+async def test_implicit_rag_unavailable_falls_back_to_original_text_query(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory()
+    gateway = FakeGateway()
+    gateway.chat_result = ChatResult("", ())
+    _, query = await _query_service(settings, gateway)
+
+    response = await query.ask(201, "original question")
+
+    assert response.used_search_fallback
+    assert gateway.search_calls == [("original question", 3, SearchMode.TEXT, None)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error", [PaperlessAuthenticationError("no"), PaperlessPermissionError("no")]
+)
+async def test_rag_authentication_and_permission_errors_never_fallback(
+    settings_factory: Callable[..., Settings], error: Exception
+) -> None:
+    settings = settings_factory()
+    gateway = FakeGateway()
+    gateway.chat_exception = error
+    _, query = await _query_service(settings, gateway)
+
+    with pytest.raises(type(error)):
+        await query.ask(201, "question")
+
+    assert gateway.search_calls == []
+
+
+@pytest.mark.asyncio
+async def test_successful_rag_returns_pending_metadata_free_turn_without_persisting(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory()
+    gateway = FakeGateway()
+    gateway.chat_result = ChatResult(
+        "answer" * 400 + CHAT_METADATA_DELIMITER + "hidden", (DocumentId(7),)
+    )
+    credentials = _CredentialMap({201: SecretStr("token-201")})
+    repository, query = await _query_service(settings, gateway, credentials)
+
+    response = await query.search(201, "current", mode=SearchMode.RAG, guild_id=100, thread_id=700)
+
+    assert gateway.last_question is not None
+    assert gateway.last_question[0] == "current"
+    assert gateway.last_question[1:] == (None, SecretStr("token-201"))
+    assert response.pending_turn == ConversationTurn("current", ("answer" * 400)[:1_500])
+    assert response.transcript_generation == 0
+    assert response.answer.endswith("hidden")
+    assert await repository.get_transcript(100, 700) is None
+
+
+@pytest.mark.asyncio
+async def test_commit_rendered_turn_shares_history_and_refreshes_only_on_commit(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory()
+    gateway = FakeGateway()
+    repository, query = await _query_service(settings, gateway)
+    first = await query.search(201, "first", mode=SearchMode.RAG, guild_id=100, thread_id=700)
+
+    assert first.pending_turn is not None
+    assert await repository.get_transcript(100, 700) is None
+    assert await query.commit_rendered_turn(
+        100, 700, first.pending_turn, first.transcript_generation or 0
+    )
+    second = await query.search(202, "second", mode=SearchMode.RAG, guild_id=100, thread_id=700)
+
+    assert gateway.last_question is not None
+    assert "Participant: first" in gateway.last_question[0]
+    assert second.pending_turn is not None
+
+
+@pytest.mark.asyncio
+async def test_reset_rejects_older_pending_generation(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory()
+    gateway = FakeGateway()
+    _, query = await _query_service(settings, gateway)
+    response = await query.search(201, "first", mode=SearchMode.RAG, guild_id=100, thread_id=700)
+
+    assert response.pending_turn is not None
+    await query.reset_transcript(100, 700)
+
+    assert not await query.commit_rendered_turn(
+        100, 700, response.pending_turn, response.transcript_generation or 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_same_generation_commits_append_all_turns(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory()
+    gateway = FakeGateway()
+    repository, query = await _query_service(settings, gateway)
+    first = ConversationTurn("first", "one")
+    second = ConversationTurn("second", "two")
+
+    results = await asyncio.gather(
+        query.commit_rendered_turn(100, 700, first, 0),
+        query.commit_rendered_turn(100, 700, second, 0),
+    )
+    transcript = await repository.get_transcript(100, 700)
+
+    assert tuple(results) == (True, True)
+    assert transcript is not None
+    assert transcript.turns == (first, second)
+
+
+@pytest.mark.asyncio
+async def test_commit_rendered_turn_discards_one_turn_that_exceeds_context_budget(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory()
+    gateway = FakeGateway()
+    repository, query = await _query_service(settings, gateway)
+    oversized = ConversationTurn("question", "a" * 4_000)
+
+    assert await query.commit_rendered_turn(100, 700, oversized, 0)
+    assert await repository.get_transcript(100, 700) is None
+
+
+@pytest.mark.asyncio
+async def test_deterministic_and_failed_rag_calls_do_not_create_transcript(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory()
+    gateway = FakeGateway()
+    repository, query = await _query_service(settings, gateway)
+
+    await query.search(201, "text", mode=SearchMode.TEXT, guild_id=100, thread_id=700)
+    gateway.chat_result = ChatResult("", ())
+    with pytest.raises(PaperlessRAGUnavailableError):
+        await query.search(201, "rag", mode=SearchMode.RAG, guild_id=100, thread_id=700)
+
+    assert await repository.get_transcript(100, 700) is None
+
+
+@pytest.mark.asyncio
+async def test_session_page_documents_reauthorizes_owner_and_returns_three_documents(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory()
+    gateway = FakeGateway()
+    gateway.documents.update(
+        {index: Document(DocumentId(index), f"Document {index}", None) for index in range(10, 14)}
+    )
+    credentials = _CredentialMap({201: SecretStr("owner-token"), 202: SecretStr("other-token")})
+    _, query = await _query_service(settings, gateway, credentials)
+    now = datetime.now(tz=UTC)
+    session = SearchSession(
+        uuid4(),
+        100,
+        700,
+        201,
+        (DocumentId(10), DocumentId(11), DocumentId(12), DocumentId(13)),
+        (),
+        (),
+        None,
+        SearchMode.TEXT,
+        0,
+        now,
+        now + timedelta(minutes=10),
+    )
+    await query.save_search_session(session)
+
+    returned, documents = await query.session_page_documents(201, session.id, 0)
+
+    assert returned == session
+    assert tuple(document.id for document in documents) == (
+        DocumentId(10),
+        DocumentId(11),
+        DocumentId(12),
+    )
+    assert gateway.document_tokens[-3:] == [SecretStr("owner-token")] * 3
+
+
+@pytest.mark.asyncio
+async def test_search_session_wrappers_round_trip_latest_and_page(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory()
+    gateway = FakeGateway()
+    _, query = await _query_service(settings, gateway)
+    now = datetime.now(tz=UTC)
+    session = SearchSession(
+        uuid4(),
+        100,
+        700,
+        201,
+        (DocumentId(7),),
+        (),
+        (),
+        None,
+        SearchMode.TITLE,
+        0,
+        now,
+        now + timedelta(minutes=10),
+    )
+
+    await query.save_search_session(session)
+    updated = await query.set_search_session_page(session.id, 1)
+
+    assert updated is not None
+    assert updated.page == 1
+    assert await query.get_search_session(session.id) == updated
+    assert await query.latest_search_session(100, 700) == updated
+
+
+@pytest.mark.asyncio
+async def test_session_page_documents_fails_closed_for_invalid_page_or_owner(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory()
+    gateway = FakeGateway()
+    credentials = _CredentialMap({201: SecretStr("owner-token"), 202: SecretStr("other-token")})
+    _, query = await _query_service(settings, gateway, credentials)
+    now = datetime.now(tz=UTC)
+    session = SearchSession(
+        uuid4(),
+        100,
+        700,
+        201,
+        (DocumentId(7),),
+        (),
+        (),
+        None,
+        SearchMode.TEXT,
+        0,
+        now,
+        now + timedelta(minutes=10),
+    )
+    await query.save_search_session(session)
+
+    with pytest.raises(ContextUnavailableError):
+        await query.session_page_documents(202, session.id, 0)
+    with pytest.raises(ContextUnavailableError):
+        await query.session_page_documents(201, session.id, 1)
+
+
+@pytest.mark.asyncio
+async def test_session_page_documents_fails_closed_for_unknown_session(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory()
+    gateway = FakeGateway()
+    _, query = await _query_service(settings, gateway)
+
+    with pytest.raises(ContextUnavailableError):
+        await query.session_page_documents(201, uuid4(), 0)
+
+
+@pytest.mark.asyncio
+async def test_session_page_documents_propagates_permission_failure(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory()
+    gateway = FakeGateway()
+    gateway.documents[7] = Document(DocumentId(7), "Document", None)
+    credentials = _CredentialMap({201: SecretStr("owner-token")})
+    _, query = await _query_service(settings, gateway, credentials)
+    now = datetime.now(tz=UTC)
+    session = SearchSession(
+        uuid4(),
+        100,
+        700,
+        201,
+        (DocumentId(7),),
+        (),
+        (),
+        None,
+        SearchMode.TEXT,
+        0,
+        now,
+        now + timedelta(minutes=10),
+    )
+    await query.save_search_session(session)
+    gateway.document_exception = PaperlessPermissionError("revoked")
+
+    with pytest.raises(PaperlessPermissionError):
+        await query.session_page_documents(201, session.id, 0)
+
+
+@pytest.mark.asyncio
+async def test_session_page_documents_allows_thread_participant_when_owner_not_required(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory()
+    gateway = FakeGateway()
+    credentials = _CredentialMap({201: SecretStr("owner-token"), 202: SecretStr("asker-token")})
+    _, query = await _query_service(settings, gateway, credentials)
+    now = datetime.now(tz=UTC)
+    session = SearchSession(
+        uuid4(),
+        100,
+        700,
+        201,
+        (DocumentId(7),),
+        (),
+        (),
+        None,
+        SearchMode.TEXT,
+        0,
+        now,
+        now + timedelta(minutes=10),
+    )
+    await query.save_search_session(session)
+
+    _, documents = await query.session_page_documents(202, session.id, 0, require_owner=False)
+
+    assert documents[0].id == DocumentId(7)
+    assert gateway.document_tokens[-1] == SecretStr("asker-token")
+
+
+@pytest.mark.asyncio
+async def test_query_audit_never_records_question_or_answer_content(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory()
+    gateway = FakeGateway()
+    gateway.chat_result = ChatResult("ANSWER_MARKER", ())
+    _repository, query = await _query_service(settings, gateway)
+
+    await query.search(201, "QUESTION_MARKER", mode=SearchMode.RAG, guild_id=100, thread_id=700)
+    with sqlite3.connect(settings.database_path) as connection:
+        rows = connection.execute("SELECT action, outcome FROM audit_events").fetchall()
+
+    assert rows == [("question", "answered")]
+
+
+@pytest.mark.asyncio
+async def test_query_similar_uses_linked_token_and_audit_without_legacy_context(
     settings_factory: Callable[..., Settings],
 ) -> None:
     settings = settings_factory()
@@ -463,14 +973,12 @@ async def test_query_similar_uses_linked_token_context_and_audit(
         credentials=FakeCredentials(),  # type: ignore[arg-type]
     )
 
-    response = await query.find_similar(201, 7, context_id=5001)
-    context = await query.context(5001)
+    response = await query.find_similar(201, 7)
 
     assert response.documents == gateway.similar
     assert response.answer == "Documents similar to Paperless document #7:"
     assert gateway.last_similar == (7, 3, "linked-user-token")
-    assert context is not None
-    assert context.document_ids == (DocumentId(9),)
+    assert await query.context(201) is None
     assert [action async for action in repository.actions()] == ["similar_search"]
 
 
