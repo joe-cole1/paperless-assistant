@@ -27,8 +27,10 @@ from paperless_assistant.errors import (
     PaperlessAITransportError,
     PaperlessAuthenticationError,
     PaperlessPermissionError,
+    PaperlessSearchValidationError,
     PaperlessUnavailableError,
 )
+from paperless_assistant.logging_config import install_http_request_url_redaction
 from paperless_assistant.models import (
     AISuggestions,
     ChatResult,
@@ -38,6 +40,7 @@ from paperless_assistant.models import (
     Download,
     MetadataGuidance,
     PaperlessTask,
+    SearchMode,
     SuggestedDate,
     TaskState,
     Taxonomy,
@@ -50,6 +53,7 @@ CHAT_METADATA_DELIMITER = "\n\n__PAPERLESS_CHAT_METADATA__"
 PAPERLESS_NO_CONTENT = "Sorry, I couldn't find any content to answer your question."
 PAPERLESS_CHAT_ERROR = "Sorry, something went wrong while generating a response."
 PAPERLESS_ERROR_LOG_LIMIT = 4096
+PAPERLESS_RAG_SEARCH_MODE_ERROR = "RAG is not a deterministic Paperless search mode"
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +201,7 @@ class HttpPaperlessGateway:
     """Only component authorized to make Paperless HTTP requests."""
 
     def __init__(self, settings: Settings, client: httpx.AsyncClient | None = None) -> None:
+        install_http_request_url_redaction()
         self._settings = settings
         self._owns_client = client is None
         timeout = httpx.Timeout(
@@ -271,6 +276,32 @@ class HttpPaperlessGateway:
             raise PaperlessPermissionError("Paperless permission denied")
         raise PaperlessUnavailableError("Paperless request failed")
 
+    @staticmethod
+    async def _raise_search_status(response: httpx.Response, mode: SearchMode) -> None:
+        """Raise sanitized search failures without reading or logging response bodies."""
+        if not response.is_error:
+            return
+        logger.warning(
+            "paperless_search_failed",
+            extra={
+                "operation": _operation(response),
+                "status_code": response.status_code,
+                "classification": "search_request_failed",
+            },
+        )
+        if response.status_code == 401:
+            raise PaperlessAuthenticationError("Paperless authentication failed")
+        if response.status_code == 403:
+            raise PaperlessPermissionError("Paperless permission denied")
+        if mode is SearchMode.ADVANCED and response.status_code in {400, 422}:
+            try:
+                payload = response.json()
+            except TypeError, ValueError:
+                payload = None
+            if isinstance(payload, Mapping) and "query" in payload:
+                raise PaperlessSearchValidationError("query")
+        raise PaperlessUnavailableError("Paperless search failed")
+
     async def chat(
         self, question: str, document_id: int | None = None, *, token: SecretStr | None = None
     ) -> ChatResult:
@@ -319,26 +350,57 @@ class HttpPaperlessGateway:
             page += 1
 
     async def search_documents(
-        self, query: str, limit: int = 3, *, token: SecretStr | None = None
+        self,
+        query: str,
+        limit: int = 3,
+        *,
+        mode: SearchMode = SearchMode.TEXT,
+        token: SecretStr | None = None,
     ) -> tuple[Document, ...]:
-        """Use Paperless native full-text search without interpreting the query."""
-        try:
-            response = await self._client.get(
-                "api/documents/",
-                params={"query": query, "page_size": min(limit, 3)},
-                headers=self._headers(token),
-            )
-        except httpx.HTTPError as error:
-            raise PaperlessUnavailableError("Paperless search unavailable") from error
-        await self._raise_status(response)
-        try:
-            payload = response.json()
-            results = payload["results"]
-        except (KeyError, TypeError, ValueError) as error:
-            raise PaperlessUnavailableError("malformed search response") from error
-        if not isinstance(results, list):
-            raise PaperlessUnavailableError("malformed search response")
-        return tuple(_document(item) for item in results[: min(limit, 3)])
+        """Use one bounded native Paperless search without interpreting the query."""
+        if mode is SearchMode.RAG:
+            raise ValueError(PAPERLESS_RAG_SEARCH_MODE_ERROR)
+        bounded_limit = min(max(limit, 0), 30)
+        if bounded_limit == 0:
+            return ()
+        parameter = {
+            SearchMode.TEXT: "text",
+            SearchMode.TITLE: "title_search",
+            SearchMode.ADVANCED: "query",
+        }.get(mode)
+        if parameter is None:
+            raise ValueError("unsupported Paperless search mode")
+
+        page = 1
+        documents: list[Document] = []
+        while True:
+            try:
+                response = await self._client.get(
+                    "api/documents/",
+                    params={
+                        parameter: query,
+                        "page": page,
+                        "page_size": bounded_limit,
+                    },
+                    headers=self._headers(token),
+                )
+            except httpx.HTTPError as error:
+                raise PaperlessUnavailableError("Paperless search unavailable") from error
+            await self._raise_search_status(response, mode)
+            try:
+                payload = response.json()
+                results = payload["results"]
+                next_page = payload.get("next")
+            except (KeyError, TypeError, ValueError) as error:
+                raise PaperlessUnavailableError("malformed search response") from error
+            if not isinstance(results, list):
+                raise PaperlessUnavailableError("malformed search response")
+            if next_page and not results:
+                raise PaperlessUnavailableError("malformed search response")
+            documents.extend(_document(item) for item in results[: bounded_limit - len(documents)])
+            if not next_page or len(documents) == bounded_limit:
+                return tuple(documents)
+            page += 1
 
     async def find_similar_documents(
         self,

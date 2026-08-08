@@ -23,6 +23,23 @@ class PaperlessPermissionError(PaperlessUnavailableError):
     """The Paperless principal lacks permission for the requested operation."""
 
 
+class PaperlessSearchValidationError(PaperlessUnavailableError):
+    """Paperless rejected a sanitized search request."""
+
+    def __init__(self, field: str) -> None:
+        safe_field = field if field == "query" else "search"
+        super().__init__("Paperless rejected a search request")
+        self.user_message = (
+            "Paperless rejected the advanced query syntax."
+            if safe_field == "query"
+            else "Paperless rejected the search request."
+        )
+
+
+class PaperlessRAGUnavailableError(PaperlessUnavailableError):
+    """Native RAG is unavailable or has no usable content."""
+
+
 class PaperlessAIUnavailableError(PaperlessUnavailableError):
     """Base class for a diagnosable Paperless AI-suggestion failure."""
 
@@ -65,6 +82,10 @@ class InvalidAttachmentError(AssistantError):
 
 class RateLimitedError(AssistantError):
     """A user exceeded the bounded native-chat rate."""
+
+
+class QuestionTooLongError(AssistantError):
+    """A question exceeds Paperless's supported character limit."""
 
 
 class ContextUnavailableError(AssistantError):

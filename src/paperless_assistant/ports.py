@@ -14,6 +14,7 @@ from paperless_assistant.models import (
     AISuggestions,
     AuditEvent,
     ChatResult,
+    ConversationTranscript,
     DiscordMessageTarget,
     Document,
     DocumentUpdate,
@@ -24,6 +25,8 @@ from paperless_assistant.models import (
     PaperlessTask,
     ReferenceContext,
     ReviewFinalizationState,
+    SearchMode,
+    SearchSession,
     Taxonomy,
     TaxonomyCapabilities,
     TaxonomyItem,
@@ -45,7 +48,12 @@ class PaperlessGateway(Protocol):
     ) -> ChatResult: ...
 
     async def search_documents(
-        self, query: str, limit: int = 3, *, token: SecretStr | None = None
+        self,
+        query: str,
+        limit: int = 3,
+        *,
+        mode: SearchMode = SearchMode.TEXT,
+        token: SecretStr | None = None,
     ) -> tuple[Document, ...]: ...
 
     async def find_similar_documents(
@@ -149,6 +157,30 @@ class CredentialRepository(Protocol):
     async def get_user_token(self, principal_id: int) -> SecretStr | None: ...
 
     async def delete_user_token(self, principal_id: int) -> bool: ...
+
+
+class QueryRepository(Protocol):
+    """Durable shared query transcripts and result sessions."""
+
+    async def save_transcript(self, transcript: ConversationTranscript) -> None: ...
+
+    async def get_transcript(
+        self, guild_id: int, thread_id: int
+    ) -> ConversationTranscript | None: ...
+
+    async def clear_transcript(self, guild_id: int, thread_id: int) -> bool: ...
+
+    async def save_search_session(self, session: SearchSession) -> None: ...
+
+    async def get_search_session(self, session_id: UUID) -> SearchSession | None: ...
+
+    async def latest_search_session(
+        self, guild_id: int, thread_id: int
+    ) -> SearchSession | None: ...
+
+    async def set_search_session_page(
+        self, session_id: UUID, page: int
+    ) -> SearchSession | None: ...
 
 
 class IngestionRepository(Protocol):

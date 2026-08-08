@@ -292,6 +292,10 @@ Important details:
   effective runtime limit automatically.
 - The default cleanup runs at 03:00 in `TZ`.
 
+No additional setting is required for question search sessions or shared thread context. They use
+the existing `ENCRYPTION_KEY` and `REFERENCE_CONTEXT_TTL_SECONDS` retention setting (15 minutes by
+default).
+
 Validate Compose without printing the expanded secret-bearing configuration:
 
 ```console
@@ -388,27 +392,36 @@ Use only synthetic files and harmless test identities.
 ### Questions and retrieval
 
 1. In `paperless-questions`, ask a natural question whose answer is present in a known synthetic
-   Paperless document.
+   Paperless document. Confirm the bot creates a public thread; ask a follow-up there and confirm
+   the thread is reused.
 2. Confirm the bot first posts `Searching Paperless…`, then edits that status with Paperless's
-   native answer.
-3. Confirm it shows no more than three referenced documents.
-4. Confirm each result shows title, date, ID, **Open in Paperless**, **Send File**, and **Similar**.
-5. Select **Open in Paperless** and verify the HTTPS browser link.
-6. Select **Send File**:
+   native answer or safe full-text fallback results.
+3. Run `/search text <question>`, `/search title <question>`, and `/search advanced <query>` in
+   the thread. Confirm they use their selected Paperless search mode. Enter malformed native query
+   syntax and confirm the response is fixed validation guidance, not the query or a server error.
+4. Run `/search rag <question>` while native RAG is unavailable and confirm it reports that safe
+   failure instead of silently changing modes.
+5. Confirm a result page contains at most three cards, each with title, date, ID, **Open in
+   Paperless**, **Send File**, and **Similar**. For a query with more than three results, confirm
+   **Prev** and **Next** edit those cards in place and only the requester can use them.
+6. Select **Open in Paperless** and verify the HTTPS browser link.
+7. Select **Send File**:
    - a small original should arrive as an attachment;
    - a large original should use an archived PDF when one fits, or return the authenticated
      original-download link.
-7. Select **Similar** and confirm the same thread receives no more than three related documents
+8. Select **Similar** and confirm the same thread receives no more than three related documents
    visible to your linked Paperless account. Confirm the source Paperless ID is identified and is
    not repeated in the results.
-8. Ask `send me the second one` and `send me all of them`.
-9. Reply directly to a result message with a follow-up question. Confirm Paperless answers about
-   that document.
-10. With several prior results, ask an ambiguous follow-up such as `what about the date?`; the bot
-   should ask which result you mean.
+9. Ask `send me the second one` and `send me all of them`.
+10. Reply directly to a result card with a follow-up question. Confirm Paperless answers about
+    that document and uses the current page's result.
+11. Have another allowlisted household member ask in the same thread; confirm the conversation is
+    shared but uses their linked Paperless token. Run `/search reset` as either allowlisted member
+    and confirm later questions start fresh while existing result controls still work for their
+    requester.
 
-Paperless native chat controls answer quality and returns at most three references. The assistant
-does not add another AI or try to make the result exhaustive.
+Paperless controls answer quality. The assistant does not add another AI or try to make search
+results exhaustive.
 
 ### Native and multi-file ingestion
 
@@ -590,7 +603,8 @@ Only after the normal tests pass and Paperless Tika/Gotenberg are known to work:
 
 - Test native chat in the Paperless web interface.
 - Confirm Paperless's configured LLM and embeddings are healthy.
-- Basic full-text search is the intentional fallback when native chat fails or returns no content.
+- Basic full-text search is the intentional fallback only for implicit free-form questions when
+  native RAG fails or returns no content. `/search rag` deliberately never falls back.
 
 ### A file is too large for Discord
 

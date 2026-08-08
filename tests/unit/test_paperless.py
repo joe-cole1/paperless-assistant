@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator, Callable
 from datetime import date
 from pathlib import Path
@@ -24,12 +25,14 @@ from paperless_assistant.errors import (
     PaperlessAITransportError,
     PaperlessAuthenticationError,
     PaperlessPermissionError,
+    PaperlessSearchValidationError,
     PaperlessUnavailableError,
 )
 from paperless_assistant.models import (
     DocumentId,
     DocumentUpdate,
     MetadataGuidance,
+    SearchMode,
     SuggestedDate,
     TaskState,
     TaxonomyItem,
@@ -37,6 +40,7 @@ from paperless_assistant.models import (
 )
 from paperless_assistant.paperless import (
     CHAT_METADATA_DELIMITER,
+    PAPERLESS_RAG_SEARCH_MODE_ERROR,
     HttpPaperlessGateway,
     _confirmed_duplicate,
     _document,
@@ -179,7 +183,12 @@ async def test_chat_search_documents_and_urls(
                 + CHAT_METADATA_DELIMITER
                 + '{"references":[{"id":7,"title":"Synthetic"}]}',
             )
-        if request.url.path == "/api/documents/" and "query=" in str(request.url):
+        if request.url.path == "/api/documents/":
+            assert dict(request.url.params) == {
+                "text": "unchanged question",
+                "page": "1",
+                "page_size": "3",
+            }
             return httpx.Response(
                 200,
                 json={
@@ -216,6 +225,266 @@ async def test_chat_search_documents_and_urls(
     assert gateway.document_url(7).endswith("/documents/7/details")
     assert "original=true" in gateway.original_download_url(7)
     await gateway.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "parameter"),
+    [
+        (SearchMode.TEXT, "text"),
+        (SearchMode.TITLE, "title_search"),
+        (SearchMode.ADVANCED, "query"),
+    ],
+)
+async def test_search_documents_maps_mode_and_forwards_linked_token(
+    settings_factory: Callable[..., Settings],
+    mode: SearchMode,
+    parameter: str,
+) -> None:
+    query = "unchanged synthetic query"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/documents/"
+        assert dict(request.url.params) == {
+            parameter: query,
+            "page": "1",
+            "page_size": "3",
+        }
+        assert request.headers["Authorization"] == "Token linked-user-token"
+        return httpx.Response(200, json={"results": [{"id": 7, "title": "Synthetic"}]})
+
+    documents = await _gateway(settings_factory, handler).search_documents(
+        query,
+        mode=mode,
+        token=SecretStr("linked-user-token"),
+    )
+
+    assert tuple(int(document.id) for document in documents) == (7,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "status_code"),
+    [
+        (SearchMode.TEXT, 200),
+        (SearchMode.TITLE, 200),
+        (SearchMode.ADVANCED, 200),
+        (SearchMode.TEXT, 500),
+        (SearchMode.TITLE, 500),
+        (SearchMode.ADVANCED, 500),
+    ],
+)
+async def test_search_http_logs_redact_query_values(
+    settings_factory: Callable[..., Settings],
+    caplog: pytest.LogCaptureFixture,
+    mode: SearchMode,
+    status_code: int,
+) -> None:
+    query_marker = f"private-{mode.value}-{status_code}"
+    caplog.set_level(logging.INFO, logger="httpx")
+    gateway = _gateway(
+        settings_factory,
+        lambda _: httpx.Response(
+            status_code,
+            json={"results": [{"id": 7, "title": "Synthetic"}]},
+        ),
+    )
+
+    if status_code == 200:
+        documents = await gateway.search_documents(query_marker, mode=mode)
+        assert tuple(int(document.id) for document in documents) == (7,)
+    else:
+        with pytest.raises(PaperlessUnavailableError, match="Paperless search failed"):
+            await gateway.search_documents(query_marker, mode=mode)
+
+    assert query_marker not in caplog.text
+    assert "[REDACTED]" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [0, -1])
+async def test_search_documents_nonpositive_limit_makes_no_http_request(
+    settings_factory: Callable[..., Settings], limit: int
+) -> None:
+    def no_request(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(request.url)
+
+    documents = await _gateway(settings_factory, no_request).search_documents("synthetic", limit)
+
+    assert documents == ()
+
+
+@pytest.mark.asyncio
+async def test_search_documents_caps_limit_and_results_at_thirty(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert dict(request.url.params) == {"text": "synthetic", "page": "1", "page_size": "30"}
+        return httpx.Response(
+            200,
+            json={"results": [{"id": index, "title": str(index)} for index in range(1, 40)]},
+        )
+
+    documents = await _gateway(settings_factory, handler).search_documents("synthetic", limit=99)
+
+    assert tuple(int(document.id) for document in documents) == tuple(range(1, 31))
+
+
+@pytest.mark.asyncio
+async def test_search_documents_rejects_rag_mode_before_http_request(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    def no_request(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(request.url)
+
+    with pytest.raises(ValueError, match=PAPERLESS_RAG_SEARCH_MODE_ERROR):
+        await _gateway(settings_factory, no_request).search_documents(
+            "synthetic", mode=SearchMode.RAG
+        )
+
+
+@pytest.mark.asyncio
+async def test_search_documents_rejects_unknown_mode_before_http_request(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    def no_request(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(request.url)
+
+    with pytest.raises(ValueError, match="unsupported Paperless search mode"):
+        await _gateway(settings_factory, no_request).search_documents(
+            "synthetic", mode=cast(SearchMode, object())
+        )
+
+
+@pytest.mark.asyncio
+async def test_search_documents_paginates_with_constant_page_size_and_ordered_cap(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    requests: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(dict(request.url.params))
+        page = request.url.params["page"]
+        if page == "1":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [{"id": index, "title": str(index)} for index in range(1, 21)],
+                    "next": "next-page",
+                },
+            )
+        return httpx.Response(
+            200,
+            json={"results": [{"id": index, "title": str(index)} for index in range(21, 41)]},
+        )
+
+    documents = await _gateway(settings_factory, handler).search_documents("synthetic", limit=30)
+
+    assert requests == [
+        {"text": "synthetic", "page": "1", "page_size": "30"},
+        {"text": "synthetic", "page": "2", "page_size": "30"},
+    ]
+    assert tuple(int(document.id) for document in documents) == tuple(range(1, 31))
+
+
+@pytest.mark.asyncio
+async def test_search_documents_rejects_empty_page_with_next_link(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    gateway = _gateway(
+        settings_factory, lambda _: httpx.Response(200, json={"results": [], "next": "x"})
+    )
+
+    with pytest.raises(PaperlessUnavailableError, match="malformed search response"):
+        await gateway.search_documents("synthetic")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"results": {}},
+        {"results": ["not-a-document"]},
+    ],
+)
+async def test_search_documents_rejects_malformed_payloads(
+    settings_factory: Callable[..., Settings], payload: object
+) -> None:
+    gateway = _gateway(settings_factory, lambda _: httpx.Response(200, json=payload))
+
+    with pytest.raises(PaperlessUnavailableError, match="malformed"):
+        await gateway.search_documents("synthetic")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "error"),
+    [(401, PaperlessAuthenticationError), (403, PaperlessPermissionError)],
+)
+async def test_search_documents_maps_authentication_and_permission_errors(
+    settings_factory: Callable[..., Settings], status_code: int, error: type[Exception]
+) -> None:
+    gateway = _gateway(settings_factory, lambda _: httpx.Response(status_code))
+
+    with pytest.raises(error):
+        await gateway.search_documents("synthetic")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [400, 422])
+async def test_advanced_search_query_validation_is_safe(
+    settings_factory: Callable[..., Settings],
+    caplog: pytest.LogCaptureFixture,
+    status_code: int,
+) -> None:
+    query_marker = "private-query-marker"
+    body_marker = "private-body-marker"
+    gateway = _gateway(
+        settings_factory,
+        lambda _: httpx.Response(status_code, json={"query": [body_marker]}),
+    )
+
+    with pytest.raises(PaperlessSearchValidationError) as raised:
+        await gateway.search_documents(query_marker, mode=SearchMode.ADVANCED)
+
+    assert raised.value.user_message == "Paperless rejected the advanced query syntax."
+    assert query_marker not in str(raised.value)
+    assert body_marker not in str(raised.value)
+    assert query_marker not in caplog.text
+    assert body_marker not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_advanced_search_validation_handles_non_json_errors(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    gateway = _gateway(settings_factory, lambda _: httpx.Response(422, text="not-json"))
+
+    with pytest.raises(PaperlessUnavailableError, match="Paperless search failed"):
+        await gateway.search_documents("synthetic", mode=SearchMode.ADVANCED)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "body"),
+    [
+        (SearchMode.ADVANCED, {"detail": "private-body-marker"}),
+        (SearchMode.ADVANCED, {"other": "private-body-marker"}),
+        (SearchMode.TEXT, {"query": "private-body-marker"}),
+        (SearchMode.TITLE, {"query": "private-body-marker"}),
+    ],
+)
+async def test_search_validation_errors_without_advanced_query_key_are_generic(
+    settings_factory: Callable[..., Settings], mode: SearchMode, body: dict[str, str]
+) -> None:
+    gateway = _gateway(settings_factory, lambda _: httpx.Response(400, json=body))
+
+    with pytest.raises(PaperlessUnavailableError, match="Paperless search failed") as raised:
+        await gateway.search_documents("private-query-marker", mode=mode)
+
+    assert not isinstance(raised.value, PaperlessSearchValidationError)
+    assert "private-body-marker" not in str(raised.value)
 
 
 @pytest.mark.asyncio
@@ -698,7 +967,7 @@ async def test_read_endpoints_fail_closed(
         await network.add_note(7, "synthetic")
 
     server_error = _gateway(settings_factory, lambda _: httpx.Response(500))
-    with pytest.raises(PaperlessUnavailableError, match="request failed"):
+    with pytest.raises(PaperlessUnavailableError, match="search failed"):
         await server_error.search_documents("synthetic")
 
 
