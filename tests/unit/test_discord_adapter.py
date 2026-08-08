@@ -164,6 +164,8 @@ class FakeMessage:
         self.reference: Any = None
         self.replies: list[FakeMessage] = []
         self.edits: list[dict[str, Any]] = []
+        self.embed: Any = None
+        self.view: Any = None
         self.deleted = False
         self.pinned = False
         self.send_kwargs: dict[str, Any] = {}
@@ -185,9 +187,21 @@ class FakeMessage:
         return thread
 
     async def edit(self, **kwargs: Any) -> None:
+        content = kwargs.get("content", self.content)
+        embed = kwargs.get("embed", self.embed)
+        view = kwargs.get("view", self.view)
+        if not content and embed is None and view is None:
+            raise discord.HTTPException(
+                cast(Any, SimpleNamespace(status=400, reason="synthetic")),
+                "Cannot send an empty message",
+            )
         self.edits.append(kwargs)
         if "content" in kwargs:
             self.content = kwargs["content"]
+        if "embed" in kwargs:
+            self.embed = kwargs["embed"]
+        if "view" in kwargs:
+            self.view = kwargs["view"]
 
     async def delete(self) -> None:
         self.deleted = True
@@ -3191,8 +3205,50 @@ async def test_page_interaction_edits_persisted_cards_for_last_partial_page(
     assert interaction.response.deferred
     assert updated.page == 1
     assert cards[0].edits[-1]["embed"].title.endswith("Document 4")
-    assert cards[1].edits[-1] == {"content": None, "embed": None, "view": None}
-    assert cards[2].edits[-1] == {"content": None, "embed": None, "view": None}
+    assert cards[1].content == "\u200b"
+    assert cards[1].embed is None
+    assert cards[1].view is None
+    assert cards[2].content == "\u200b"
+    assert cards[2].embed is None
+    assert cards[2].view is None
+    assert interaction.followup.sent[-1]["content"] == "Page updated."
+    await assistant.close()
+
+
+@pytest.mark.asyncio
+async def test_page_interaction_restores_cards_when_returning_to_full_page(
+    tmp_path: Path,
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory(data_dir=tmp_path)
+    query = FakeQuery()
+    assistant = _assistant(settings, query, FakeIngestion(), FakeDelivery(tmp_path), FakeTaxonomy())
+    thread = FakeThread(settings.discord_questions_channel_id, thread_id=5001)
+    session = await _saved_session(query, thread, 1, 2, 3, 4)
+    await assistant.on_interaction(
+        cast(
+            discord.Interaction,
+            _component_interaction(settings, thread, f"paperless:page:{session.id}:1"),
+        )
+    )
+
+    await assistant.on_interaction(
+        cast(
+            discord.Interaction,
+            _component_interaction(settings, thread, f"paperless:page:{session.id}:0"),
+        )
+    )
+
+    cards = [thread.get_partial_message(identifier) for identifier in session.card_message_ids]
+    assert query.sessions[session.id].page == 0
+    assert [card.id for card in cards] == list(session.card_message_ids)
+    assert [card.content for card in cards] == [None, None, None]
+    assert [card.embed.title for card in cards] == [
+        "📄 Document 1",
+        "📄 Document 2",
+        "📄 Document 3",
+    ]
+    assert all(card.view is not None for card in cards)
     await assistant.close()
 
 
