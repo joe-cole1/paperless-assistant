@@ -24,7 +24,7 @@ dependencies = [
   "httpx>=0.28.1,<1",
   "pydantic>=2.13.4,<3",
   "pydantic-settings>=2.15.0,<3",
-  "starlette>=1.5.0,<2",
+  "starlette>=1.6.0,<2",
   "uvicorn>=0.52.1,<1",
 ]
 
