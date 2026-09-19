@@ -17,6 +17,8 @@ env:
 
 jobs:
   validate:
+    # Defense in depth: repository Actions policy should enforce the same boundary before execution.
+    if: github.actor == github.repository_owner
     name: Validate release tag
     runs-on: ubuntu-24.04
     timeout-minutes: 2
